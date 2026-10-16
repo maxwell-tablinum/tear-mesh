@@ -1,0 +1,8 @@
+{
+  "description": "Tell the session about tear-mesh letters that arrived since it was last told.",
+  "hooks": {
+    "SessionStart": [{ "hooks": [{ "type": "command", "command": "tearmesh hook", "timeout": 10 }] }],
+    "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "tearmesh hook", "timeout": 10 }] }],
+    "PostToolUse": [{ "hooks": [{ "type": "command", "command": "tearmesh hook", "timeout": 10 }] }]
+  }
+}

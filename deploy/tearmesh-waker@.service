@@ -1,0 +1,16 @@
+# One per boundary user: systemctl enable --now tearmesh-waker@tm-work
+# Never instantiate it for root or the tearmesh user: woken sessions run as %i.
+[Unit]
+Description=tear-mesh waker for %i
+After=tearmesh.service
+Requires=tearmesh.service
+
+[Service]
+User=%i
+ExecStart=/usr/local/bin/tearmesh waker
+Restart=on-failure
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

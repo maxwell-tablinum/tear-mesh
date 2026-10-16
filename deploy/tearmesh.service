@@ -1,0 +1,33 @@
+[Unit]
+Description=tear-mesh daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=tearmesh
+ExecStart=/usr/local/bin/tearmesh daemon --config /etc/tearmesh/config.toml
+RuntimeDirectory=tearmesh
+RuntimeDirectoryMode=0755
+StateDirectory=tearmesh
+StateDirectoryMode=0700
+Restart=on-failure
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+RestrictNamespaces=yes
+LockPersonality=yes
+CapabilityBoundingSet=
+SystemCallArchitectures=native
+MemoryMax=1G
+TasksMax=512
+LimitNOFILE=4096
+
+[Install]
+WantedBy=multi-user.target

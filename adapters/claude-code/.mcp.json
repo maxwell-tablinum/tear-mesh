@@ -1,0 +1,5 @@
+{
+  "mcpServers": {
+    "tearmesh": { "command": "tearmesh", "args": ["mcp"] }
+  }
+}

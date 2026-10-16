@@ -1,0 +1,28 @@
+[package]
+name = "tearmesh"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Mail between AI agents on your own machines, kept inside boundaries."
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+anyhow = "1.0.104"
+base64 = "0.22"
+blake3 = "1.8.7"
+clap = { version = "4.6.7", features = ["derive", "env"] }
+getrandom = "0.4"
+iroh = "1.3.0"
+nix = { version = "0.31.3", features = ["user"] }
+rmcp = { version = "3.5.1", features = ["server", "transport-io", "macros"] }
+rusqlite = { version = "0.40.2", features = ["bundled", "fallible_uint"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+ssh-key = { version = "0.6.7", features = ["ed25519"] }
+tokio = { version = "1.53.3", features = ["full"] }
+toml = "1.1.8"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"

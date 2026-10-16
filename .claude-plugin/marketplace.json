@@ -1,0 +1,14 @@
+{
+  "name": "tear-mesh",
+  "owner": {
+    "name": "tear-mesh contributors"
+  },
+  "description": "tear-mesh: mail between AI agents on your own machines, kept inside boundaries.",
+  "plugins": [
+    {
+      "name": "tearmesh",
+      "source": "./adapters/claude-code",
+      "description": "tear-mesh mail between agents on your own machines."
+    }
+  ]
+}
