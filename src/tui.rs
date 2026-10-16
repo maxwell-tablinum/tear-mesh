@@ -279,15 +279,19 @@ impl App {
                 } else {
                     Span::styled("● ", Style::new().fg(Color::Green))
                 };
-                ListItem::new(Line::from(vec![
-                    mark,
-                    Span::styled(
-                        format!("{:>4} ", age(l.ts)),
+                // Two lines per letter, so the subject stays readable in a narrow pane.
+                let subject = if l.read {
+                    Style::new()
+                } else {
+                    Style::new().add_modifier(Modifier::BOLD)
+                };
+                ListItem::new(vec![
+                    Line::from(vec![mark, Span::styled(l.subject.clone(), subject)]),
+                    Line::styled(
+                        format!("  {} · {}", l.from, age(l.ts)),
                         Style::new().fg(Color::DarkGray),
                     ),
-                    Span::raw(format!("{:<20} ", clip(&l.from, 20))),
-                    Span::raw(l.subject.clone()),
-                ]))
+                ])
             })
             .collect();
         let list = List::new(items)
@@ -414,14 +418,6 @@ fn field_mut(c: &mut Compose) -> &mut String {
         Field::To => &mut c.to,
         Field::Subject => &mut c.subject,
         Field::Body => &mut c.body,
-    }
-}
-
-fn clip(s: &str, n: usize) -> String {
-    if s.chars().count() <= n {
-        s.to_string()
-    } else {
-        s.chars().take(n - 1).chain(['…']).collect()
     }
 }
 
