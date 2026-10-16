@@ -121,4 +121,31 @@ check "the reply is on the same thread" bash -c "sudo -u tme-work env TEARMESH_S
 sleep 3
 check "one letter wakes once" test "$(grep -c 'waking helper@laptop' "$T/waker.log")" = 1
 
+# The terminal UI, driven through tmux as the laptop's boundary user.
+if command -v tmux >/dev/null; then
+  TS="tme2e-$$"
+  tmux new-session -d -s "$TS" -x 140 -y 30 "sudo -u tme-lap env TEARMESH_SOCKET=$T/laptop.sock TEARMESH_MAILBOX=admin $TM tui"
+  pane_has() { tmux capture-pane -p -t "$TS" 2>/dev/null | grep -q "$1"; }
+  check "tui shows the address and inbox" wait_for pane_has "admin@laptop · boundary work"
+  check "tui lists letters newest first" bash -c "tmux capture-pane -p -t $TS | grep -n 'hook test\|work note' | head -1 | grep -q 'hook test'"
+  tmux send-keys -t "$TS" j Enter
+  check "tui opens a letter" wait_for pane_has "hello laptop"
+  tmux send-keys -t "$TS" r
+  wait_for pane_has "Reply · To"
+  tmux send-keys -t "$TS" -l "pong from the tui"
+  tmux send-keys -t "$TS" C-s
+  check "tui shows the send result" wait_for pane_has "sent "
+  ws_has_tui_reply() { run tme-work "$T/ws.sock" builder inbox 2>/dev/null | grep -q "Re: work note"; }
+  check "tui reply reaches the sender" wait_for ws_has_tui_reply
+  TUI_ID=$(run tme-work "$T/ws.sock" builder inbox | grep "Re: work note" | cut -c1-12)
+  tui_body() { local out; out=$(run tme-work "$T/ws.sock" builder read "$TUI_ID"); grep -q "pong from the tui" <<<"$out" && grep -q "thread:  $ID1" <<<"$out"; }
+  check "tui reply body and thread are right" tui_body
+  tmux send-keys -t "$TS" q
+  tui_gone() { ! tmux has-session -t "$TS" 2>/dev/null; }
+  check "tui quits cleanly" wait_for tui_gone
+  tmux kill-session -t "$TS" 2>/dev/null
+else
+  echo "SKIP tui checks (no tmux)"
+fi
+
 if [ $FAILED = 0 ]; then echo "ALL PASSED"; else echo "--- ws.log"; tail -20 "$T/ws.log"; echo "--- laptop.log"; tail -20 "$T/laptop.log"; echo "--- waker.log"; cat "$T/waker.log"; exit 1; fi

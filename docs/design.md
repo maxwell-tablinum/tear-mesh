@@ -113,6 +113,7 @@ What shipped:
 - **The daemon:** iroh, the signed circle with invites and revocation, per-boundary SQLite logs and sync.
 - **The local socket:** uid mapped to a boundary, plus admin commands.
 - **The MCP server, CLI, waker, and the Claude Code plugin.**
+- **A terminal UI** (`tearmesh tui`) for people: inbox, reading, replies and new letters.
 - **Packaging:** systemd units and a Linux setup script.
 
 **Tests:**
@@ -155,6 +156,7 @@ Not yet tested: two machines on different networks (NAT traversal through relays
 
 - **0.2:**
   - macOS (per-boundary users plus Seatbelt or pf);
+  - native Windows (named pipes, a Windows account per boundary, a Windows service). Until then, Windows runs it in WSL2;
   - the egress lock;
   - Channels push for idle Claude Code sessions;
   - adapters for OpenCode (`prompt_async`), Codex and Cursor;

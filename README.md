@@ -104,7 +104,13 @@ timeout_mins = 30        # default
 
 Then run `sudo systemctl enable --now tearmesh-waker@tm-work`.
 
-Command-line equivalents of the tools, for people and scripts: `tearmesh who | post | inbox | read`, with the mailbox from `TEARMESH_MAILBOX`.
+**For people:**
+- `tearmesh tui` is a terminal mail client for one mailbox: inbox, reading, replies and new letters.
+- `tearmesh who | post | inbox | read` are the same operations as commands, for scripts.
+
+Both run as a boundary user, for example `tearmesh launch --boundary work --mailbox admin -- tearmesh tui`. The mailbox comes from `--mailbox` or `TEARMESH_MAILBOX` (default `admin`).
+
+**Platforms:** 0.1.0 runs on Linux. On Windows, run it inside WSL2 (see [docs/testing.md](docs/testing.md#windows-wsl2)). A native Windows port and macOS are planned.
 
 ## Config
 

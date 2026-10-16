@@ -80,6 +80,29 @@ sudo -u tm-work tearmesh post --to builder@alpha --subject re --body "got it" --
 sudo -u tm-work env TEARMESH_MAILBOX=builder tearmesh inbox
 ```
 
+### The terminal UI
+
+```sh
+tearmesh launch --boundary work --mailbox admin -- tearmesh tui     # on beta
+```
+
+The screen has three parts: the inbox (newest first, ● marks unread), the open letter, and a header showing your address and when each machine last synced. The keys:
+
+| Key | Does |
+|---|---|
+| `↑` `↓` or `j` `k` | Move through the inbox |
+| `enter` | Open a letter (marks it read) |
+| `r` | Reply to the open or selected letter, in its thread |
+| `n` | Write a new letter |
+| `a` | Switch between all letters and unread only |
+| `g` | Refresh (it also refreshes every 3 seconds) |
+| `space` / `pgup` | Scroll a long letter |
+| `q` | Quit |
+
+While writing a letter, `tab` moves between To, Subject and Body. `enter` adds a new line in the body. `ctrl+s` sends and `esc` discards. Separate several recipients with commas.
+
+Send a letter from alpha's TUI to `admin@beta`. It shows up in beta's TUI within a few seconds; reply with `r`.
+
 ### Check the boundaries
 
 Each of these should be refused with the reason shown.
@@ -153,6 +176,31 @@ sudo -u tm-work env TEARMESH_MAILBOX=builder tearmesh inbox
 ```
 
 `journalctl -u tearmesh-waker@tm-work` shows each wake. If the woken session can't use the tools, check the exact tool names with `/permissions` in an interactive session, and adjust `--allowedTools`.
+
+## Windows (WSL2)
+
+0.1.0 doesn't run natively on Windows. It depends on Unix sockets, Linux user ids and systemd. Inside WSL2 it runs unchanged and joins the circle like any Linux machine. Use it as **beta** in section 2.
+
+1. **Install Ubuntu.** In an administrator PowerShell, run `wsl --install -d Ubuntu-24.04`, restart if asked, then open "Ubuntu" from the Start menu and create your user.
+2. **Check systemd.** `systemctl is-system-running` should print `running` or `degraded`. If it prints `offline`, add these two lines to `/etc/wsl.conf`, then run `wsl --shutdown` in PowerShell and reopen Ubuntu:
+   ```
+   [boot]
+   systemd=true
+   ```
+3. **Build:**
+   ```sh
+   sudo apt update && sudo apt install -y build-essential git
+   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && . ~/.cargo/env
+   sudo git clone <repo-url> /opt/tear-mesh && sudo chown -R "$USER" /opt/tear-mesh
+   cd /opt/tear-mesh && cargo build --release
+   ```
+   Or skip the Rust install: copy `target/release/tearmesh` from the Linux machine (both x86_64; Ubuntu 24.04 on both is safest) and run setup with `TEARMESH_BIN=/path/to/tearmesh`.
+4. Continue with **Install** in section 2 (`sudo deploy/setup-linux.sh beta work`), then join with the invite.
+
+Notes for WSL2:
+- **Keep an Ubuntu window open while testing.** WSL stops the distribution, daemon included, a little while after its last window closes.
+- **Networking works as is**, through WSL's NAT and the relays. For direct peer-to-peer paths on Windows 11, you can add `networkingMode=mirrored` under `[wsl2]` in `%UserProfile%\.wslconfig` and restart WSL. This is optional.
+- Run the TUI in Windows Terminal, from the Ubuntu tab.
 
 ## 4. Uninstall
 

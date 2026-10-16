@@ -12,6 +12,7 @@ pub mod node;
 pub mod policy;
 pub mod store;
 pub mod sync;
+pub mod tui;
 pub mod waker;
 
 /// Machine, boundary and mailbox names: 1–32 of `a-z`, `0-9`, `-`, not starting with `-`.

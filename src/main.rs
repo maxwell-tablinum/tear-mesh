@@ -10,7 +10,7 @@ use tearmesh::circle::{Circle, Machine, ssh_sign};
 use tearmesh::config::{Config, DEFAULT_CONFIG};
 use tearmesh::ipc::{Client, Request, socket_path};
 use tearmesh::node::{Letter, Node, load_or_create_key};
-use tearmesh::{hook, ipc, mcp, waker};
+use tearmesh::{hook, ipc, mcp, tui, waker};
 
 #[derive(Parser)]
 #[command(
@@ -70,6 +70,11 @@ enum Cmd {
     },
     /// Show a letter and mark it read.
     Read { id: String },
+    /// Terminal mail client for your mailbox (TEARMESH_MAILBOX, default `admin`).
+    Tui {
+        #[arg(long)]
+        mailbox: Option<String>,
+    },
     /// Stdio MCP server for agent harnesses.
     Mcp,
     /// Claude Code hook: report new mail to the session.
@@ -253,6 +258,7 @@ async fn run(cmd: Cmd) -> Result<()> {
             }
             println!("\n{}", l.body.unwrap_or_default());
         }
+        Cmd::Tui { mailbox } => tui::run(mailbox).await?,
         Cmd::Mcp => mcp::run().await?,
         Cmd::Hook => hook::run().await?,
         Cmd::Waker { config } => waker::run(&config.unwrap_or_else(waker::default_config)).await?,
