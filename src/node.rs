@@ -969,6 +969,11 @@ impl Node {
         })
     }
 
+    /// Join requests waiting for the person to approve them.
+    pub fn joins_pending(&self) -> Vec<join::PendingInfo> {
+        self.joins.pending()
+    }
+
     pub fn subscribe(&self) -> broadcast::Receiver<Event> {
         self.events.subscribe()
     }
