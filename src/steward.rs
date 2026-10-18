@@ -132,7 +132,10 @@ pub async fn run(mailboxes: &Path, offers_path: &Path) -> Result<()> {
         mailboxes.display(),
         offers_path.display()
     );
-    let state = crate::os::home_dir().join(".local").join("state").join("tearmesh");
+    let state = crate::os::home_dir()
+        .join(".local")
+        .join("state")
+        .join("tearmesh");
     let mut w = Waker {
         boxes,
         offers,
@@ -372,9 +375,11 @@ pub async fn describe(server: &str, def: &OfferDef) -> Result<Offer> {
         stdin.flush().await?;
         Ok(())
     };
-    send(json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+    send(
+        json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
         "protocolVersion": "2025-06-18", "capabilities": {},
-        "clientInfo": {"name": "tearmesh", "version": env!("CARGO_PKG_VERSION")}}}))
+        "clientInfo": {"name": "tearmesh", "version": env!("CARGO_PKG_VERSION")}}}),
+    )
     .await?;
     let mut answer = async |id: i64| -> Result<Value> {
         loop {
@@ -382,9 +387,15 @@ pub async fn describe(server: &str, def: &OfferDef) -> Result<Offer> {
                 .await
                 .context("the server didn't answer within 30 s")??
                 .context("the server exited")?;
-            let Ok(v) = serde_json::from_str::<Value>(&line) else { continue };
+            let Ok(v) = serde_json::from_str::<Value>(&line) else {
+                continue;
+            };
             if v["id"] == json!(id) {
-                ensure!(v.get("error").is_none(), "the server returned an error: {}", v["error"]);
+                ensure!(
+                    v.get("error").is_none(),
+                    "the server returned an error: {}",
+                    v["error"]
+                );
                 return Ok(v["result"].clone());
             }
         }

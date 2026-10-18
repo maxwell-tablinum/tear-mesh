@@ -174,12 +174,12 @@ impl EndpointHooks for Members {
         &'a self,
         conn: &'a Connection,
     ) -> impl Future<Output = AfterHandshakeOutcome> + Send + 'a {
-        let member = self.mesh.read().unwrap().as_ref().is_some_and(|s| {
-            s.current()
-                .mesh
-                .machine_by_id(&conn.remote_id())
-                .is_some()
-        });
+        let member = self
+            .mesh
+            .read()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|s| s.current().mesh.machine_by_id(&conn.remote_id()).is_some());
         let alpn = conn.alpn();
         let ok = if alpn == join::ALPN {
             conn.side() == Side::Client || self.joins.open()
@@ -246,7 +246,9 @@ fn load_history(dir: &Path) -> Result<Option<MeshState>> {
         match SignedMesh::verify_next(&f.toml, &f.sig, history.last().expect("non-empty")) {
             Ok(s) => history.push(s),
             Err(e) => {
-                warn!("stored mesh version {v} doesn't follow the one before; ignoring it and later ones: {e:#}");
+                warn!(
+                    "stored mesh version {v} doesn't follow the one before; ignoring it and later ones: {e:#}"
+                );
                 break;
             }
         }
@@ -308,18 +310,20 @@ impl Node {
                 iroh_mdns_address_lookup::MdnsAddressLookup::builder().service_name("tearmesh"),
             );
         }
-        b = b.relay_mode(match cfg.network.relay.as_ref().unwrap_or(&settings.relays) {
-            Relay::Preset(p) if p == "n0" => RelayMode::Default,
-            Relay::Preset(_) => RelayMode::Disabled,
-            Relay::Urls(urls) => {
-                let urls: Vec<RelayUrl> = urls
-                    .iter()
-                    .map(|u| u.parse())
-                    .collect::<Result<_, _>>()
-                    .context("relay url")?;
-                RelayMode::Custom(urls.into_iter().collect::<RelayMap>())
-            }
-        });
+        b = b.relay_mode(
+            match cfg.network.relay.as_ref().unwrap_or(&settings.relays) {
+                Relay::Preset(p) if p == "n0" => RelayMode::Default,
+                Relay::Preset(_) => RelayMode::Disabled,
+                Relay::Urls(urls) => {
+                    let urls: Vec<RelayUrl> = urls
+                        .iter()
+                        .map(|u| u.parse())
+                        .collect::<Result<_, _>>()
+                        .context("relay url")?;
+                    RelayMode::Custom(urls.into_iter().collect::<RelayMap>())
+                }
+            },
+        );
         if let Some(addr) = cfg.network.bind {
             b = b.clear_ip_transports().bind_addr(addr)?;
         }
@@ -482,12 +486,13 @@ impl Node {
             } else if *v <= cur {
                 let Some(mine) = state.at(*v) else { continue };
                 let h = crate::mesh::hash(toml);
-                if h == mine.hash || h > mine.hash {
+                // The same file, or a sibling that loses to ours.
+                if h >= mine.hash {
                     continue;
                 }
-                let prev = state
-                    .at(v - 1)
-                    .with_context(|| format!("can't check sibling version {v}: no version {}", v - 1))?;
+                let prev = state.at(v - 1).with_context(|| {
+                    format!("can't check sibling version {v}: no version {}", v - 1)
+                })?;
                 let s = SignedMesh::verify_next(toml, sig, prev)?;
                 let dropped: Vec<String> = state
                     .history
@@ -498,7 +503,9 @@ impl Node {
                 state.history.retain(|x| x.mesh.version < *v);
                 for d in &dropped {
                     let n = d.split(' ').next().unwrap_or_default();
-                    let _ = std::fs::remove_file(self.cfg.state_dir.join("mesh").join(format!("{n}.json")));
+                    let _ = std::fs::remove_file(
+                        self.cfg.state_dir.join("mesh").join(format!("{n}.json")),
+                    );
                 }
                 save_version(&self.cfg.state_dir, &s)?;
                 state.history.push(s);
@@ -543,7 +550,9 @@ impl Node {
     /// Versions a peer at `(v, hash)` lacks, to send it. Includes this machine's file at `v` when
     /// the peer's differs, so the peer can settle the split.
     pub(crate) fn versions_for(&self, v: u64, hash: &str) -> Vec<(u64, String, String)> {
-        let Ok(state) = self.state() else { return vec![] };
+        let Ok(state) = self.state() else {
+            return vec![];
+        };
         let cur = state.current().mesh.version;
         let from = match state.at(v) {
             Some(mine) if mine.hash == hash => v + 1,
@@ -859,7 +868,9 @@ impl Node {
         self.with_store(boundary, |s| {
             Ok(s.mail_for(mailbox, &addr, Seen::Read)?
                 .into_iter()
-                .filter(|(st, read)| (all || !read) && policy::visible(&mesh, &self.cfg.machine, &st.env))
+                .filter(|(st, read)| {
+                    (all || !read) && policy::visible(&mesh, &self.cfg.machine, &st.env)
+                })
                 .map(|(st, read)| letter(st, read, false))
                 .collect())
         })
@@ -872,7 +883,9 @@ impl Node {
         self.with_store(boundary, |s| {
             let st = s
                 .get(id)?
-                .filter(|st| st.env.kind.is_letter() && policy::visible(&mesh, &self.cfg.machine, &st.env))
+                .filter(|st| {
+                    st.env.kind.is_letter() && policy::visible(&mesh, &self.cfg.machine, &st.env)
+                })
                 .with_context(|| format!("no letter {id} in this boundary"))?;
             s.mark(mailbox, &st.id, Seen::Read)?;
             Ok(letter(st, true, true))

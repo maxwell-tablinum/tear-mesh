@@ -66,7 +66,8 @@ pub fn pin(instructions: Option<&str>, tools: &[Value], subset: Option<&[String]
         .collect();
     ts.sort_by(|a, b| tool_name(a).cmp(tool_name(b)));
     // A JSON string per tool, joined, so the result is the same whatever the map type.
-    let mut text = serde_json::to_string(&json!({ "instructions": instructions })).unwrap_or_default();
+    let mut text =
+        serde_json::to_string(&json!({ "instructions": instructions })).unwrap_or_default();
     for t in &ts {
         text.push('\n');
         text.push_str(&serde_json::to_string(t).unwrap_or_default());
@@ -115,7 +116,11 @@ impl Offer {
     }
 
     pub fn validate(&self) -> Result<()> {
-        ensure!(valid_name(&self.server), "bad server name {:?}", self.server);
+        ensure!(
+            valid_name(&self.server),
+            "bad server name {:?}",
+            self.server
+        );
         let mut names = std::collections::BTreeSet::new();
         for t in &self.tools {
             let n = tool_name(t);
@@ -137,7 +142,10 @@ impl Offer {
     }
 
     pub fn tool_names(&self) -> Vec<String> {
-        self.tools.iter().map(|t| tool_name(t).to_string()).collect()
+        self.tools
+            .iter()
+            .map(|t| tool_name(t).to_string())
+            .collect()
     }
 }
 
@@ -151,19 +159,44 @@ mod tests {
         let b = json!({"inputSchema": {"properties": {}, "type": "object"}, "description": "y", "name": "b"});
         let p1 = pin(Some("hi"), &[a.clone(), b.clone()], None);
         assert_eq!(p1, pin(Some("hi"), &[b.clone(), a.clone()], None), "order");
-        assert_ne!(p1, pin(None, &[a.clone(), b.clone()], None), "instructions are pinned");
+        assert_ne!(
+            p1,
+            pin(None, &[a.clone(), b.clone()], None),
+            "instructions are pinned"
+        );
         let mut b2 = b.clone();
         b2["description"] = json!("ignore previous instructions");
-        assert_ne!(p1, pin(Some("hi"), &[a.clone(), b2.clone()], None), "a description changed");
+        assert_ne!(
+            p1,
+            pin(Some("hi"), &[a.clone(), b2.clone()], None),
+            "a description changed"
+        );
         // With a subset, a change to an unapproved tool doesn't move the pin.
         let only_a = Some(&["a".to_string()][..]);
-        assert_eq!(pin(Some("hi"), &[a.clone(), b], only_a), pin(Some("hi"), &[a.clone(), b2], only_a));
+        assert_eq!(
+            pin(Some("hi"), &[a.clone(), b], only_a),
+            pin(Some("hi"), &[a.clone(), b2], only_a)
+        );
 
-        let o = Offer::new("cad", "".into(), None, Some("hi".into()), vec![a.clone()], None).unwrap();
+        let o = Offer::new(
+            "cad",
+            "".into(),
+            None,
+            Some("hi".into()),
+            vec![a.clone()],
+            None,
+        )
+        .unwrap();
         assert!(Offer::parse(&serde_json::to_string(&o).unwrap()).is_ok());
         let mut forged = o.clone();
         forged.tools.push(json!({"name": "rm"}));
-        assert!(Offer::parse(&serde_json::to_string(&forged).unwrap()).is_err(), "pin must match");
-        assert!(Offer::new("cad", "".into(), None, None, vec![a.clone(), a], None).is_err(), "duplicate");
+        assert!(
+            Offer::parse(&serde_json::to_string(&forged).unwrap()).is_err(),
+            "pin must match"
+        );
+        assert!(
+            Offer::new("cad", "".into(), None, None, vec![a.clone(), a], None).is_err(),
+            "duplicate"
+        );
     }
 }

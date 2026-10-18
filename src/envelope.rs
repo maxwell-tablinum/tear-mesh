@@ -335,9 +335,15 @@ pub(crate) mod tests {
             body: "b".into(),
         };
         let env = entry.open().unwrap();
-        assert_eq!((env.mesh.as_str(), env.label.trust, env.kind), ("c1", Trust::Member, Kind::Info));
+        assert_eq!(
+            (env.mesh.as_str(), env.label.trust, env.kind),
+            ("c1", Trust::Member, Kind::Info)
+        );
         e.kind = Kind::Offer;
-        assert!(Entry::sign(&e, "b".into(), &k).unwrap().open().is_err(), "v1 has letters only");
+        assert!(
+            Entry::sign(&e, "b".into(), &k).unwrap().open().is_err(),
+            "v1 has letters only"
+        );
     }
 
     #[test]

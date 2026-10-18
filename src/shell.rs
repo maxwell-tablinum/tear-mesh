@@ -28,9 +28,14 @@ pub async fn serve(node: &Arc<Node>, conn: Connection) -> Result<()> {
     let peer = conn.remote_id();
     let (mut send, mut recv) = conn.accept_bi().await?;
     let setup = async {
-        let h: Header = tokio::time::timeout(Duration::from_secs(30), recv_json(&mut recv)).await??;
+        let h: Header =
+            tokio::time::timeout(Duration::from_secs(30), recv_json(&mut recv)).await??;
         let mesh = node.mesh()?;
-        let caller = mesh.machine_by_id(&peer).context("not a member")?.name.clone();
+        let caller = mesh
+            .machine_by_id(&peer)
+            .context("not a member")?
+            .name
+            .clone();
         policy::may_shell(&mesh, &caller, &node.cfg.machine, &h.boundary)?;
         let tcp = tokio::net::TcpStream::connect(("127.0.0.1", node.cfg.shell_port))
             .await
@@ -41,16 +46,31 @@ pub async fn serve(node: &Arc<Node>, conn: Connection) -> Result<()> {
     let tcp = match setup.await {
         Ok(t) => t,
         Err(e) => {
-            let _ = send_json(&mut send, &Ack { ok: false, error: format!("{e:#}") }).await;
+            let _ = send_json(
+                &mut send,
+                &Ack {
+                    ok: false,
+                    error: format!("{e:#}"),
+                },
+            )
+            .await;
             let _ = send.finish();
             let _ = tokio::time::timeout(Duration::from_secs(5), conn.closed()).await;
             return Err(e);
         }
     };
-    send_json(&mut send, &Ack { ok: true, error: String::new() }).await?;
+    send_json(
+        &mut send,
+        &Ack {
+            ok: true,
+            error: String::new(),
+        },
+    )
+    .await?;
     let (tr, tw) = tcp.into_split();
     let r = splice(recv, send, tr, tw).await;
-    conn.close(0u32.into(), b"done");
+    // The caller closes once it has everything; closing here could drop bytes still in flight.
+    let _ = tokio::time::timeout(Duration::from_secs(10), conn.closed()).await;
     r
 }
 
@@ -59,7 +79,11 @@ pub async fn open(
     node: &Arc<Node>,
     boundary: &str,
     machine: &str,
-) -> Result<(iroh::endpoint::RecvStream, iroh::endpoint::SendStream, Connection)> {
+) -> Result<(
+    iroh::endpoint::RecvStream,
+    iroh::endpoint::SendStream,
+    Connection,
+)> {
     let mesh = node.mesh()?;
     policy::may_shell(&mesh, &node.cfg.machine, machine, boundary)?;
     let target = mesh.machine(machine).context("no such machine")?.id;
@@ -67,7 +91,13 @@ pub async fn open(
         .await
         .map_err(|_| anyhow::anyhow!("{machine} not reachable"))??;
     let (mut send, mut recv) = conn.open_bi().await?;
-    send_json(&mut send, &Header { boundary: boundary.into() }).await?;
+    send_json(
+        &mut send,
+        &Header {
+            boundary: boundary.into(),
+        },
+    )
+    .await?;
     let ack: Ack = tokio::time::timeout(Duration::from_secs(30), recv_json(&mut recv)).await??;
     ensure!(ack.ok, "{machine} refused: {}", ack.error);
     Ok((recv, send, conn))

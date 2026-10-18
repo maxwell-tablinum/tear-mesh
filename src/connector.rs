@@ -60,9 +60,15 @@ pub fn default_config() -> PathBuf {
 }
 
 pub fn load(path: &Path) -> Result<ConnectorConfig> {
-    let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-    let c: ConnectorConfig = toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
-    ensure!(crate::valid_name(&c.mailbox), "bad mailbox name {:?}", c.mailbox);
+    let text =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let c: ConnectorConfig =
+        toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+    ensure!(
+        crate::valid_name(&c.mailbox),
+        "bad mailbox name {:?}",
+        c.mailbox
+    );
     Ok(c)
 }
 
@@ -88,17 +94,23 @@ pub struct FileArgs {
 
 #[tool_router]
 impl Connector {
-    #[tool(description = "Your tear-mesh address, the machines in your boundary (with their bios and offered tools), and the mailbox addresses known there.")]
+    #[tool(
+        description = "Your tear-mesh address, the machines in your boundary (with their bios and offered tools), and the mailbox addresses known there."
+    )]
     async fn who(&self) -> Result<String, String> {
         self.call(Request::Who).await
     }
 
-    #[tool(description = "Send a letter to mailboxes in your boundary: `mailbox@machine`, or `*` for everyone. `kind` is info (default), task, or question. To reply, set `thread` to the letter's id. Letters from here are marked guest.")]
+    #[tool(
+        description = "Send a letter to mailboxes in your boundary: `mailbox@machine`, or `*` for everyone. `kind` is info (default), task, or question. To reply, set `thread` to the letter's id. Letters from here are marked guest."
+    )]
     async fn post(&self, Parameters(a): Parameters<PostArgs>) -> Result<String, String> {
         self.call(crate::mcp::post_request(a)?).await
     }
 
-    #[tool(description = "List letters addressed to this mailbox (or to everyone). Unread only unless `all` is set.")]
+    #[tool(
+        description = "List letters addressed to this mailbox (or to everyone). Unread only unless `all` is set."
+    )]
     async fn inbox(&self, Parameters(a): Parameters<InboxArgs>) -> Result<String, String> {
         self.call(Request::Inbox { all: a.all }).await
     }
@@ -108,7 +120,9 @@ impl Connector {
         self.call(Request::Read { id: a.id }).await
     }
 
-    #[tool(description = "Read-only: branch, uncommitted changes and recent commits of the configured git repositories.")]
+    #[tool(
+        description = "Read-only: branch, uncommitted changes and recent commits of the configured git repositories."
+    )]
     async fn repo_status(&self, Parameters(a): Parameters<RepoArgs>) -> Result<String, String> {
         let repos: Vec<&PathBuf> = self
             .cfg
@@ -148,7 +162,9 @@ impl Connector {
         Ok(out)
     }
 
-    #[tool(description = "Read-only: a text file under one of the configured directories (at most 512 KiB).")]
+    #[tool(
+        description = "Read-only: a text file under one of the configured directories (at most 512 KiB)."
+    )]
     async fn read_file(&self, Parameters(a): Parameters<FileArgs>) -> Result<String, String> {
         read_under(&self.cfg.roots, &a.path).map_err(|e| format!("{e:#}"))
     }
@@ -158,7 +174,10 @@ impl Connector {
 /// and symlinks leading outside the root are refused by the kernel, with no check-then-open race.
 pub fn read_under(roots: &[PathBuf], path: &str) -> Result<String> {
     use nix::fcntl::{OFlag, OpenHow, ResolveFlag, openat2};
-    ensure!(!roots.is_empty(), "no directories are configured for read_file");
+    ensure!(
+        !roots.is_empty(),
+        "no directories are configured for read_file"
+    );
     let p = Path::new(path);
     let (root, rel) = if p.is_absolute() {
         roots
@@ -172,7 +191,8 @@ pub fn read_under(roots: &[PathBuf], path: &str) -> Result<String> {
     let how = OpenHow::new()
         .flags(OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOCTTY | OFlag::O_NONBLOCK)
         .resolve(ResolveFlag::RESOLVE_BENEATH | ResolveFlag::RESOLVE_NO_MAGICLINKS);
-    let fd = openat2(dir.as_fd(), rel, how).with_context(|| format!("can't open {path} under {}", root.display()))?;
+    let fd = openat2(dir.as_fd(), rel, how)
+        .with_context(|| format!("can't open {path} under {}", root.display()))?;
     let f = std::fs::File::from(fd);
     let meta = f.metadata()?;
     ensure!(meta.is_file(), "{path} isn't a regular file");
@@ -187,7 +207,9 @@ impl Connector {
     async fn call(&self, req: Request) -> Result<String, String> {
         let mut guard = self.client.lock().await;
         if guard.is_none() {
-            let mut c = Client::connect(&socket_path()).await.map_err(|e| format!("{e:#}"))?;
+            let mut c = Client::connect(&socket_path())
+                .await
+                .map_err(|e| format!("{e:#}"))?;
             c.call(&Request::Hello {
                 mailbox: Some(self.cfg.mailbox.clone()),
                 hold: false,
@@ -211,7 +233,10 @@ impl Connector {
 impl ServerHandler for Connector {
     fn get_info(&self) -> ServerConfig {
         let mut info = ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
-            .with_server_info(Implementation::new("tearmesh-connector", env!("CARGO_PKG_VERSION")));
+            .with_server_info(Implementation::new(
+                "tearmesh-connector",
+                env!("CARGO_PKG_VERSION"),
+            ));
         info.instructions = Some(
             "tear-mesh: mail between the owner's machines and their agents. Post letters (tasks, questions, \
              notes) to `mailbox@machine`; read replies with `inbox` and `read`. `repo_status` and `read_file` \
@@ -224,7 +249,10 @@ impl ServerHandler for Connector {
 
 pub async fn run(config: &Path) -> Result<()> {
     let cfg = Arc::new(load(config)?);
-    let dir = cfg.listen.parent().context("listen path has no directory")?;
+    let dir = cfg
+        .listen
+        .parent()
+        .context("listen path has no directory")?;
     std::fs::create_dir_all(dir)?;
     // Only this user (and the tunnel running as this user) may reach the socket: another local
     // user, in another boundary, must not be able to post or read through it.
@@ -279,11 +307,17 @@ mod tests {
         std::os::unix::fs::symlink("../secret", root.join("rel")).unwrap();
         let roots = vec![root.clone()];
         assert_eq!(read_under(&roots, "sub/a.md").unwrap(), "hello");
-        assert_eq!(read_under(&roots, root.join("sub/a.md").to_str().unwrap()).unwrap(), "hello");
+        assert_eq!(
+            read_under(&roots, root.join("sub/a.md").to_str().unwrap()).unwrap(),
+            "hello"
+        );
         assert!(read_under(&roots, "../secret").is_err(), "dot-dot");
         assert!(read_under(&roots, "link").is_err(), "absolute symlink out");
         assert!(read_under(&roots, "rel").is_err(), "relative symlink out");
-        assert!(read_under(&roots, d.path().join("secret").to_str().unwrap()).is_err(), "outside path");
+        assert!(
+            read_under(&roots, d.path().join("secret").to_str().unwrap()).is_err(),
+            "outside path"
+        );
         assert!(read_under(&roots, "sub").is_err(), "a directory");
     }
 }

@@ -232,7 +232,8 @@ impl Inner {
     fn expire(&mut self) {
         let now = now_ms();
         self.invites.retain(|i| i.expires_ms > now);
-        self.pending.retain(|p| p.expires_ms > now && p.tx.as_ref().is_some_and(|t| !t.is_closed()));
+        self.pending
+            .retain(|p| p.expires_ms > now && p.tx.as_ref().is_some_and(|t| !t.is_closed()));
     }
 }
 
@@ -328,7 +329,13 @@ pub async fn serve(node: &Arc<Node>, conn: Connection) -> Result<()> {
     let r = owner_side(node, &joiner, &mut send, &mut recv).await;
     if let Err(e) = &r {
         warn!("join attempt from {}: {e:#}", joiner.fmt_short());
-        let _ = send_json(&mut send, &Frame::Refused { reason: format!("{e:#}") }).await;
+        let _ = send_json(
+            &mut send,
+            &Frame::Refused {
+                reason: format!("{e:#}"),
+            },
+        )
+        .await;
     }
     let _ = send.finish();
     let _ = tokio::time::timeout(Duration::from_secs(10), conn.closed()).await;
@@ -341,8 +348,11 @@ async fn owner_side(
     send: &mut SendStream,
     recv: &mut RecvStream,
 ) -> Result<()> {
-    let Frame::Request { mesh, name, proof: p } =
-        tokio::time::timeout(Duration::from_secs(30), recv_json(recv)).await??
+    let Frame::Request {
+        mesh,
+        name,
+        proof: p,
+    } = tokio::time::timeout(Duration::from_secs(30), recv_json(recv)).await??
     else {
         bail!("expected a join request")
     };
@@ -473,7 +483,10 @@ impl Joining {
         let r = match frame {
             Frame::Approved { toml, sig } => {
                 let s = SignedMesh::verify_first(&toml, &sig)?;
-                ensure!(s.mesh.id == self.ticket.mesh, "the file is for another mesh");
+                ensure!(
+                    s.mesh.id == self.ticket.mesh,
+                    "the file is for another mesh"
+                );
                 ensure!(
                     s.mesh.owner_set_hash()? == self.ticket.owners,
                     "the file's owner keys aren't the ones the ticket named"
@@ -516,7 +529,11 @@ mod tests {
 
         let c = code(&t.secret, &joiner, &owner);
         assert_eq!(c.len(), 6);
-        assert_ne!(c, code(&[8; 16], &joiner, &owner), "another ticket, another code");
+        assert_ne!(
+            c,
+            code(&[8; 16], &joiner, &owner),
+            "another ticket, another code"
+        );
         assert_ne!(
             proof(&t.secret, &joiner, &owner),
             proof(&t.secret, &owner, &joiner),

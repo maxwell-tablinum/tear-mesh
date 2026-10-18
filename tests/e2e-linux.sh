@@ -5,15 +5,15 @@
 # grants, MCP over stdio, a tool call to another machine's offered server through the steward,
 # shell forwarding, bios, the hook, the steward waking a mailbox, the connector and the TUI.
 # Needs passwordless sudo, python3 and curl. Creates and removes the users tme-work, tme-vault
-# and tme-lap.
+# tme-lap and tme-none (mapped to no boundary).
 # Usage: cargo build --release && tests/e2e-linux.sh
 set -uo pipefail
-BIN=$(cd "$(dirname "$0")/.." && pwd)/target/release/tearmesh
+BIN=${TEARMESH_BIN:-$(cd "$(dirname "$0")/.." && pwd)/target/release/tearmesh}
 [ -x "$BIN" ] || { echo "build first: cargo build --release" >&2; exit 2; }
 cd /
 T=$(mktemp -d /tmp/tm-e2e.XXXX)
 chmod 0755 "$T"
-USERS="tme-work tme-vault tme-lap"
+USERS="tme-work tme-vault tme-lap tme-none"
 FAILED=0
 cleanup() {
   kill $(jobs -p) 2>/dev/null
@@ -109,7 +109,7 @@ check "vault session can't address a work-only machine" refused "is not in bound
 check "vault session can't read work mail on the same machine" refused "no letter" run tme-vault "$T/ws.sock" builder read "${ID1:0:12}"
 check "work user can't read the vault user's home" refused "Permission denied" sudo -u tme-work ls /home/tme-vault
 check "boundary users can't read the daemon's state" refused "Permission denied" sudo -u tme-vault cat "$T/ws/boundaries/vault.db"
-check "an unmapped OS user is refused" refused "isn't mapped" sudo -u nobody env TEARMESH_SOCKET="$T/ws.sock" "$TM" who
+check "an unmapped OS user is refused" refused "isn't mapped" sudo -u tme-none env TEARMESH_SOCKET="$T/ws.sock" "$TM" who
 check "a boundary user can't run admin commands" refused "admin only" run tme-work "$T/ws.sock" admin status
 
 # Tools: ws's work boundary offers an MCP server; laptop may call one of its two tools.
@@ -139,7 +139,8 @@ description = "Echoes text"
 dir = "$T"
 EOF
 chmod 0644 "$T/echo-server.py" "$T/offers-tme-work.toml"
-check "a boundary user publishes an offer" bash -c "sudo -u tme-work env TEARMESH_SOCKET=$T/ws.sock TEARMESH_OFFERS=$T/offers-tme-work.toml $TM offer publish echo 2>&1 | grep -q 'published; pin'"
+publish() { local out; out=$(run tme-work "$T/ws.sock" admin offer publish echo 2>&1); grep -q 'published; pin' <<<"$out" || { echo "  got: $out"; return 1; }; }
+check "a boundary user publishes an offer" publish
 sudo -u tme-work env TEARMESH_SOCKET="$T/ws.sock" TEARMESH_OFFERS="$T/offers-tme-work.toml" TEARMESH_MAILBOXES=/nonexistent "$TM" steward 2>"$T/steward-ws.log" &
 MCP_INIT='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"e2e","version":"0"}}}'
 remote_call() {
@@ -168,8 +169,8 @@ check "an unapproved tool is refused" reply_has 4 "isn't approved"
 check "other MCP methods are refused" reply_has 5 "isn't allowed"
 check "the steward ran the server as the boundary user" grep -q "serving echo" "$T/steward-ws.log"
 
-SHELL_OUT=$(printf '' | timeout 10 sudo -u tme-lap env TEARMESH_SOCKET="$T/laptop.sock" "$TM" shell-proxy ws 2>&1)
-check "shell-proxy reaches ws's sshd" grep -q "SSH-2.0-fake" <<<"$SHELL_OUT"
+shell_ok() { local out; out=$(printf '' | timeout 10 sudo -u tme-lap env TEARMESH_SOCKET="$T/laptop.sock" "$TM" shell-proxy ws 2>&1); grep -q "SSH-2.0-fake" <<<"$out" || { echo "  got: $out"; return 1; }; }
+check "shell-proxy reaches ws's sshd" shell_ok
 check "the shell grant is one way" refused "no shell grant" run tme-work "$T/ws.sock" admin shell-proxy laptop
 
 printf 'role: build box\noffers: [echo]\n' | run tme-work "$T/ws.sock" admin bio set - >/dev/null
@@ -248,6 +249,7 @@ check "another local user can't reach the connector" refused "" cpost tme-work "
 
 # The terminal UI, driven through tmux as the laptop's boundary user.
 if command -v tmux >/dev/null; then
+  export TMUX_TMPDIR=$T
   TS="tme2e-$$"
   tmux new-session -d -s "$TS" -x 140 -y 30 "sudo -u tme-lap env TEARMESH_SOCKET=$T/laptop.sock TEARMESH_MAILBOX=admin $TM tui"
   pane_has() { tmux capture-pane -p -t "$TS" 2>/dev/null | grep -q "$1"; }

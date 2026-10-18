@@ -162,8 +162,7 @@ fn is_hex64(s: &str) -> bool {
 /// MCP tool names: 1-128 of letters, digits, `_`, `-`, `.`.
 pub fn valid_tool_name(s: &str) -> bool {
     (1..=128).contains(&s.len())
-        && s
-            .bytes()
+        && s.bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
 }
 
@@ -314,7 +313,12 @@ impl Mesh {
                 g.from,
                 g.to
             );
-            ensure!(!g.allow.is_empty(), "grant {} -> {} allows nothing", g.from, g.to);
+            ensure!(
+                !g.allow.is_empty(),
+                "grant {} -> {} allows nothing",
+                g.from,
+                g.to
+            );
             ensure!(
                 !g.allow.contains(&Category::Shell) || (g.from != "*" && g.to != "*"),
                 "a shell grant must name both machines, not *"
@@ -398,7 +402,9 @@ impl Mesh {
             return true;
         }
         self.grants.iter().any(|g| {
-            (g.from == "*" || g.from == from) && (g.to == "*" || g.to == to) && g.allow.contains(&cat)
+            (g.from == "*" || g.from == from)
+                && (g.to == "*" || g.to == to)
+                && g.allow.contains(&cat)
         })
     }
 
@@ -444,7 +450,11 @@ impl Mesh {
     }
 
     pub fn grant(&mut self, from: &str, to: &str, cats: &[Category]) {
-        match self.grants.iter_mut().find(|g| g.from == from && g.to == to) {
+        match self
+            .grants
+            .iter_mut()
+            .find(|g| g.from == from && g.to == to)
+        {
             Some(g) => {
                 for c in cats {
                     if !g.allow.contains(c) {
@@ -653,8 +663,13 @@ pub(crate) mod tests {
 
         assert!(Mesh::new("home", vec![p1.clone()], vec!["work".into()], None).is_err());
 
-        let m1 = Mesh::new("home", vec![p1.clone(), p2.clone()], vec!["work".into()], None)
-            .unwrap();
+        let m1 = Mesh::new(
+            "home",
+            vec![p1.clone(), p2.clone()],
+            vec!["work".into()],
+            None,
+        )
+        .unwrap();
         let t1 = m1.to_toml().unwrap();
         let v1 = SignedMesh::verify_first(&t1, &sign(d.path(), &k1, &t1)).unwrap();
         assert!(
@@ -679,7 +694,10 @@ pub(crate) mod tests {
             SignedMesh::verify_next(&t2, &v2.sig, &v2).is_err(),
             "replay of the same version"
         );
-        assert!(SignedMesh::verify_next(&t1, &v1.sig, &v2).is_err(), "rollback");
+        assert!(
+            SignedMesh::verify_next(&t1, &v1.sig, &v2).is_err(),
+            "rollback"
+        );
 
         // A jump (here to u64::MAX) can't freeze the mesh: only version + 1 follows.
         let mut jump = m2.clone();
@@ -717,10 +735,13 @@ pub(crate) mod tests {
         let v1 = format!(
             "id = \"abc123\"\nname = \"home\"\nversion = 4\nowners = [{p1:?}, {p2:?}]\nboundaries = [\"work\"]\n"
         );
-        let old = SignedMesh::verify_first(&v1, &sign_ns(d.path(), &k1, &v1, V1_NAMESPACE))
-            .unwrap();
+        let old =
+            SignedMesh::verify_first(&v1, &sign_ns(d.path(), &k1, &v1, V1_NAMESPACE)).unwrap();
         assert_eq!(old.mesh.format, 1);
-        assert!(old.mesh.allows("a", "b", Category::Converse), "0.1 mail still flows");
+        assert!(
+            old.mesh.allows("a", "b", Category::Converse),
+            "0.1 mail still flows"
+        );
         assert!(
             SignedMesh::verify_first(&v1, &sign(d.path(), &k1, &v1)).is_err(),
             "a v1 file isn't valid under the new namespace"
@@ -737,13 +758,25 @@ pub(crate) mod tests {
         let d = tempfile::tempdir().unwrap();
         let (_k1, p1) = keygen(d.path(), "one");
         let (_k2, p2) = keygen(d.path(), "two");
-        let mut m = Mesh::new("home", vec![p1, p2], vec!["work".into(), "vault".into()], None)
-            .unwrap();
+        let mut m = Mesh::new(
+            "home",
+            vec![p1, p2],
+            vec!["work".into(), "vault".into()],
+            None,
+        )
+        .unwrap();
         m.add_machine(machine("a", &["work"]), false).unwrap();
-        m.add_machine(machine("b", &["work", "vault"]), false).unwrap();
-        assert!(m.add_machine(machine("a", &["work"]), false).is_err(), "name reuse");
+        m.add_machine(machine("b", &["work", "vault"]), false)
+            .unwrap();
+        assert!(
+            m.add_machine(machine("a", &["work"]), false).is_err(),
+            "name reuse"
+        );
 
-        assert!(m.allows("a", "b", Category::Converse), "default * -> * mail");
+        assert!(
+            m.allows("a", "b", Category::Converse),
+            "default * -> * mail"
+        );
         assert!(!m.allows("a", "b", Category::Tools), "deny by default");
         m.grant("a", "b", &[Category::Tools, Category::Shell]);
         assert!(m.allows("a", "b", Category::Shell) && !m.allows("b", "a", Category::Shell));

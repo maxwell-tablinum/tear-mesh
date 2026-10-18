@@ -295,12 +295,25 @@ mod tests {
         });
         assert!(visible(&c, "laptop", &letter));
 
-        assert!(may_call(&c, "laptop", "ws", "work", "cad").is_err(), "no tools grant");
+        assert!(
+            may_call(&c, "laptop", "ws", "work", "cad").is_err(),
+            "no tools grant"
+        );
         c.grant("laptop", "ws", &[Category::Tools]);
-        assert!(may_call(&c, "laptop", "ws", "work", "cad").is_err(), "not approved");
-        assert!(may_call(&c, "laptop", "ws", "vault", "cad").is_err(), "laptop isn't in vault");
+        assert!(
+            may_call(&c, "laptop", "ws", "work", "cad").is_err(),
+            "not approved"
+        );
+        assert!(
+            may_call(&c, "laptop", "ws", "vault", "cad").is_err(),
+            "laptop isn't in vault"
+        );
         c.settings.tools_sharing = Sharing::Free;
-        assert!(may_call(&c, "laptop", "ws", "work", "cad").unwrap().is_none());
+        assert!(
+            may_call(&c, "laptop", "ws", "work", "cad")
+                .unwrap()
+                .is_none()
+        );
         assert!(may_shell(&c, "laptop", "ws", "work").is_err());
     }
 }

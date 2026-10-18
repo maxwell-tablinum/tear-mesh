@@ -394,7 +394,15 @@ async fn run(cmd: Cmd) -> Result<()> {
             for l in letters {
                 let tag = match (l.kind, l.trust) {
                     (Kind::Info, tearmesh::envelope::Trust::Member) => String::new(),
-                    (k, t) => format!(" [{}{}]", k.as_str(), if t == tearmesh::envelope::Trust::Member { String::new() } else { format!(", {}", t.as_str()) }),
+                    (k, t) => format!(
+                        " [{}{}]",
+                        k.as_str(),
+                        if t == tearmesh::envelope::Trust::Member {
+                            String::new()
+                        } else {
+                            format!(", {}", t.as_str())
+                        }
+                    ),
                 };
                 println!(
                     "{} {} {:<24} {}{tag}",
@@ -428,7 +436,11 @@ async fn run(cmd: Cmd) -> Result<()> {
                 if machine.as_ref().is_some_and(|x| *x != m.name) {
                     continue;
                 }
-                println!("== {}\n{}\n", m.name, m.bio.as_deref().unwrap_or("(no bio)"));
+                println!(
+                    "== {}\n{}\n",
+                    m.name,
+                    m.bio.as_deref().unwrap_or("(no bio)")
+                );
             }
         }
         Cmd::Bio(BioCmd::Set { file, boundary }) => {
@@ -466,8 +478,14 @@ async fn run(cmd: Cmd) -> Result<()> {
             println!("withdrew {name}");
         }
         Cmd::Offers { boundary } => {
-            let req = Request::Offers { boundary: boundary.clone() };
-            let v = if boundary.is_some() { admin(req).await? } else { session(req).await? };
+            let req = Request::Offers {
+                boundary: boundary.clone(),
+            };
+            let v = if boundary.is_some() {
+                admin(req).await?
+            } else {
+                session(req).await?
+            };
             println!("{}", serde_json::to_string_pretty(&v)?);
         }
         Cmd::Mcp { remote, http } => match (remote, http) {
@@ -930,17 +948,25 @@ async fn setup(config: &Path) -> Result<()> {
         b.dedup();
         b
     };
-    ensure!(!boundaries.is_empty(), "the config maps no users to boundaries");
+    ensure!(
+        !boundaries.is_empty(),
+        "the config maps no users to boundaries"
+    );
     let ssh = tearmesh::os::home_dir().join(".ssh");
     std::fs::create_dir_all(&ssh)?;
-    eprintln!("\nOwner keys sign every change to the mesh. You need two: an everyday key on this machine and a portable one.");
+    eprintln!(
+        "\nOwner keys sign every change to the mesh. You need two: an everyday key on this machine and a portable one."
+    );
     let everyday = ask(&format!(
         "Everyday owner key (path to an existing private key, or Enter to create {}):",
         ssh.join("tearmesh-owner").display()
     ))?;
     let everyday = if everyday.is_empty() {
         let p = ssh.join("tearmesh-owner");
-        eprintln!("Creating {} (choose a passphrase: any process running as you could otherwise sign with it)", p.display());
+        eprintln!(
+            "Creating {} (choose a passphrase: any process running as you could otherwise sign with it)",
+            p.display()
+        );
         keygen(&["-t", "ed25519", "-a", "100", "-C", "tearmesh owner"], &p)?;
         p
     } else {
@@ -960,22 +986,38 @@ async fn setup(config: &Path) -> Result<()> {
         everyday.display(),
         everyday.display()
     );
-    let kind = ask("Portable key: a security key such as a YubiKey (s, recommended) or a key file on removable media (f)?")?;
+    let kind = ask(
+        "Portable key: a security key such as a YubiKey (s, recommended) or a key file on removable media (f)?",
+    )?;
     let portable = if kind.starts_with('s') {
         let p = ssh.join("tearmesh-portable-sk");
         eprintln!("Touch the security key when it blinks; set a PIN when asked.");
         keygen(
-            &["-t", "ed25519-sk", "-O", "resident", "-O", "verify-required", "-C", "tearmesh portable"],
+            &[
+                "-t",
+                "ed25519-sk",
+                "-O",
+                "resident",
+                "-O",
+                "verify-required",
+                "-C",
+                "tearmesh portable",
+            ],
             &p,
         )?;
         p
     } else {
         let p = PathBuf::from(ask("Path for the key file (on the removable drive):")?);
-        keygen(&["-t", "ed25519", "-a", "100", "-C", "tearmesh portable"], &p)?;
+        keygen(
+            &["-t", "ed25519", "-a", "100", "-C", "tearmesh portable"],
+            &p,
+        )?;
         eprintln!("Keep {} off this machine and never email it.", p.display());
         p
     };
-    let pubkey = |p: &Path| -> Result<String> { Ok(std::fs::read_to_string(pub_path(p))?.trim().to_string()) };
+    let pubkey = |p: &Path| -> Result<String> {
+        Ok(std::fs::read_to_string(pub_path(p))?.trim().to_string())
+    };
     let mut m = Mesh::new(
         &name,
         vec![pubkey(&everyday)?, pubkey(&portable)?],

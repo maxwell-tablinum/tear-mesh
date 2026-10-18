@@ -55,7 +55,9 @@ pub fn user_identity(name: &str) -> Result<String> {
 }
 
 pub fn home_dir() -> PathBuf {
-    std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default()
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_default()
 }
 
 /// Write-then-rename with fsync, mode 0600, so a crash leaves the old file or the new one.

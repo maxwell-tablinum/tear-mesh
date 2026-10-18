@@ -19,7 +19,9 @@ use anyhow::{Context, Result, bail, ensure};
 use iroh::endpoint::Connection;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{
+    AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader,
+};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{info, warn};
 
@@ -166,10 +168,18 @@ impl Filter {
                 if self.allowed.may_call(tool) {
                     Action::Forward(line.into())
                 } else {
-                    Action::Reply(error(id, -32602, &format!("tool {tool:?} isn't approved for use over tear-mesh")))
+                    Action::Reply(error(
+                        id,
+                        -32602,
+                        &format!("tool {tool:?} isn't approved for use over tear-mesh"),
+                    ))
                 }
             }
-            _ => Action::Reply(error(id, -32601, &format!("{method} isn't allowed over tear-mesh"))),
+            _ => Action::Reply(error(
+                id,
+                -32601,
+                &format!("{method} isn't allowed over tear-mesh"),
+            )),
         }
     }
 
@@ -180,7 +190,11 @@ impl Filter {
         if let Some(method) = m.get("method").and_then(Value::as_str) {
             if let Some(id) = m.get("id") {
                 // Sampling, elicitation, roots: the remote server can't ask anything of the caller.
-                return Action::Reply(error(id, -32601, "requests to the client aren't allowed over tear-mesh"));
+                return Action::Reply(error(
+                    id,
+                    -32601,
+                    "requests to the client aren't allowed over tear-mesh",
+                ));
             }
             return match method {
                 "notifications/progress"
@@ -213,10 +227,15 @@ impl Filter {
                 .and_then(Value::as_array)
                 .cloned()
                 .unwrap_or_default();
-            let want = self
+            let want = self.allowed.pin(
+                self.allowed.offer.instructions.as_deref(),
+                &self.allowed.offer.tools,
+            );
+            if self
                 .allowed
-                .pin(self.allowed.offer.instructions.as_deref(), &self.allowed.offer.tools);
-            if self.allowed.pin(self.allowed.offer.instructions.as_deref(), &tools) != want {
+                .pin(self.allowed.offer.instructions.as_deref(), &tools)
+                != want
+            {
                 return Action::Close("the server's tools differ from its offer".into());
             }
             let shown: Vec<Value> = tools
@@ -232,9 +251,12 @@ impl Filter {
 
 async fn read_line<R: AsyncBufRead + Unpin>(r: &mut R) -> Result<Option<String>> {
     let mut buf = Vec::new();
-    let n = tokio::time::timeout(IDLE, r.take(MAX_LINE as u64 + 1).read_until(b'\n', &mut buf))
-        .await
-        .context("idle for too long")??;
+    let n = tokio::time::timeout(
+        IDLE,
+        r.take(MAX_LINE as u64 + 1).read_until(b'\n', &mut buf),
+    )
+    .await
+    .context("idle for too long")??;
     if n == 0 {
         return Ok(None);
     }
@@ -254,7 +276,13 @@ async fn writer<W: AsyncWrite + Unpin>(mut w: W, mut rx: mpsc::Receiver<String>)
 }
 
 /// Runs a filtered MCP session between a client side and a server side until either closes.
-pub async fn pipe<CR, CW, SR, SW>(client_r: CR, client_w: CW, server_r: SR, server_w: SW, filter: Filter) -> Result<()>
+pub async fn pipe<CR, CW, SR, SW>(
+    client_r: CR,
+    client_w: CW,
+    server_r: SR,
+    server_w: SW,
+    filter: Filter,
+) -> Result<()>
 where
     CR: AsyncBufRead + Unpin + Send,
     CW: AsyncWrite + Unpin + Send + 'static,
@@ -309,17 +337,20 @@ where
     r
 }
 
+/// A steward's connection, handed to the stream that asked for it.
+type Attached = (BufReader<BoxRead>, BoxWrite);
+
 /// Streams waiting for their boundary's steward to attach.
 #[derive(Default)]
 pub struct Streams {
     next: AtomicU64,
-    waiting: Mutex<HashMap<u64, (String, oneshot::Sender<(BufReader<BoxRead>, BoxWrite)>)>>,
+    waiting: Mutex<HashMap<u64, (String, oneshot::Sender<Attached>)>>,
     open: Mutex<HashMap<iroh::EndpointId, usize>>,
 }
 
 impl Streams {
     /// Hands a steward's connection to the stream it was told about, if the boundary matches.
-    pub fn attach(&self, stream: u64, boundary: &str, conn: (BufReader<BoxRead>, BoxWrite)) -> Result<()> {
+    pub fn attach(&self, stream: u64, boundary: &str, conn: Attached) -> Result<()> {
         let mut w = self.waiting.lock().unwrap();
         match w.remove(&stream) {
             Some((b, tx)) if b == boundary => tx
@@ -350,14 +381,19 @@ pub async fn serve(node: &Arc<Node>, conn: Connection) -> Result<()> {
     {
         let mut open = node.streams.open.lock().unwrap();
         let n = open.entry(peer).or_default();
-        ensure!(*n < MAX_PER_PEER, "too many tool streams from {}", peer.fmt_short());
+        ensure!(
+            *n < MAX_PER_PEER,
+            "too many tool streams from {}",
+            peer.fmt_short()
+        );
         *n += 1;
     }
     let _slot = PeerSlot(&node.streams, peer);
     let (mut send, recv) = conn.accept_bi().await?;
     let mut recv = BufReader::new(recv);
     let setup = async {
-        let h: Header = tokio::time::timeout(Duration::from_secs(30), recv_json(recv.get_mut())).await??;
+        let h: Header =
+            tokio::time::timeout(Duration::from_secs(30), recv_json(recv.get_mut())).await??;
         let mesh = node.mesh()?;
         let caller = mesh
             .machine_by_id(&peer)
@@ -380,33 +416,50 @@ pub async fn serve(node: &Arc<Node>, conn: Connection) -> Result<()> {
             server: h.server.clone(),
         });
         let attached = if told {
-            tokio::time::timeout(Duration::from_secs(15), rx).await.ok().and_then(|r| r.ok())
+            tokio::time::timeout(Duration::from_secs(15), rx)
+                .await
+                .ok()
+                .and_then(|r| r.ok())
         } else {
             None
         };
         node.streams.waiting.lock().unwrap().remove(&stream);
-        let steward = attached.with_context(|| {
-            format!("no steward is serving boundary {} on {me}", h.boundary)
-        })?;
+        let steward = attached
+            .with_context(|| format!("no steward is serving boundary {} on {me}", h.boundary))?;
         info!(caller = %caller, server = %h.server, "tool stream open");
         anyhow::Ok((steward, allowed, h, caller))
     };
     let (steward, allowed, h, caller) = match setup.await {
         Ok(x) => x,
         Err(e) => {
-            let _ = send_json(&mut send, &Ack { ok: false, error: format!("{e:#}") }).await;
+            let _ = send_json(
+                &mut send,
+                &Ack {
+                    ok: false,
+                    error: format!("{e:#}"),
+                },
+            )
+            .await;
             let _ = send.finish();
             let _ = tokio::time::timeout(Duration::from_secs(5), conn.closed()).await;
             return Err(e);
         }
     };
-    send_json(&mut send, &Ack { ok: true, error: String::new() }).await?;
+    send_json(
+        &mut send,
+        &Ack {
+            ok: true,
+            error: String::new(),
+        },
+    )
+    .await?;
     let (sr, sw) = steward;
     let r = pipe(recv, send, sr, sw, Filter::new(allowed)).await;
     if let Err(e) = &r {
         warn!("tool stream {caller} -> {}/{}: {e:#}", h.boundary, h.server);
     }
-    conn.close(0u32.into(), b"done");
+    // The caller closes once it has everything; closing here could drop replies in flight.
+    let _ = tokio::time::timeout(Duration::from_secs(10), conn.closed()).await;
     r
 }
 
@@ -417,7 +470,12 @@ pub async fn call(
     boundary: &str,
     machine: &str,
     server: &str,
-) -> Result<(BufReader<iroh::endpoint::RecvStream>, iroh::endpoint::SendStream, Filter, Connection)> {
+) -> Result<(
+    BufReader<iroh::endpoint::RecvStream>,
+    iroh::endpoint::SendStream,
+    Filter,
+    Connection,
+)> {
     let mesh = node.mesh()?;
     let me = node.cfg.machine.clone();
     let approval = policy::may_call(&mesh, &me, machine, boundary, server)?.cloned();
@@ -436,7 +494,8 @@ pub async fn call(
         },
     )
     .await?;
-    let ack: Ack = tokio::time::timeout(Duration::from_secs(30), recv_json(recv.get_mut())).await??;
+    let ack: Ack =
+        tokio::time::timeout(Duration::from_secs(30), recv_json(recv.get_mut())).await??;
     ensure!(ack.ok, "{machine} refused: {}", ack.error);
     Ok((recv, send, Filter::new(allowed), conn))
 }
@@ -445,13 +504,42 @@ pub async fn call(
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn a_steward_attaches_only_in_its_boundary() {
+        let s = Streams::default();
+        let (tx, rx) = oneshot::channel();
+        s.waiting.lock().unwrap().insert(7, ("work".into(), tx));
+        let conn = || -> Attached {
+            (
+                BufReader::new(Box::new(tokio::io::empty())),
+                Box::new(tokio::io::sink()),
+            )
+        };
+        assert!(
+            s.attach(7, "vault", conn()).is_err(),
+            "a vault steward can't take a work stream"
+        );
+        assert!(s.attach(8, "work", conn()).is_err(), "no such stream");
+        s.attach(7, "work", conn()).unwrap();
+        assert!(rx.await.is_ok());
+        assert!(s.attach(7, "work", conn()).is_err(), "only once");
+    }
+
     fn allowed(subset: Option<Vec<String>>) -> Allowed {
         let tools = vec![
             json!({"name": "export_step", "inputSchema": {"type": "object"}}),
             json!({"name": "delete_all", "inputSchema": {"type": "object"}}),
         ];
         Allowed {
-            offer: Offer::new("cad", "".into(), None, Some("be careful".into()), tools, None).unwrap(),
+            offer: Offer::new(
+                "cad",
+                "".into(),
+                None,
+                Some("be careful".into()),
+                tools,
+                None,
+            )
+            .unwrap(),
             subset,
         }
     }
@@ -459,15 +547,41 @@ mod tests {
     #[test]
     fn methods_and_tools() {
         let mut f = Filter::new(allowed(Some(vec!["export_step".into()])));
-        assert!(matches!(f.to_server(r#"[{"jsonrpc":"2.0","id":1,"method":"ping"}]"#), Action::Close(_)), "batch");
-        assert!(matches!(f.to_server(r#"{"jsonrpc":"2.0","id":1,"method":"resources/list"}"#), Action::Reply(_)));
-        assert!(matches!(f.to_server(r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"delete_all"}}"#), Action::Reply(_)));
-        assert!(matches!(f.to_server(r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"export_step"}}"#), Action::Forward(_)));
-        assert_eq!(f.to_server(r#"{"jsonrpc":"2.0","method":"notifications/roots/list_changed"}"#), Action::Drop);
+        assert!(
+            matches!(
+                f.to_server(r#"[{"jsonrpc":"2.0","id":1,"method":"ping"}]"#),
+                Action::Close(_)
+            ),
+            "batch"
+        );
+        assert!(matches!(
+            f.to_server(r#"{"jsonrpc":"2.0","id":1,"method":"resources/list"}"#),
+            Action::Reply(_)
+        ));
+        assert!(matches!(
+            f.to_server(
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"delete_all"}}"#
+            ),
+            Action::Reply(_)
+        ));
+        assert!(matches!(
+            f.to_server(
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"export_step"}}"#
+            ),
+            Action::Forward(_)
+        ));
+        assert_eq!(
+            f.to_server(r#"{"jsonrpc":"2.0","method":"notifications/roots/list_changed"}"#),
+            Action::Drop
+        );
         // The server can't ask the caller's model for anything.
-        let a = f.to_client(r#"{"jsonrpc":"2.0","id":9,"method":"sampling/createMessage","params":{}}"#);
+        let a = f
+            .to_client(r#"{"jsonrpc":"2.0","id":9,"method":"sampling/createMessage","params":{}}"#);
         assert!(matches!(a, Action::Reply(r) if r.contains("\"id\":9")));
-        assert_eq!(f.to_client(r#"{"jsonrpc":"2.0","method":"notifications/message","params":{}}"#), Action::Drop);
+        assert_eq!(
+            f.to_client(r#"{"jsonrpc":"2.0","method":"notifications/message","params":{}}"#),
+            Action::Drop
+        );
     }
 
     #[test]
@@ -484,8 +598,13 @@ mod tests {
 
         f.to_server(r#"{"jsonrpc":"2.0","id":"a","method":"tools/list"}"#);
         let list = r#"{"jsonrpc":"2.0","id":"a","result":{"tools":[{"name":"delete_all","inputSchema":{"type":"object"}},{"name":"export_step","inputSchema":{"type":"object"}}]}}"#;
-        let Action::Forward(shown) = f.to_client(list) else { panic!() };
-        assert!(shown.contains("export_step") && !shown.contains("delete_all"), "subset only");
+        let Action::Forward(shown) = f.to_client(list) else {
+            panic!()
+        };
+        assert!(
+            shown.contains("export_step") && !shown.contains("delete_all"),
+            "subset only"
+        );
 
         // A changed description on an approved tool closes the stream...
         f.to_server(r#"{"jsonrpc":"2.0","id":"b","method":"tools/list"}"#);
@@ -499,6 +618,9 @@ mod tests {
         // Without a subset the whole list is pinned.
         let mut f = Filter::new(allowed(None));
         f.to_server(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#);
-        assert!(matches!(f.to_client(other.replace("\"c\"", "2").as_str()), Action::Close(_)));
+        assert!(matches!(
+            f.to_client(other.replace("\"c\"", "2").as_str()),
+            Action::Close(_)
+        ));
     }
 }

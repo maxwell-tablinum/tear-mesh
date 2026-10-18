@@ -28,7 +28,9 @@ pub fn user_identity(_name: &str) -> Result<String> {
 }
 
 pub fn home_dir() -> PathBuf {
-    std::env::var_os("USERPROFILE").map(PathBuf::from).unwrap_or_default()
+    std::env::var_os("USERPROFILE")
+        .map(PathBuf::from)
+        .unwrap_or_default()
 }
 
 pub fn write_private(path: &Path, data: &[u8]) -> Result<()> {

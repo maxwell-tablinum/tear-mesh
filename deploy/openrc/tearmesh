@@ -1,0 +1,20 @@
+#!/sbin/openrc-run
+# tear-mesh daemon for OpenRC (Alpine and others). Installed by deploy/setup-linux.sh.
+description="tear-mesh daemon"
+command=/usr/local/bin/tearmesh
+command_args="daemon --config /etc/tearmesh/config.toml"
+command_user=tearmesh
+command_background=true
+pidfile=/run/tearmesh.pid
+output_log=/var/log/tearmesh.log
+error_log=/var/log/tearmesh.log
+
+depend() {
+	need net
+}
+
+start_pre() {
+	checkpath -d -m 0755 -o tearmesh /run/tearmesh
+	checkpath -d -m 0700 -o tearmesh /var/lib/tearmesh
+	checkpath -f -m 0640 -o tearmesh /var/log/tearmesh.log
+}

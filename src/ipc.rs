@@ -431,7 +431,13 @@ fn pick_boundary(mine: Option<String>, asked: Option<String>, admin: bool) -> Re
     }
 }
 
-fn post_bio(node: &Node, boundary: &str, mailbox: &str, trust: Trust, text: String) -> Result<Value> {
+fn post_bio(
+    node: &Node,
+    boundary: &str,
+    mailbox: &str,
+    trust: Trust,
+    text: String,
+) -> Result<Value> {
     ensure!(text.len() <= MAX_BIO, "a bio is at most {MAX_BIO} bytes");
     let id = node.post_as(
         boundary,
@@ -450,13 +456,24 @@ fn offers(node: &Node, boundary: &str) -> Result<Value> {
     let mesh = node.mesh()?;
     let mut out = vec![];
     for (machine, st) in node.latest(boundary, Kind::Offer)? {
-        let Ok(o) = Offer::parse(&st.body) else { continue };
+        let Ok(o) = Offer::parse(&st.body) else {
+            continue;
+        };
         if o.withdrawn {
             continue;
         }
         let approval = mesh.approval(&machine, boundary, &o.server);
         let state = match approval {
-            Some(a) if a.pin == crate::offer::pin(o.instructions.as_deref(), &o.tools, a.tools.as_deref()) => "approved",
+            Some(a)
+                if a.pin
+                    == crate::offer::pin(
+                        o.instructions.as_deref(),
+                        &o.tools,
+                        a.tools.as_deref(),
+                    ) =>
+            {
+                "approved"
+            }
             Some(_) => "changed since approval",
             None if mesh.settings.tools_sharing == crate::mesh::Sharing::Free => "free",
             None => "pending approval",
@@ -513,7 +530,13 @@ impl Client {
     pub async fn session_with(hold: bool, trust: Option<Trust>) -> Result<(Client, String)> {
         let mut c = Client::connect(&socket_path()).await?;
         let mailbox = std::env::var("TEARMESH_MAILBOX").ok();
-        let v = c.call(&Request::Hello { mailbox, hold, trust }).await?;
+        let v = c
+            .call(&Request::Hello {
+                mailbox,
+                hold,
+                trust,
+            })
+            .await?;
         let addr = v["address"].as_str().unwrap_or_default().to_string();
         Ok((c, addr))
     }
@@ -550,7 +573,11 @@ impl Client {
     }
 
     /// Sends a request and passes every reply to `each`, the final one last.
-    pub async fn call_each(&mut self, req: &Request, mut each: impl FnMut(&Value)) -> Result<Value> {
+    pub async fn call_each(
+        &mut self,
+        req: &Request,
+        mut each: impl FnMut(&Value),
+    ) -> Result<Value> {
         self.send(req).await?;
         loop {
             let v = self.line().await?;

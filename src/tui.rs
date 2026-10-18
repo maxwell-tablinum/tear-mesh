@@ -286,7 +286,10 @@ impl App {
                     Style::new().add_modifier(Modifier::BOLD)
                 };
                 ListItem::new(vec![
-                    Line::from(vec![mark, Span::styled(l.subject.clone(), subject)]),
+                    Line::from(vec![
+                        mark,
+                        Span::styled(format!("{}{}", l.subject, crate::hook::tags(l)), subject),
+                    ]),
                     Line::styled(
                         format!("  {} · {}", l.from, age(l.ts)),
                         Style::new().fg(Color::DarkGray),
