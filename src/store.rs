@@ -23,6 +23,7 @@ CREATE TABLE IF NOT EXISTS entries (
   seq INTEGER NOT NULL,
   thread TEXT,
   from_addr TEXT NOT NULL,
+  kind TEXT NOT NULL DEFAULT 'info',
   envelope TEXT NOT NULL,
   sig TEXT NOT NULL,
   body TEXT NOT NULL,
@@ -67,6 +68,15 @@ impl Store {
     pub fn open(path: &Path, max_bytes: u64) -> Result<Self> {
         let conn = Connection::open(path).with_context(|| format!("opening {}", path.display()))?;
         conn.execute_batch(SCHEMA)?;
+        // 0.1.0 logs predate `kind`; every entry in them is a letter.
+        let has_kind: bool = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('entries') WHERE name = 'kind'",
+            [],
+            |r| r.get(0),
+        )?;
+        if !has_kind {
+            conn.execute_batch("ALTER TABLE entries ADD COLUMN kind TEXT NOT NULL DEFAULT 'info'")?;
+        }
         Ok(Store { conn, max_bytes })
     }
 
@@ -138,14 +148,15 @@ impl Store {
             ),
         }
         tx.execute(
-            "INSERT INTO entries (id, author, seq, thread, from_addr, envelope, sig, body)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT INTO entries (id, author, seq, thread, from_addr, kind, envelope, sig, body)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 id,
                 env.author.to_string(),
                 env.seq,
                 env.thread,
                 env.from,
+                env.kind.as_str(),
                 entry.envelope,
                 entry.sig,
                 entry.body
@@ -209,6 +220,7 @@ impl Store {
                     EXISTS (SELECT 1 FROM seen s WHERE s.mailbox = ?1 AND s.id = e.id AND s.kind = ?3)
              FROM entries e JOIN rcpt r ON r.id = e.id
              WHERE r.addr IN (?2, '*') AND e.from_addr != ?2
+               AND e.kind IN ('info', 'task', 'question')
              ORDER BY e.rowid",
         )?;
         let rows = st.query_map(params![mailbox, addr, kind.as_str()], |r| {
@@ -227,10 +239,30 @@ impl Store {
 
     /// Every address that has sent mail in this boundary.
     pub fn senders(&self) -> Result<Vec<String>> {
+        let mut st = self.conn.prepare(
+            "SELECT DISTINCT from_addr FROM entries WHERE kind IN ('info', 'task', 'question')
+             ORDER BY from_addr",
+        )?;
+        let rows = st.query_map([], |r| r.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Entries of one kind (offers or bios), oldest first.
+    pub fn of_kind(&self, kind: crate::envelope::Kind) -> Result<Vec<Stored>> {
         let mut st = self
             .conn
-            .prepare("SELECT DISTINCT from_addr FROM entries ORDER BY from_addr")?;
-        let rows = st.query_map([], |r| r.get(0))?;
+            .prepare("SELECT id, envelope, body FROM entries WHERE kind = ?1 ORDER BY rowid")?;
+        let rows = st.query_map([kind.as_str()], row_stored)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Letters sent from `addr`, oldest first.
+    pub fn sent_by(&self, addr: &str) -> Result<Vec<Stored>> {
+        let mut st = self.conn.prepare(
+            "SELECT id, envelope, body FROM entries
+             WHERE from_addr = ?1 AND kind IN ('info', 'task', 'question') ORDER BY rowid",
+        )?;
+        let rows = st.query_map([addr], row_stored)?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 

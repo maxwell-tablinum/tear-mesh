@@ -154,14 +154,14 @@ Not yet tested: two machines on different networks (NAT traversal through relays
 
 ## Next
 
-- **0.2:**
+- **0.2:** apps over the mesh (tools, shell, bios), grants, ticket joins with approval, and a Claude connector. See [spec-0.2.md](spec-0.2.md). The items below move to 0.3 or later.
+- **Was 0.2, now later:**
   - macOS (per-boundary users plus Seatbelt or pf);
   - native Windows (named pipes, a Windows account per boundary, a Windows service). Until then, Windows runs it in WSL2;
   - the egress lock;
   - Channels push for idle Claude Code sessions;
   - adapters for OpenCode (`prompt_async`), Codex and Cursor;
-  - a self-hosted relay recipe;
-  - mDNS on the LAN.
+  - a self-hosted relay recipe.
 - **Later:**
   - **Guests and the post office.** A `public` boundary on an always-on machine, invite codes as capability tokens (mailbox, rights, quota, expiry, binds to the first key that uses it, owner-signed, revoked through the circle file), and a connector door for chat apps that don't run tear-mesh.
   - **Cross-boundary flow**, with tear-line approvals on a cleared machine and content-free phone notifications.

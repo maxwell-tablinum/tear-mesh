@@ -1,19 +1,27 @@
-//! tear-mesh: agents on a circle of machines send each other mail. Each machine hosts one or
-//! more boundaries; the daemon and the OS keep every boundary's mail inside that boundary.
-//! No check depends on a model's judgment.
+//! tear-mesh: a peer-to-peer mesh that connects apps and agents on your own machines. Agents
+//! mail each other, call MCP servers other machines offer, and reach their shells, under
+//! owner-signed grants. Each machine hosts one or more boundaries; the daemon and the OS keep
+//! every boundary's data inside that boundary. No check depends on a model's judgment.
 
-pub mod circle;
+pub mod bridge;
 pub mod config;
+#[cfg(target_os = "linux")]
+pub mod connector;
 pub mod envelope;
 pub mod hook;
 pub mod ipc;
+pub mod join;
 pub mod mcp;
+pub mod mesh;
 pub mod node;
+pub mod offer;
+pub mod os;
 pub mod policy;
+pub mod shell;
+pub mod steward;
 pub mod store;
 pub mod sync;
 pub mod tui;
-pub mod waker;
 
 /// Machine, boundary and mailbox names: 1–32 of `a-z`, `0-9`, `-`, not starting with `-`.
 pub fn valid_name(s: &str) -> bool {

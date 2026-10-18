@@ -1,6 +1,8 @@
-//! `tearmesh waker`: runs as a boundary's OS user and starts a session when mail reaches a mailbox
-//! no session holds. Each letter wakes at most once, and each mailbox has an hourly wake budget,
-//! so agents can't keep waking each other forever.
+//! `tearmesh steward`: runs as a boundary's OS user and does that boundary's chores. It starts a
+//! session when mail reaches a mailbox no session holds (each letter wakes at most once, each
+//! mailbox has an hourly wake budget), and it runs the MCP servers this machine offers when a
+//! peer opens a tool stream. The daemon checks and filters; the steward only runs things, as the
+//! boundary's own user.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -9,11 +11,15 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail, ensure};
 use serde::Deserialize;
+use serde_json::{Value, json};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
+use crate::envelope::Trust;
 use crate::ipc::{Client, Request, socket_path};
-use crate::node::Letter;
+use crate::node::{Event, Letter};
+use crate::offer::Offer;
 use crate::valid_name;
 
 #[derive(Deserialize, Clone, Debug)]
@@ -33,22 +39,63 @@ pub struct Mailbox {
     pub resume: bool,
     #[serde(default = "default_timeout")]
     pub timeout_mins: u64,
+    /// Letters of these trust levels wake the mailbox. Guest letters (from the connector) wake it
+    /// only if `guest` is listed.
+    #[serde(default = "default_wake_on")]
+    pub wake_on: Vec<Trust>,
+}
+
+/// An MCP server this boundary shares, from `offers.toml`.
+#[derive(Deserialize, Clone, Debug)]
+#[serde(deny_unknown_fields)]
+pub struct OfferDef {
+    /// The stdio server to run, e.g. `["/opt/cad-mcp/bin/server"]`.
+    pub command: Vec<String>,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+    /// Working directory; default the user's home.
+    #[serde(default)]
+    pub dir: Option<PathBuf>,
 }
 
 fn default_budget() -> u32 {
     6
 }
+fn default_wake_on() -> Vec<Trust> {
+    vec![Trust::Member, Trust::Admin]
+}
 fn default_timeout() -> u64 {
     30
 }
 
+fn config_dir() -> PathBuf {
+    crate::os::home_dir().join(".config").join("tearmesh")
+}
+
 pub fn default_config() -> PathBuf {
-    std::env::var_os("TEARMESH_WAKER_CONFIG")
+    std::env::var_os("TEARMESH_MAILBOXES")
         .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            PathBuf::from(std::env::var_os("HOME").unwrap_or_default())
-                .join(".config/tearmesh/mailboxes.toml")
-        })
+        .unwrap_or_else(|| config_dir().join("mailboxes.toml"))
+}
+
+pub fn default_offers() -> PathBuf {
+    std::env::var_os("TEARMESH_OFFERS")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| config_dir().join("offers.toml"))
+}
+
+pub fn load_offers(path: &Path) -> Result<BTreeMap<String, OfferDef>> {
+    let text =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let offers: BTreeMap<String, OfferDef> =
+        toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+    for (name, o) in &offers {
+        ensure!(valid_name(name), "bad server name {name:?}");
+        ensure!(!o.command.is_empty(), "offer {name}: empty command");
+    }
+    Ok(offers)
 }
 
 pub fn load(path: &Path) -> Result<BTreeMap<String, Mailbox>> {
@@ -67,13 +114,28 @@ pub fn load(path: &Path) -> Result<BTreeMap<String, Mailbox>> {
     Ok(boxes)
 }
 
-pub async fn run(config: &Path) -> Result<()> {
-    let boxes = load(config)?;
-    ensure!(!boxes.is_empty(), "no mailboxes in {}", config.display());
-    let state =
-        PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".local/state/tearmesh");
+/// Runs the steward. Either file may be missing, not both.
+pub async fn run(mailboxes: &Path, offers_path: &Path) -> Result<()> {
+    let boxes = if mailboxes.exists() {
+        load(mailboxes)?
+    } else {
+        BTreeMap::new()
+    };
+    let offers = if offers_path.exists() {
+        load_offers(offers_path)?
+    } else {
+        BTreeMap::new()
+    };
+    ensure!(
+        !boxes.is_empty() || !offers.is_empty(),
+        "nothing to do: no mailboxes in {} and no offers in {}",
+        mailboxes.display(),
+        offers_path.display()
+    );
+    let state = crate::os::home_dir().join(".local").join("state").join("tearmesh");
     let mut w = Waker {
         boxes,
+        offers,
         state,
         presented: HashMap::new(),
         wakes: HashMap::new(),
@@ -89,6 +151,7 @@ pub async fn run(config: &Path) -> Result<()> {
 
 struct Waker {
     boxes: BTreeMap<String, Mailbox>,
+    offers: BTreeMap<String, OfferDef>,
     state: PathBuf,
     /// Letter ids already handed to a woken session, per mailbox.
     presented: HashMap<String, HashSet<String>>,
@@ -109,7 +172,18 @@ impl Waker {
         loop {
             tokio::select! {
                 ev = sub.next_event() => match ev? {
-                    Some(ev) if self.boxes.contains_key(&ev.mailbox) => check_tx.send(ev.mailbox)?,
+                    Some(Event::Mail(ev)) if self.boxes.contains_key(&ev.mailbox) => check_tx.send(ev.mailbox)?,
+                    Some(Event::Open { stream, server, .. }) => match self.offers.get(&server) {
+                        Some(def) => {
+                            let def = def.clone();
+                            tokio::spawn(async move {
+                                if let Err(e) = serve_stream(stream, &server, &def).await {
+                                    warn!("serving {server}: {e:#}");
+                                }
+                            });
+                        }
+                        None => warn!("a peer asked for {server}, which offers.toml doesn't define"),
+                    },
                     Some(_) => {}
                     None => bail!("daemon closed the subscription"),
                 },
@@ -135,15 +209,17 @@ impl Waker {
             .call(&Request::Hello {
                 mailbox: Some(mailbox.into()),
                 hold: false,
+                trust: None,
             })
             .await?;
         let address = hello["address"].as_str().unwrap_or_default().to_string();
         let unread: Vec<Letter> =
             serde_json::from_value(c.call(&Request::Inbox { all: false }).await?)?;
+        let wake_on = self.boxes[mailbox].wake_on.clone();
         let presented = self.presented.entry(mailbox.into()).or_default();
         let fresh: Vec<Letter> = unread
             .into_iter()
-            .filter(|l| !presented.contains(&l.id))
+            .filter(|l| !presented.contains(&l.id) && wake_on.contains(&l.trust))
             .collect();
         if fresh.is_empty() {
             return Ok(());
@@ -178,10 +254,11 @@ pub fn prompt(address: &str, letters: &[Letter]) -> String {
         format!("You are the `{address}` mailbox on tear-mesh, and new mail has arrived:\n");
     for l in letters {
         p.push_str(&format!(
-            "- {} from {}: {}\n",
+            "- {} from {}: {}{}\n",
             &l.id[..12],
             l.from,
-            l.subject
+            l.subject,
+            crate::hook::tags(l)
         ));
     }
     p.push_str(
@@ -256,6 +333,85 @@ async fn wake(
         std::fs::write(&sessions_path, serde_json::to_vec(&sessions)?)?;
     }
     Ok(())
+}
+
+fn spawn_server(def: &OfferDef) -> Result<tokio::process::Child> {
+    let mut cmd = tokio::process::Command::new(&def.command[0]);
+    cmd.args(&def.command[1..])
+        .envs(&def.env)
+        .current_dir(def.dir.clone().unwrap_or_else(crate::os::home_dir))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .kill_on_drop(true);
+    cmd.spawn()
+        .with_context(|| format!("starting {}", def.command[0]))
+}
+
+/// Attaches to a tool stream the daemon announced and runs the server on it.
+async fn serve_stream(stream: u64, server: &str, def: &OfferDef) -> Result<()> {
+    let mut c = Client::connect(&socket_path()).await?;
+    c.call(&Request::Attach { stream }).await?;
+    let mut child = spawn_server(def)?;
+    info!("serving {server} on stream {stream}");
+    let (r, w) = c.into_raw();
+    let stdin = child.stdin.take().context("server stdin")?;
+    let stdout = child.stdout.take().context("server stdout")?;
+    let r = crate::shell::splice(r, w, stdout, stdin).await;
+    let _ = child.kill().await;
+    r
+}
+
+/// Runs the server once to read what it offers: `initialize`, then `tools/list`.
+pub async fn describe(server: &str, def: &OfferDef) -> Result<Offer> {
+    let mut child = spawn_server(def)?;
+    let mut stdin = child.stdin.take().context("server stdin")?;
+    let mut out = BufReader::new(child.stdout.take().context("server stdout")?).lines();
+    let mut send = async |v: Value| -> Result<()> {
+        stdin.write_all(format!("{v}\n").as_bytes()).await?;
+        stdin.flush().await?;
+        Ok(())
+    };
+    send(json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+        "protocolVersion": "2025-06-18", "capabilities": {},
+        "clientInfo": {"name": "tearmesh", "version": env!("CARGO_PKG_VERSION")}}}))
+    .await?;
+    let mut answer = async |id: i64| -> Result<Value> {
+        loop {
+            let line = tokio::time::timeout(Duration::from_secs(30), out.next_line())
+                .await
+                .context("the server didn't answer within 30 s")??
+                .context("the server exited")?;
+            let Ok(v) = serde_json::from_str::<Value>(&line) else { continue };
+            if v["id"] == json!(id) {
+                ensure!(v.get("error").is_none(), "the server returned an error: {}", v["error"]);
+                return Ok(v["result"].clone());
+            }
+        }
+    };
+    let init = answer(1).await?;
+    send(json!({"jsonrpc": "2.0", "method": "notifications/initialized"})).await?;
+    send(json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})).await?;
+    let list = answer(2).await?;
+    let _ = child.kill().await;
+    ensure!(
+        list.get("nextCursor").is_none_or(Value::is_null),
+        "paged tool lists aren't supported"
+    );
+    let exe = Path::new(&def.command[0]);
+    let exe = exe
+        .is_file()
+        .then(|| std::fs::read(exe).ok())
+        .flatten()
+        .map(|b| blake3::hash(&b).to_hex().to_string());
+    Offer::new(
+        server,
+        def.description.clone(),
+        init.get("serverInfo").cloned(),
+        init["instructions"].as_str().map(String::from),
+        list["tools"].as_array().cloned().unwrap_or_default(),
+        exe,
+    )
 }
 
 #[cfg(test)]

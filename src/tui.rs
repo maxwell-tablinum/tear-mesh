@@ -438,6 +438,7 @@ pub async fn run(mailbox: Option<String>) -> Result<()> {
     let mailbox = mailbox.or_else(|| std::env::var("TEARMESH_MAILBOX").ok());
     let hello = c
         .call(&Request::Hello {
+            trust: None,
             mailbox,
             hold: false,
         })
@@ -495,6 +496,7 @@ async fn exec(c: &mut Client, app: &mut App, cmd: Cmd) {
             } => {
                 let v = c
                     .call(&Request::Post {
+                        kind: None,
                         to,
                         subject,
                         body,
@@ -537,6 +539,7 @@ mod tests {
             ts: crate::now_ms() - 120_000,
             read,
             body: None,
+            ..Default::default()
         }
     }
 
@@ -585,6 +588,7 @@ mod tests {
                 name: "ws".into(),
                 this_machine: false,
                 last_sync_ms: Some(crate::now_ms() - 7_000),
+                ..Default::default()
             }],
             addresses: vec![],
         });

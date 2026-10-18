@@ -1,5 +1,6 @@
-//! Letters. Each one is an envelope (signed by the sending machine) plus a body. The envelope is
-//! kept as the exact JSON that was signed, so nothing is re-encoded before checking.
+//! Log entries: letters, offers and bios. Each one is an envelope (signed by the writing machine)
+//! plus a body. The envelope is kept as the exact JSON that was signed, so nothing is re-encoded
+//! before checking. Version 1 envelopes (0.1.0) still verify.
 
 use std::collections::BTreeSet;
 
@@ -16,7 +17,9 @@ const MAX_ENVELOPE: usize = 16 * 1024;
 #[serde(deny_unknown_fields)]
 pub struct Envelope {
     pub v: u32,
-    pub circle: String,
+    /// The mesh id (`circle` in version 1).
+    #[serde(alias = "circle")]
+    pub mesh: String,
     /// The log this entry belongs to.
     pub boundary: String,
     /// The signing machine.
@@ -37,6 +40,50 @@ pub struct Envelope {
     pub body_hash: String,
     pub body_len: u64,
     pub label: Label,
+    /// Absent in version 1, where every entry is a letter (`info`).
+    #[serde(default)]
+    pub kind: Kind,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Kind {
+    #[default]
+    Info,
+    Task,
+    Question,
+    /// A machine's offer of an MCP server; the subject is the server name, the body JSON.
+    Offer,
+    /// A machine's "about this machine" text.
+    Bio,
+}
+
+impl Kind {
+    pub fn is_letter(self) -> bool {
+        matches!(self, Kind::Info | Kind::Task | Kind::Question)
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Kind::Info => "info",
+            Kind::Task => "task",
+            Kind::Question => "question",
+            Kind::Offer => "offer",
+            Kind::Bio => "bio",
+        }
+    }
+}
+
+impl std::str::FromStr for Kind {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> Result<Self> {
+        Ok(match s {
+            "info" => Kind::Info,
+            "task" => Kind::Task,
+            "question" => Kind::Question,
+            _ => anyhow::bail!("letter kind must be info, task or question"),
+        })
+    }
 }
 
 /// Where a letter may go (`boundaries`) and how far to believe it (`trust`). Labels only tighten:
@@ -48,16 +95,30 @@ pub struct Label {
     pub trust: Trust,
 }
 
-/// Ordered from least to most trusted.
-#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+/// Ordered from least to most trusted. The writing machine sets it from where the entry came:
+/// it is that machine's claim, used only for local decisions such as waking a mailbox.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum Trust {
-    /// Anyone holding an invite code (not used before guests ship).
+    /// From outside the mesh, e.g. through the Claude connector.
     Guest,
-    /// One of the circle's own machines.
-    Circle,
-    /// Signed with an owner key.
-    Owner,
+    /// From a session on a member machine (`circle` in version 1).
+    #[serde(alias = "circle")]
+    #[default]
+    Member,
+    /// From the machine's admin socket (root or an Administrator).
+    #[serde(alias = "owner")]
+    Admin,
+}
+
+impl Trust {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Trust::Guest => "guest",
+            Trust::Member => "member",
+            Trust::Admin => "admin",
+        }
+    }
 }
 
 impl Label {
@@ -111,7 +172,11 @@ impl Entry {
         env.author
             .verify(self.envelope.as_bytes(), &Signature::from_bytes(&sig))
             .map_err(|_| anyhow::anyhow!("bad signature"))?;
-        ensure!(env.v == 1, "unknown envelope version {}", env.v);
+        ensure!(
+            env.v == 2 || (env.v == 1 && env.kind == Kind::Info),
+            "unknown envelope version {}",
+            env.v
+        );
         ensure!(env.seq >= 1, "seq starts at 1");
         let is_id =
             |s: &str| s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
@@ -175,8 +240,8 @@ pub(crate) mod tests {
 
     pub fn envelope(key: &SecretKey, seq: u64, prev: Option<String>, body: &str) -> Envelope {
         Envelope {
-            v: 1,
-            circle: "c1".into(),
+            v: 2,
+            mesh: "c1".into(),
             boundary: "work".into(),
             author: key.public(),
             seq,
@@ -190,8 +255,9 @@ pub(crate) mod tests {
             body_len: body.len() as u64,
             label: Label {
                 boundaries: ["work".to_string()].into(),
-                trust: Trust::Circle,
+                trust: Trust::Member,
             },
+            kind: Kind::Info,
         }
     }
 
@@ -241,7 +307,7 @@ pub(crate) mod tests {
     fn labels_only_tighten() {
         let a = Label {
             boundaries: ["work".to_string()].into(),
-            trust: Trust::Circle,
+            trust: Trust::Member,
         };
         let b = Label {
             boundaries: ["public".to_string()].into(),
@@ -250,6 +316,28 @@ pub(crate) mod tests {
         let j = a.join(&b);
         assert_eq!(j.boundaries.len(), 2);
         assert_eq!(j.trust, Trust::Guest);
+    }
+
+    #[test]
+    fn version_1_envelopes_still_parse() {
+        let k = SecretKey::generate();
+        let mut e = envelope(&k, 1, None, "b");
+        e.v = 1;
+        let json = serde_json::to_string(&e)
+            .unwrap()
+            .replace("\"mesh\"", "\"circle\"")
+            .replace("\"member\"", "\"circle\"")
+            .replace(",\"kind\":\"info\"", "");
+        let sig = hex(&k.sign(json.as_bytes()).to_bytes());
+        let entry = Entry {
+            envelope: json,
+            sig,
+            body: "b".into(),
+        };
+        let env = entry.open().unwrap();
+        assert_eq!((env.mesh.as_str(), env.label.trust, env.kind), ("c1", Trust::Member, Kind::Info));
+        e.kind = Kind::Offer;
+        assert!(Entry::sign(&e, "b".into(), &k).unwrap().open().is_err(), "v1 has letters only");
     }
 
     #[test]

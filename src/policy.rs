@@ -1,13 +1,14 @@
-//! Every placement decision lives here: which boundaries a log may hold, which peers may receive a
-//! boundary, and whether a received entry is acceptable. Nothing else decides where data goes.
+//! Every placement and permission decision lives here: which boundaries a log may hold, which peers
+//! may receive a boundary, whether a received entry is acceptable, and which machines may address,
+//! call or drive which. Nothing else decides where data goes.
 
 use std::collections::BTreeSet;
 
 use anyhow::{Result, ensure};
 use iroh::EndpointId;
 
-use crate::circle::Circle;
 use crate::envelope::{Entry, Envelope, Label, Trust, parse_address};
+use crate::mesh::{Category, Mesh, Sharing};
 
 /// Boundaries whose content a log for `boundary` may hold.
 /// 0.1.0 is same-boundary-only: each boundary is cleared for itself alone.
@@ -20,17 +21,17 @@ pub fn label_fits(label: &Label, boundary: &str) -> bool {
     label.boundaries.contains(boundary) && label.boundaries.is_subset(&cleared(boundary))
 }
 
-/// The label on anything a session in `boundary` writes.
-pub fn post_label(boundary: &str) -> Label {
+/// The label on anything written in `boundary` with `trust`.
+pub fn post_label(boundary: &str, trust: Trust) -> Label {
     Label {
         boundaries: [boundary.to_string()].into(),
-        trust: Trust::Circle,
+        trust,
     }
 }
 
 /// Boundaries both this machine and `peer` host. Sync offers, and even mentions, only these.
-pub fn shared_boundaries(circle: &Circle, me: &str, peer: &EndpointId) -> Vec<String> {
-    let (Some(mine), Some(theirs)) = (circle.machine(me), circle.machine_by_id(peer)) else {
+pub fn shared_boundaries(mesh: &Mesh, me: &str, peer: &EndpointId) -> Vec<String> {
+    let (Some(mine), Some(theirs)) = (mesh.machine(me), mesh.machine_by_id(peer)) else {
         return vec![];
     };
     if mine.name == theirs.name {
@@ -43,42 +44,114 @@ pub fn shared_boundaries(circle: &Circle, me: &str, peer: &EndpointId) -> Vec<St
         .collect()
 }
 
-pub fn may_sync(circle: &Circle, me: &str, peer: &EndpointId, boundary: &str) -> bool {
-    shared_boundaries(circle, me, peer)
+pub fn may_sync(mesh: &Mesh, me: &str, peer: &EndpointId, boundary: &str) -> bool {
+    shared_boundaries(mesh, me, peer)
         .iter()
         .any(|b| b == boundary)
 }
 
 /// Recipients must be `*` or a mailbox on a machine that hosts the boundary, so a letter is never
 /// addressed to someone who could not receive it.
-pub fn check_recipients(circle: &Circle, boundary: &str, to: &[String]) -> Result<()> {
+pub fn check_recipients(mesh: &Mesh, boundary: &str, to: &[String]) -> Result<()> {
     for a in to {
         if a == "*" {
             continue;
         }
         let (_, host) = parse_address(a).ok_or_else(|| anyhow::anyhow!("bad address {a:?}"))?;
         ensure!(
-            circle.hosts(host, boundary),
+            mesh.hosts(host, boundary),
             "{host} is not in boundary {boundary}; can't address {a}"
         );
     }
     Ok(())
 }
 
+/// A local post: every named recipient's machine must accept mail from this one. `*` is always
+/// allowed; each receiving machine shows it only if it accepts mail from the sender.
+pub fn check_converse(mesh: &Mesh, me: &str, to: &[String]) -> Result<()> {
+    for a in to {
+        if let Some((_, host)) = parse_address(a) {
+            ensure!(
+                mesh.allows(me, host, Category::Converse),
+                "{me} has no converse grant to {host}, so {host} won't deliver mail from it"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Whether this machine shows an entry to its sessions. Letters need a converse grant from the
+/// author's machine to this one, checked against the current file, so revoking a grant also hides
+/// earlier letters. Offers and bios are always visible: hiding them would quietly break tool
+/// calls in the other direction.
+pub fn visible(mesh: &Mesh, me: &str, env: &Envelope) -> bool {
+    if !env.kind.is_letter() {
+        return true;
+    }
+    mesh.machine_by_id(&env.author)
+        .is_some_and(|m| mesh.allows(&m.name, me, Category::Converse))
+}
+
+/// Whether a session in `boundary` on `caller` may call `server` offered by `target`. Both
+/// machines must host the boundary, the caller needs a tools grant, and, when the mesh requires
+/// approval, the owner must have approved the offer. Returns the approval, if any, for its pin
+/// and tool subset.
+pub fn may_call<'a>(
+    mesh: &'a Mesh,
+    caller: &str,
+    target: &str,
+    boundary: &str,
+    server: &str,
+) -> Result<Option<&'a crate::mesh::Approval>> {
+    ensure!(
+        mesh.hosts(caller, boundary) && mesh.hosts(target, boundary),
+        "{caller} and {target} don't both host boundary {boundary}"
+    );
+    ensure!(
+        caller != target,
+        "{server} is on this machine; use it directly"
+    );
+    ensure!(
+        mesh.allows(caller, target, Category::Tools),
+        "{caller} has no tools grant to {target}"
+    );
+    let approval = mesh.approval(target, boundary, server);
+    if mesh.settings.tools_sharing == Sharing::Approval {
+        ensure!(
+            approval.is_some(),
+            "the owner hasn't approved {target}/{server} in {boundary}"
+        );
+    }
+    Ok(approval)
+}
+
+/// Whether `caller` may reach `target`'s sshd, for a session in `boundary`.
+pub fn may_shell(mesh: &Mesh, caller: &str, target: &str, boundary: &str) -> Result<()> {
+    ensure!(
+        mesh.hosts(caller, boundary) && mesh.hosts(target, boundary),
+        "{caller} and {target} don't both host boundary {boundary}"
+    );
+    ensure!(
+        mesh.allows(caller, target, Category::Shell),
+        "{caller} has no shell grant to {target}"
+    );
+    Ok(())
+}
+
 /// The one check every entry passes before it is stored, local or received.
-pub fn check_entry(circle: &Circle, boundary: &str, entry: &Entry) -> Result<Envelope> {
+pub fn check_entry(mesh: &Mesh, boundary: &str, entry: &Entry) -> Result<Envelope> {
     let env = entry.open()?;
-    ensure!(env.circle == circle.id, "entry is from another circle");
+    ensure!(env.mesh == mesh.id, "entry is from another mesh");
     ensure!(
         env.boundary == boundary,
         "entry for {} offered as {boundary}",
         env.boundary
     );
-    let author = circle
+    let author = mesh
         .machine_by_id(&env.author)
         .ok_or_else(|| anyhow::anyhow!("author {} is not a member", env.author.fmt_short()))?;
     ensure!(
-        circle.hosts(&author.name, boundary),
+        mesh.hosts(&author.name, boundary),
         "author {} is not in boundary {boundary}",
         author.name
     );
@@ -88,8 +161,8 @@ pub fn check_entry(circle: &Circle, boundary: &str, entry: &Entry) -> Result<Env
         env.label.boundaries
     );
     ensure!(
-        env.label.trust == Trust::Circle,
-        "only circle trust exists before guests ship"
+        env.kind.is_letter() || env.to == ["*"],
+        "offers and bios go to the whole boundary"
     );
     let (_, from_host) = parse_address(&env.from).ok_or_else(|| anyhow::anyhow!("bad from"))?;
     ensure!(
@@ -98,24 +171,34 @@ pub fn check_entry(circle: &Circle, boundary: &str, entry: &Entry) -> Result<Env
         env.from,
         author.name
     );
-    check_recipients(circle, boundary, &env.to)?;
+    check_recipients(mesh, boundary, &env.to)?;
     Ok(env)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::circle::Machine;
+    use crate::envelope::Kind;
     use crate::envelope::tests::envelope;
+    use crate::mesh::{Grant, Machine, Settings};
     use iroh::SecretKey;
 
-    fn circle(ws: &SecretKey, laptop: &SecretKey) -> Circle {
-        Circle {
+    fn circle(ws: &SecretKey, laptop: &SecretKey) -> Mesh {
+        Mesh {
+            format: 2,
             id: "c1".into(),
             name: "home".into(),
             version: 1,
+            prev: None,
             owners: vec![],
             boundaries: vec!["work".into(), "vault".into()],
+            settings: Settings::default(),
+            grants: vec![Grant {
+                from: "*".into(),
+                to: "*".into(),
+                allow: vec![Category::Converse],
+            }],
+            approvals: vec![],
             machines: vec![
                 Machine {
                     name: "ws".into(),
@@ -142,7 +225,7 @@ mod tests {
         assert!(!may_sync(&c, "ws", &laptop.public(), "vault"));
         assert!(shared_boundaries(&c, "ws", &SecretKey::generate().public()).is_empty());
 
-        let mut wider = post_label("vault");
+        let mut wider = post_label("vault", Trust::Member);
         wider.boundaries.insert("work".into());
         assert!(
             !label_fits(&wider, "vault"),
@@ -168,7 +251,7 @@ mod tests {
         e.boundary = "vault".into();
         e.from = "x@laptop".into();
         e.to = vec!["*".into()];
-        e.label = post_label("vault");
+        e.label = post_label("vault", Trust::Member);
         let bad = Entry::sign(&e, "b".into(), &laptop).unwrap();
         assert!(check_entry(&c, "vault", &bad).is_err());
 
@@ -183,5 +266,41 @@ mod tests {
         let mut e = envelope(&s, 1, None, "b");
         e.from = "x@ws".into();
         assert!(check_entry(&c, "work", &Entry::sign(&e, "b".into(), &s).unwrap()).is_err());
+
+        // Any trust level is storable; an offer must go to the whole boundary.
+        let mut e = envelope(&ws, 1, None, "b");
+        e.label.trust = Trust::Guest;
+        assert!(check_entry(&c, "work", &Entry::sign(&e, "b".into(), &ws).unwrap()).is_ok());
+        e.kind = Kind::Offer;
+        assert!(check_entry(&c, "work", &Entry::sign(&e, "b".into(), &ws).unwrap()).is_err());
+    }
+
+    #[test]
+    fn converse_and_calls() {
+        let (ws, laptop) = (SecretKey::generate(), SecretKey::generate());
+        let mut c = circle(&ws, &laptop);
+        c.grants.clear();
+        let letter = envelope(&ws, 1, None, "b");
+        assert!(!visible(&c, "laptop", &letter), "no grant, no delivery");
+        assert!(visible(&c, "ws", &letter), "mail within one machine");
+        assert!(check_converse(&c, "ws", &["admin@laptop".into()]).is_err());
+        assert!(check_converse(&c, "ws", &["*".into(), "x@ws".into()]).is_ok());
+        let mut offer = letter.clone();
+        offer.kind = Kind::Offer;
+        assert!(visible(&c, "laptop", &offer), "offers stay visible");
+        c.grants.push(Grant {
+            from: "ws".into(),
+            to: "laptop".into(),
+            allow: vec![Category::Converse],
+        });
+        assert!(visible(&c, "laptop", &letter));
+
+        assert!(may_call(&c, "laptop", "ws", "work", "cad").is_err(), "no tools grant");
+        c.grant("laptop", "ws", &[Category::Tools]);
+        assert!(may_call(&c, "laptop", "ws", "work", "cad").is_err(), "not approved");
+        assert!(may_call(&c, "laptop", "ws", "vault", "cad").is_err(), "laptop isn't in vault");
+        c.settings.tools_sharing = Sharing::Free;
+        assert!(may_call(&c, "laptop", "ws", "work", "cad").unwrap().is_none());
+        assert!(may_shell(&c, "laptop", "ws", "work").is_err());
     }
 }

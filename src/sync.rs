@@ -1,5 +1,6 @@
 //! Machine-to-machine sync over iroh. One bidirectional stream per session:
-//! hello (heads for shared boundaries only) → newer circle, if any → missing entries both ways.
+//! hello (mesh version and hash, heads for shared boundaries only) → the membership versions the
+//! other side lacks → missing entries both ways.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -14,7 +15,7 @@ use tracing::warn;
 use crate::envelope::Entry;
 use crate::node::Node;
 
-pub const ALPN: &[u8] = b"tear-mesh/1";
+pub const ALPN: &[u8] = b"tear-mesh/sync/2";
 const MAX_FRAME: usize = 4 << 20;
 const BATCH_BYTES: usize = 1 << 20;
 
@@ -22,14 +23,16 @@ const BATCH_BYTES: usize = 1 << 20;
 #[serde(tag = "t", rename_all = "snake_case")]
 enum Frame {
     Hello {
-        circle: String,
+        mesh: String,
         version: u64,
+        hash: String,
         addr: EndpointAddr,
         /// boundary → author → highest seq held. Only boundaries shared with this peer.
         heads: BTreeMap<String, BTreeMap<String, u64>>,
     },
-    Circle {
-        signed: Option<(String, String)>,
+    /// `(version, toml, sig)` for each version the other side lacks, oldest first.
+    Mesh {
+        versions: Vec<(u64, String, String)>,
     },
     Entries {
         boundary: String,
@@ -38,7 +41,8 @@ enum Frame {
     End,
 }
 
-async fn write(send: &mut SendStream, f: &Frame) -> Result<()> {
+/// One length-prefixed JSON frame.
+pub(crate) async fn send_json<T: Serialize>(send: &mut SendStream, f: &T) -> Result<()> {
     let b = serde_json::to_vec(f)?;
     ensure!(b.len() <= MAX_FRAME, "frame too large");
     send.write_all(&(b.len() as u32).to_be_bytes()).await?;
@@ -46,7 +50,7 @@ async fn write(send: &mut SendStream, f: &Frame) -> Result<()> {
     Ok(())
 }
 
-async fn read(recv: &mut RecvStream) -> Result<Frame> {
+pub(crate) async fn recv_json<T: serde::de::DeserializeOwned>(recv: &mut RecvStream) -> Result<T> {
     let mut len = [0u8; 4];
     recv.read_exact(&mut len).await?;
     let n = u32::from_be_bytes(len) as usize;
@@ -54,6 +58,14 @@ async fn read(recv: &mut RecvStream) -> Result<Frame> {
     let mut buf = vec![0; n];
     recv.read_exact(&mut buf).await?;
     Ok(serde_json::from_slice(&buf)?)
+}
+
+async fn write(send: &mut SendStream, f: &Frame) -> Result<()> {
+    send_json(send, f).await
+}
+
+async fn read(recv: &mut RecvStream) -> Result<Frame> {
+    recv_json(recv).await
 }
 
 pub async fn initiate(node: &Arc<Node>, peer: EndpointId) -> Result<()> {
@@ -90,41 +102,43 @@ async fn session(
         heads.insert(b.clone(), node.heads(&b)?);
     }
     let hello = Frame::Hello {
-        circle: me.circle.id.clone(),
-        version: me.circle.version,
+        mesh: me.mesh.id.clone(),
+        version: me.mesh.version,
+        hash: me.hash.clone(),
         addr: node.endpoint.addr(),
         heads,
     };
     write(&mut send, &hello).await?;
     let Frame::Hello {
-        circle,
+        mesh,
         version,
+        hash,
         addr,
         heads: theirs,
     } = read(&mut recv).await?
     else {
         bail!("expected hello")
     };
-    ensure!(circle == me.circle.id, "peer is in another circle");
+    ensure!(mesh == me.mesh.id, "peer is in another mesh");
     if addr.id == peer {
         node.learn_addr(addr);
     }
 
-    let offer = (me.circle.version > version).then(|| (me.toml.clone(), me.sig.clone()));
-    write(&mut send, &Frame::Circle { signed: offer }).await?;
-    let Frame::Circle { signed } = read(&mut recv).await? else {
-        bail!("expected circle")
+    let versions = node.versions_for(version, &hash);
+    write(&mut send, &Frame::Mesh { versions }).await?;
+    let Frame::Mesh { versions } = read(&mut recv).await? else {
+        bail!("expected mesh versions")
     };
-    if let Some((toml, sig)) = signed
-        && let Err(e) = node.adopt(&toml, &sig)
+    if !versions.is_empty()
+        && let Err(e) = node.adopt(&versions)
     {
         warn!(
-            "peer {} offered a circle we refused: {e:#}",
+            "peer {} offered membership versions we refused: {e:#}",
             peer.fmt_short()
         );
     }
 
-    // Placement uses the circle as it stands now, possibly just updated.
+    // Placement uses the membership file as it stands now, possibly just updated.
     let shared = node.shared_with(&peer);
     let send_side = async {
         for b in shared.iter().filter(|b| theirs.contains_key(*b)) {
