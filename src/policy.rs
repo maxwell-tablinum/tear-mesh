@@ -164,6 +164,23 @@ pub fn check_entry(mesh: &Mesh, boundary: &str, entry: &Entry) -> Result<Envelop
         env.kind.is_letter() || env.to == ["*"],
         "offers and bios go to the whole boundary"
     );
+    match env.kind {
+        crate::envelope::Kind::Bio => ensure!(
+            entry.body.len() <= crate::envelope::MAX_BIO,
+            "bio over {} bytes",
+            crate::envelope::MAX_BIO
+        ),
+        crate::envelope::Kind::Offer => {
+            let o = crate::offer::Offer::parse(&entry.body)?;
+            ensure!(
+                o.server == env.subject,
+                "offer for {} filed as {}",
+                o.server,
+                env.subject
+            );
+        }
+        _ => {}
+    }
     let (_, from_host) = parse_address(&env.from).ok_or_else(|| anyhow::anyhow!("bad from"))?;
     ensure!(
         from_host == author.name,

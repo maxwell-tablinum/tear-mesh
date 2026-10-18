@@ -467,54 +467,77 @@ impl Node {
         Ok(v)
     }
 
-    /// Adopts later versions, each `(declared version, toml, sig)`, in order. A version this
-    /// machine already has with a different hash is a sibling: the lower hash wins on every
-    /// machine, so a split heals the same way everywhere. Returns the current version.
+    /// Adopts later versions, each `(declared version, toml, sig)`, in order.
+    ///
+    /// Two owners may sign different files for the same version. Only the tip is ever replaced,
+    /// never an older version, and only by a sibling whose signer is still an owner in this
+    /// machine's tip, so a key that a version removed can't come back and rewrite history.
+    /// Between such siblings, one that removes the other's signer wins, then the one with more
+    /// versions built on it, then the lower hash. Every machine applies the same rule.
     pub fn adopt(&self, files: &[(u64, String, String)]) -> Result<u64> {
         let mut files = files.to_vec();
         files.sort_by_key(|f| f.0);
+        files.truncate(MAX_VERSIONS);
         let mut guard = self.mesh.write().unwrap();
         let state = guard.as_mut().context("no mesh yet")?;
         let mut changed = false;
-        for (v, toml, sig) in files.iter().take(MAX_VERSIONS) {
+        for (i, (v, toml, sig)) in files.iter().enumerate() {
             let cur = state.current().mesh.version;
             if *v == cur + 1 {
                 let s = SignedMesh::verify_next(toml, sig, state.current())?;
                 save_version(&self.cfg.state_dir, &s)?;
                 state.history.push(s);
                 changed = true;
-            } else if *v <= cur {
-                let Some(mine) = state.at(*v) else { continue };
-                let h = crate::mesh::hash(toml);
-                // The same file, or a sibling that loses to ours.
-                if h >= mine.hash {
-                    continue;
+            } else if *v == cur && crate::mesh::hash(toml) != state.current().hash {
+                let Some(prev) = state.at(cur - 1) else {
+                    self.warn_once(format!(
+                        "a peer has a different version {cur}, and this machine has no version {} to check it against",
+                        cur - 1
+                    ));
+                    break;
+                };
+                let mut branch = vec![SignedMesh::verify_next(toml, sig, prev)?];
+                for (w, t, g) in &files[i + 1..] {
+                    let last = branch.last().expect("non-empty");
+                    if *w != last.mesh.version + 1 {
+                        break;
+                    }
+                    match SignedMesh::verify_next(t, g, last) {
+                        Ok(x) => branch.push(x),
+                        Err(_) => break,
+                    }
                 }
-                let prev = state.at(v - 1).with_context(|| {
-                    format!("can't check sibling version {v}: no version {}", v - 1)
-                })?;
-                let s = SignedMesh::verify_next(toml, sig, prev)?;
-                let dropped: Vec<String> = state
-                    .history
-                    .iter()
-                    .filter(|x| x.mesh.version >= *v)
-                    .map(|x| format!("{} ({})", x.mesh.version, &x.hash[..12]))
-                    .collect();
-                state.history.retain(|x| x.mesh.version < *v);
-                for d in &dropped {
-                    let n = d.split(' ').next().unwrap_or_default();
-                    let _ = std::fs::remove_file(
-                        self.cfg.state_dir.join("mesh").join(format!("{n}.json")),
-                    );
+                let mine = state.current().clone();
+                if sibling_wins(&branch[0], &mine, branch.len() > 1) {
+                    state.history.pop();
+                    for b in branch {
+                        save_version(&self.cfg.state_dir, &b)?;
+                        state.history.push(b);
+                    }
+                    changed = true;
+                    self.warn_once(format!(
+                        "two owners signed different version {cur}s; this machine dropped its own ({}) for the other ({}). Re-apply the dropped changes on top of the current version",
+                        &mine.hash[..12],
+                        &state.at(cur).expect("just pushed").hash[..12]
+                    ));
+                } else {
+                    self.warn_once(format!(
+                        "a peer has a different version {cur} ({}); this machine keeps its own ({})",
+                        &branch[0].hash[..12],
+                        &mine.hash[..12]
+                    ));
                 }
-                save_version(&self.cfg.state_dir, &s)?;
-                state.history.push(s);
-                changed = true;
-                self.warn_once(format!(
-                    "two owners signed different version {v}s; the other one won (lower hash). Dropped {}; re-apply those changes on top of the current version",
-                    dropped.join(", ")
-                ));
-            } else {
+                break;
+            } else if *v < cur {
+                if state
+                    .at(*v)
+                    .is_some_and(|m| m.hash != crate::mesh::hash(toml))
+                {
+                    self.warn_once(format!(
+                        "a peer has a different version {v}; this machine is past it and keeps its own"
+                    ));
+                }
+            } else if *v > cur {
                 bail!("version {v} doesn't follow {cur}; missing the versions between");
             }
         }
@@ -523,6 +546,7 @@ impl Node {
         if changed {
             info!(version = cur.mesh.version, "adopted mesh version");
             self.joins.on_adopt(&cur);
+            self.streams.recheck(self, &cur.mesh);
             self.sync_now.notify_one();
         }
         Ok(cur.mesh.version)
@@ -935,14 +959,21 @@ impl Node {
     pub fn who(&self, boundary: &str, mailbox: &str) -> Result<Who> {
         let mesh = self.mesh()?;
         let seen = self.last_seen.lock().unwrap().clone();
+        let me = &self.cfg.machine;
+        use crate::mesh::Category;
+        // A bio is the machine talking to this one, so it needs a converse grant like a letter.
+        // Offers are listed where this machine may call them (and its own).
         let bios: HashMap<String, String> = self
             .latest(boundary, Kind::Bio)?
             .into_iter()
+            .filter(|(m, _)| mesh.allows(m, me, Category::Converse))
             .map(|(m, st)| (m, st.body))
             .collect();
         let mut offers: HashMap<String, Vec<String>> = HashMap::new();
         for (m, st) in self.latest(boundary, Kind::Offer)? {
-            if crate::offer::Offer::parse(&st.body).is_ok_and(|o| !o.withdrawn) {
+            if (m == *me || mesh.allows(me, &m, Category::Tools))
+                && crate::offer::Offer::parse(&st.body).is_ok_and(|o| !o.withdrawn)
+            {
                 offers.entry(m).or_default().push(st.env.subject);
             }
         }
@@ -958,13 +989,11 @@ impl Node {
                 offers: offers.remove(&m.name).unwrap_or_default(),
             })
             .collect();
-        let me = &self.cfg.machine;
         let mut addresses: Vec<String> = self
             .with_store(boundary, |s| s.senders())?
             .into_iter()
             .filter(|a| {
-                parse_address(a)
-                    .is_some_and(|(_, host)| mesh.allows(host, me, crate::mesh::Category::Converse))
+                parse_address(a).is_some_and(|(_, host)| mesh.allows(host, me, Category::Converse))
             })
             .collect();
         for (b, mb) in self.holders.lock().unwrap().keys() {
@@ -1085,6 +1114,19 @@ impl Node {
             warnings,
         }
     }
+}
+
+/// Whether `theirs` should replace `mine`, two different files for the same version.
+fn sibling_wins(theirs: &SignedMesh, mine: &SignedMesh, longer: bool) -> bool {
+    // A key this machine's version removed can't replace it.
+    if !mine.mesh.has_owner(&theirs.signer) {
+        return false;
+    }
+    // A version that removed the other's signer wins.
+    if !theirs.mesh.has_owner(&mine.signer) {
+        return true;
+    }
+    longer || theirs.hash < mine.hash
 }
 
 pub struct HoldGuard {

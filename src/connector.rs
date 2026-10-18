@@ -145,9 +145,17 @@ impl Connector {
                 &["status", "--porcelain=v2", "--branch"][..],
                 &["log", "-n", "10", "--oneline", "--decorate"][..],
             ] {
-                // fsmonitor off and no optional locks: status mustn't run hooks or write the index.
+                // No fsmonitor, no signature checks, no index writes. Clean filters in the repo's
+                // own config can still run: whoever can edit .git/config already runs as this user.
                 let o = tokio::process::Command::new("git")
-                    .args(["--no-optional-locks", "-c", "core.fsmonitor=false", "-C"])
+                    .args([
+                        "--no-optional-locks",
+                        "-c",
+                        "core.fsmonitor=false",
+                        "-c",
+                        "log.showSignature=false",
+                        "-C",
+                    ])
                     .arg(r)
                     .args(args)
                     .output()

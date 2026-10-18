@@ -32,7 +32,12 @@ Some overlap is real: machine bios resemble A2A Agent Cards and MCP registry met
   - the MCP servers you approved;
   - the owner keys.
 
-  You sign it with `ssh-keygen -Y sign`, and YubiKeys work. At least two owner keys are required, typically an everyday key and a portable one, so losing one doesn't lock you out. Versions form a hash chain: each one names the one before and is signed by an owner of it. A machine that missed versions gets each one, and a split between two owners heals the same way everywhere. Connections from keys not in the file are refused during the handshake.
+  You sign it with `ssh-keygen -Y sign`, and YubiKeys work. At least two owner keys are required, typically an everyday key and a portable one, so losing one doesn't lock you out. Versions form a hash chain: each one names the one before and is signed by an owner of it. A machine that missed versions gets each one. If two owners sign different versions at once:
+  - a version that removes the other's signer wins;
+  - otherwise the one with more versions built on it wins;
+  - otherwise the lower hash wins.
+
+  Only a machine's newest version can be replaced, and only by a version signed by a key that's still an owner, so a removed key can't come back and rewrite history. Connections from keys not in the file are refused during the handshake.
 - **A boundary is an OS user.** Each boundary on a machine has its own user (`tm-work`, `tm-vault`). The daemon learns a session's boundary from the OS (`SO_PEERCRED` on Linux; the pipe client's token on Windows), so a session can't claim another one.
 - **One log per boundary.** Each boundary has an append-only SQLite file, synced only with machines that host that boundary. Moving information between boundaries is a person's job.
 - **Grants say which machine may act on which:**

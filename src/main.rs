@@ -606,7 +606,15 @@ async fn edit(e: Edit, change: impl FnOnce(&mut Mesh) -> Result<()>) -> Result<(
             // A local file signed offline is applied only if a daemon is there to take it.
             let daemon = from_daemon || Client::connect(&socket_path()).await.is_ok();
             if !e.no_apply && daemon {
-                apply_file(&out).await?;
+                // The bytes this process wrote, not the file read back: the daemon refuses a
+                // signature that doesn't match them.
+                let sig = std::fs::read_to_string(sig_path(&out))?;
+                let v = admin(Request::ApplyMesh {
+                    toml: m.to_toml()?,
+                    sig,
+                })
+                .await?;
+                println!("applied mesh version {}", v["version"]);
             }
         }
         None => println!(
@@ -890,13 +898,14 @@ async fn mesh_cmd(cmd: MeshCmd) -> Result<()> {
             if !yes && !confirm("Does the new machine show the same code? Approve and sign?")? {
                 bail!("not approved");
             }
+            let dir = private_dir()?;
             let e = Edit {
                 file: None,
-                out: Some(std::env::temp_dir().join(format!("tearmesh-approve-{name}.toml"))),
+                out: Some(dir.join(format!("{name}.toml"))),
                 key: Some(key),
                 no_apply: false,
             };
-            edit(e, |m| {
+            let r = edit(e, |m| {
                 m.add_machine(
                     Machine {
                         name: x.name,
@@ -906,7 +915,9 @@ async fn mesh_cmd(cmd: MeshCmd) -> Result<()> {
                     x.replace,
                 )
             })
-            .await?;
+            .await;
+            let _ = std::fs::remove_dir_all(&dir);
+            r?;
         }
         MeshCmd::Reset { yes } => {
             if !yes
@@ -1047,6 +1058,19 @@ async fn setup(config: &Path) -> Result<()> {
         cfg.machine
     );
     Ok(())
+}
+
+/// A new directory only this user can enter, for files that get signed: in a shared temp
+/// directory another user could swap a file between writing and signing.
+fn private_dir() -> Result<PathBuf> {
+    let mut r = [0u8; 8];
+    getrandom::fill(&mut r).map_err(|e| anyhow::anyhow!("random: {e}"))?;
+    let d = std::env::temp_dir().join(format!("tearmesh-{}", tearmesh::envelope::hex(&r)));
+    let mut b = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut b, 0o700);
+    b.create(&d)?;
+    Ok(d)
 }
 
 /// `key.pub` next to `key`, as ssh-keygen names it.

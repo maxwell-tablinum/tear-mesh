@@ -11,6 +11,8 @@ use serde::{Deserialize, Serialize};
 pub const MAX_BODY: usize = 256 * 1024;
 pub const MAX_SUBJECT: usize = 200;
 pub const MAX_TO: usize = 32;
+/// Largest bio.
+pub const MAX_BIO: usize = 16 * 1024;
 const MAX_ENVELOPE: usize = 16 * 1024;
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]

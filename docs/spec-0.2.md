@@ -540,8 +540,20 @@ Each gate is an automated test, in the style of `tests/mesh.rs` (in-process iroh
 Four problems the review found are fixed in 0.2:
 1. **A machine that missed an owner change was stuck.** Versions now name their predecessor's hash, must be exactly one higher, and peers send every version the other lacks.
 2. **One signature could freeze the mesh** with a huge version number. Fixed by the same rule.
-3. **Two owners signing different next versions split the mesh silently.** The lower hash now wins everywhere, and `status` says which changes to re-apply.
+3. **Two owners signing different next versions split the mesh silently.** Now only a machine's newest version can be replaced, and only by a sibling signed by a key that is still an owner in it. A sibling that removes the other's signer wins, then the branch with more versions, then the lower hash. `status` says which changes to re-apply. (A first version of this rule let any older version be replaced by a lower hash. A security review showed a removed owner key could use that to rewrite history, so it was narrowed.)
 4. **The connector on a localhost TCP port crossed boundaries.** It now listens on a private Unix socket instead.
+
+The security review of the 0.2 code also led to these fixes:
+- **Tool streams:**
+  - the filter passes a reply only for an outstanding request id, in one exact form, so `1.0` can't stand in for `1`;
+  - notifications lose their free text;
+  - the queues are small.
+- **Open streams:** tool and shell streams close when a new version no longer allows them.
+- **The local socket:** a connection must speak within 10 seconds, at most 256 are open at once, and accept errors back off.
+- **Joins:** only failed attempts count against the join budget, and a wrong machine name doesn't burn the ticket.
+- **Signing:** `mesh approve` signs in a private directory and applies the exact bytes it wrote.
+- **Received bios and offers** are checked for size and shape.
+- **`who`** shows a bio only from a machine with a converse grant to this one, and an offer only where this machine may call it.
 
 ## 16. Superseded or changed
 

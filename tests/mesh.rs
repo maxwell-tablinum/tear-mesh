@@ -628,7 +628,7 @@ async fn a_split_heals_the_same_way_everywhere() {
             .status()
             .warnings
             .iter()
-            .any(|x| x.contains("re-apply")),
+            .any(|x| x.contains("Re-apply")),
         "the machine that lost says so"
     );
     stop(&[&ws, &laptop]).await;
@@ -865,16 +865,18 @@ async fn tool_calls_need_a_grant_an_approval_and_a_shared_boundary() {
         .unwrap();
     }
     sync(&[&ws, &laptop]).await;
-    assert_eq!(
-        laptop
-            .who("work", "admin")
+    let offers = |n: &Arc<Node>| {
+        n.who("work", "admin")
             .unwrap()
             .machines
-            .iter()
+            .into_iter()
             .find(|m| m.name == "ws")
             .unwrap()
-            .offers,
-        vec!["cad"]
+            .offers
+    };
+    assert!(
+        offers(&laptop).is_empty(),
+        "offers show only where they can be called"
     );
     let err = |r: anyhow::Result<_>| r.err().map(|e| format!("{e:#}")).unwrap_or_default();
 
@@ -885,6 +887,7 @@ async fn tool_calls_need_a_grant_an_approval_and_a_shared_boundary() {
     let v2 = w.next(&v1, |m| m.grant("laptop", "ws", &[Category::Tools]));
     apply(&ws, &v2).unwrap();
     apply(&laptop, &v2).unwrap();
+    assert_eq!(offers(&laptop), vec!["cad"]);
     let e = err(tearmesh::bridge::call(&laptop, "work", "ws", "cad")
         .await
         .map(|_| ()));
@@ -1010,4 +1013,154 @@ async fn a_stored_0_1_circle_is_carried_over() {
     assert_eq!(ws.mesh().unwrap().version, 4);
     let _ = SignedMesh::verify_first(&v4.0, &v4.1).unwrap();
     stop(&[&ws]).await;
+}
+
+#[tokio::test]
+async fn a_removed_owner_key_cant_rewrite_history() {
+    let w = World::new();
+    let (new_key, new_pub) = keygen(w.dir.path(), "new-owner");
+    let v1 = w.sign(&w.mesh(&[("ws", &["work"]), ("laptop", &["work"])]));
+    let ws = w.start("ws", &v1).await;
+    let laptop = w.start("laptop", &v1).await;
+    // The backup key is rotated out at v2; v3 and v4 follow under the new key.
+    let v2 = w.next(&v1, |m| {
+        m.owners = vec![w.owners[0].clone(), new_pub.clone()]
+    });
+    let next_by_new = |prev: &Signed| {
+        let mut m = Mesh::parse(&prev.0).unwrap();
+        m.bump(&prev.0).unwrap();
+        w.sign_with(&new_key, &m)
+    };
+    let v3 = next_by_new(&v2);
+    let v4 = next_by_new(&v3);
+    for s in [&v2, &v3, &v4] {
+        apply(&ws, s).unwrap();
+    }
+    apply(&laptop, &v2).unwrap();
+    // Whoever holds the old key signs a different v2 on v1 that makes them owner and adds a
+    // machine hosting every boundary. Hash grinding doesn't matter: no hash comparison is reached.
+    let mut fake = Mesh::parse(&v1.0).unwrap();
+    let (_k, evil_pub) = keygen(w.dir.path(), "evil-key");
+    fake.owners = vec![w.owners[1].clone(), evil_pub];
+    fake.add_machine(
+        Machine {
+            name: "evil".into(),
+            id: w.id("evil"),
+            boundaries: vec!["work".into(), "vault".into()],
+        },
+        false,
+    )
+    .unwrap();
+    fake.bump(&v1.0).unwrap();
+    let fake = w.sign_with(&w.backup_key, &fake);
+    for n in [&ws, &laptop] {
+        let before = n.signed().unwrap().hash;
+        let _ = apply(n, &fake);
+        assert_eq!(
+            n.signed().unwrap().hash,
+            before,
+            "{} kept its version",
+            n.cfg.machine
+        );
+        assert!(n.mesh().unwrap().machine("evil").is_none());
+    }
+    assert!(
+        laptop
+            .status()
+            .warnings
+            .iter()
+            .any(|x| x.contains("keeps its own"))
+    );
+    stop(&[&ws, &laptop]).await;
+}
+
+#[tokio::test]
+async fn a_longer_branch_wins_a_split() {
+    let w = World::new();
+    let v1 = w.sign(&w.mesh(&[("ws", &["work"]), ("laptop", &["work"])]));
+    let ws = w.start("ws", &v1).await;
+    let laptop = w.start("laptop", &v1).await;
+    introduce(&[&ws, &laptop]);
+    // One owner signs v2 and v3; the other, concurrently, a different v2.
+    let v2a = w.next(&v1, |m| m.grant("ws", "laptop", &[Category::Tools]));
+    let v3a = w.next(&v2a, |m| m.grant("laptop", "ws", &[Category::Tools]));
+    let mut mb = Mesh::parse(&v1.0).unwrap();
+    mb.grant("laptop", "ws", &[Category::Shell]);
+    mb.bump(&v1.0).unwrap();
+    let v2b = w.sign_with(&w.backup_key, &mb);
+    apply(&ws, &v2a).unwrap();
+    apply(&ws, &v3a).unwrap();
+    apply(&laptop, &v2b).unwrap();
+    sync(&[&laptop, &ws]).await;
+    assert_eq!(laptop.signed().unwrap().hash, tearmesh::mesh::hash(&v3a.0));
+    assert_eq!(ws.signed().unwrap().hash, tearmesh::mesh::hash(&v3a.0));
+    stop(&[&ws, &laptop]).await;
+}
+
+#[tokio::test]
+async fn a_version_that_removes_the_other_signer_wins() {
+    let w = World::new();
+    let v1 = w.sign(&w.mesh(&[("ws", &["work"]), ("laptop", &["work"])]));
+    let ws = w.start("ws", &v1).await;
+    let laptop = w.start("laptop", &v1).await;
+    introduce(&[&ws, &laptop]);
+    let (_n, new_pub) = keygen(w.dir.path(), "new-owner");
+    // The owner revokes the backup key while, at the same time, the backup key signs a change.
+    let revoke = w.next(&v1, |m| {
+        m.owners = vec![w.owners[0].clone(), new_pub.clone()]
+    });
+    let mut other = Mesh::parse(&v1.0).unwrap();
+    other.grant("laptop", "ws", &[Category::Shell]);
+    other.bump(&v1.0).unwrap();
+    let other = w.sign_with(&w.backup_key, &other);
+    apply(&ws, &revoke).unwrap();
+    apply(&laptop, &other).unwrap();
+    sync(&[&laptop, &ws]).await;
+    let want = tearmesh::mesh::hash(&revoke.0);
+    assert_eq!(ws.signed().unwrap().hash, want);
+    assert_eq!(
+        laptop.signed().unwrap().hash,
+        want,
+        "the revocation wins whatever the hashes"
+    );
+    stop(&[&ws, &laptop]).await;
+}
+
+#[tokio::test]
+async fn revoking_a_grant_closes_open_streams() {
+    let w = World::new();
+    let echo = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = echo.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        while let Ok((s, _)) = echo.accept().await {
+            tokio::spawn(async move {
+                let (mut r, mut wr) = s.into_split();
+                let _ = tokio::io::copy(&mut r, &mut wr).await;
+            });
+        }
+    });
+    let mut m = w.mesh(&[("ws", &["work"]), ("laptop", &["work"])]);
+    m.grant("laptop", "ws", &[Category::Shell]);
+    let v1 = w.sign(&m);
+    let mut cfg = w.cfg("ws");
+    cfg.shell_port = port;
+    let ws = Node::start(cfg).await.unwrap();
+    ws.adopt_first(&v1.0, &v1.1).unwrap();
+    let laptop = w.start("laptop", &v1).await;
+    introduce(&[&ws, &laptop]);
+    let (mut r, mut s, _conn) = tearmesh::shell::open(&laptop, "work", "ws").await.unwrap();
+    s.write_all(b"ping\n").await.unwrap();
+    let mut buf = [0u8; 5];
+    r.read_exact(&mut buf).await.unwrap();
+    let v2 = w.next(&v1, |m| {
+        m.revoke("laptop", "ws", &[Category::Shell]).unwrap();
+    });
+    apply(&ws, &v2).unwrap();
+    let ended =
+        tokio::time::timeout(std::time::Duration::from_secs(10), r.read_to_end(1 << 20)).await;
+    assert!(
+        ended.is_ok(),
+        "the stream was closed when the grant went away"
+    );
+    stop(&[&ws, &laptop]).await;
 }

@@ -10,6 +10,7 @@ use std::collections::BTreeSet;
 use anyhow::{Context, Result, bail, ensure};
 use iroh::EndpointId;
 use serde::{Deserialize, Serialize};
+use ssh_key::public::KeyData;
 use ssh_key::{Algorithm, HashAlg, PublicKey, SshSig};
 
 use crate::config::Relay;
@@ -408,6 +409,12 @@ impl Mesh {
         })
     }
 
+    /// Whether `key` is one of this version's owner keys.
+    pub fn has_owner(&self, key: &KeyData) -> bool {
+        self.owner_keys()
+            .is_ok_and(|ks| ks.iter().any(|k| k.key_data() == key))
+    }
+
     pub fn approval(&self, machine: &str, boundary: &str, server: &str) -> Option<&Approval> {
         self.approvals
             .iter()
@@ -502,6 +509,8 @@ pub struct SignedMesh {
     pub mesh: Mesh,
     /// `hash(toml)`.
     pub hash: String,
+    /// The owner key that signed it.
+    pub signer: KeyData,
 }
 
 impl SignedMesh {
@@ -521,6 +530,7 @@ impl SignedMesh {
             sig: sig.into(),
             mesh,
             hash: hash(toml),
+            signer: sshsig.public_key().clone(),
         })
     }
 
@@ -554,6 +564,7 @@ impl SignedMesh {
             sig: sig.into(),
             mesh,
             hash: hash(toml),
+            signer: sshsig.public_key().clone(),
         })
     }
 }

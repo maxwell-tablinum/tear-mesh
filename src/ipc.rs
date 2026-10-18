@@ -15,7 +15,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tracing::debug;
 
 use crate::config::DEFAULT_SOCKET;
-use crate::envelope::{Kind, Trust};
+use crate::envelope::{Kind, MAX_BIO, Trust};
 use crate::node::{Event, Node};
 use crate::offer::Offer;
 use crate::os::{BoxRead, BoxWrite, Caller};
@@ -115,7 +115,10 @@ pub enum Request {
 
 /// Longest request line: a 256 KiB body JSON-escaped at worst, plus room.
 const MAX_LINE: u64 = 2 << 20;
-pub const MAX_BIO: usize = 16 * 1024;
+/// Local connections open at once.
+const MAX_CONNECTIONS: usize = 256;
+/// A connection must say something within this long; until then nobody knows who it is.
+const FIRST_LINE: Duration = Duration::from_secs(10);
 
 pub fn socket_path() -> PathBuf {
     std::env::var_os("TEARMESH_SOCKET")
@@ -127,16 +130,21 @@ pub async fn serve(node: Arc<Node>) -> Result<()> {
     let listener = crate::os::listen(&node.cfg.socket).await?;
     let ids = Arc::new(node.cfg.identity_map()?);
     let admins = Arc::new(node.cfg.admin_identities()?);
+    // Any local user may connect, so cap how many connections can be open at once.
+    let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
     loop {
+        let slot = slots.clone().acquire_owned().await?;
         let inc = match listener.accept().await {
             Ok(i) => i,
             Err(e) => {
                 debug!("socket accept: {e:#}");
+                tokio::time::sleep(Duration::from_millis(100)).await;
                 continue;
             }
         };
         let (node, ids, admins) = (node.clone(), ids.clone(), admins.clone());
         tokio::spawn(async move {
+            let _slot = slot;
             if let Err(e) = handle(node, inc, &ids, &admins).await {
                 debug!("socket client: {e:#}");
             }
@@ -175,7 +183,15 @@ async fn handle(
     let mut trust = Trust::Member;
     let mut _hold = None;
     loop {
-        let buf = match read_request(&mut reader).await {
+        let next = if who.is_none() {
+            match tokio::time::timeout(FIRST_LINE, read_request(&mut reader)).await {
+                Ok(r) => r,
+                Err(_) => return Ok(()),
+            }
+        } else {
+            read_request(&mut reader).await
+        };
+        let buf = match next {
             Ok(Some(b)) => b,
             Ok(None) => break,
             Err(e) => {

@@ -359,25 +359,28 @@ async fn owner_side(
     let mesh_id = node.mesh()?.id;
     let (rx, code) = {
         let mut i = node.joins.inner.lock().unwrap();
-        ensure!(
-            crate::within_budget(&mut i.attempts, ATTEMPTS_PER_HOUR, Instant::now()),
-            "too many join attempts this hour"
-        );
         i.expire();
-        ensure!(mesh == mesh_id, "ticket is for another mesh");
-        let got = blake3::Hash::from_hex(&p).context("proof")?;
-        let pos = i
-            .invites
-            .iter()
+        // Only failed attempts count against the budget, so strangers can't use it up and
+        // block the real joiner, whose proof matches.
+        let got = blake3::Hash::from_hex(&p).ok();
+        let pos = i.invites.iter().position(|inv| {
             // blake3::Hash compares in constant time.
-            .position(|inv| proof(&inv.secret, joiner, &node.id()) == got)
-            .context("no open invite matches this ticket (used, expired, or wrong)")?;
-        let inv = i.invites.remove(pos);
+            mesh == mesh_id && got == Some(proof(&inv.secret, joiner, &node.id()))
+        });
+        let Some(pos) = pos else {
+            ensure!(
+                crate::within_budget(&mut i.attempts, ATTEMPTS_PER_HOUR, Instant::now()),
+                "too many failed join attempts this hour"
+            );
+            bail!("no open invite matches this ticket (used, expired, or wrong)");
+        };
+        // A wrong name doesn't burn the ticket.
         ensure!(
-            name == inv.name,
+            name == i.invites[pos].name,
             "the ticket is for {}, but this machine is configured as {name}",
-            inv.name
+            i.invites[pos].name
         );
+        let inv = i.invites.remove(pos);
         let (tx, rx) = oneshot::channel();
         let code = code(&inv.secret, joiner, &node.id());
         info!(machine = %inv.name, code = %code, "join request waiting for approval");

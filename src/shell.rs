@@ -26,6 +26,7 @@ struct Header {
 /// The target's side: checks the grant, then connects the stream to the local sshd.
 pub async fn serve(node: &Arc<Node>, conn: Connection) -> Result<()> {
     let peer = conn.remote_id();
+    let _slot = node.streams.claim(peer)?;
     let (mut send, mut recv) = conn.accept_bi().await?;
     let setup = async {
         let h: Header =
@@ -41,9 +42,9 @@ pub async fn serve(node: &Arc<Node>, conn: Connection) -> Result<()> {
             .await
             .with_context(|| format!("no sshd on 127.0.0.1:{}", node.cfg.shell_port))?;
         info!(caller = %caller, boundary = %h.boundary, "shell stream open");
-        anyhow::Ok(tcp)
+        anyhow::Ok((tcp, caller, h.boundary))
     };
-    let tcp = match setup.await {
+    let (tcp, caller, boundary) = match setup.await {
         Ok(t) => t,
         Err(e) => {
             let _ = send_json(
@@ -68,7 +69,13 @@ pub async fn serve(node: &Arc<Node>, conn: Connection) -> Result<()> {
     )
     .await?;
     let (tr, tw) = tcp.into_split();
-    let r = splice(recv, send, tr, tw).await;
+    let live = node
+        .streams
+        .live(&caller, crate::bridge::Purpose::Shell { boundary });
+    let r = tokio::select! {
+        r = splice(recv, send, tr, tw) => r,
+        _ = live.stop.notified() => Err(anyhow::anyhow!("closed: the mesh no longer allows it")),
+    };
     // The caller closes once it has everything; closing here could drop bytes still in flight.
     let _ = tokio::time::timeout(Duration::from_secs(10), conn.closed()).await;
     r
