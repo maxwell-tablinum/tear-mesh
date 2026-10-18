@@ -1,6 +1,6 @@
 {
   "name": "tearmesh",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "tear-mesh mail between agents on your own machines: MCP tools plus hooks that announce new letters.",
   "author": {
     "name": "tear-mesh contributors"
