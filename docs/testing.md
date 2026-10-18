@@ -1,92 +1,216 @@
 # Testing tear-mesh
 
-This guide has three levels. Automated tests run on one Linux machine. The two-machine walkthrough proves that real machines on different networks find each other. The Claude Code steps check the agent side. Commands assume a clone at `/opt/tear-mesh`. Boundary users have private home directories, so put the clone somewhere they can read.
+There are three levels:
+1. **Automated tests** run on one machine. On Linux there's also a container matrix across distributions.
+2. **The walkthrough across machines** proves that real machines on different networks find each other, mail each other, call each other's tools and reach each other's shells.
+3. **The Claude Code and connector steps** check the agent side.
+
+Commands assume a clone at `/opt/tear-mesh`. Boundary users have private home directories, so put the clone somewhere they can read.
 
 ## 1. Automated tests
 
-You need Linux and Rust 1.88 or later.
+You need Rust 1.88 or later.
 
 ```sh
 cargo test                  # about 40 s
 cargo build --release
-tests/e2e-linux.sh          # needs passwordless sudo
+tests/e2e-linux.sh          # Linux; needs passwordless sudo, python3, curl (tmux for the TUI checks)
+cargo build --release --target x86_64-unknown-linux-musl
+PODMAN="sudo podman" tests/distros.sh      # the same in six distributions' containers
 ```
 
-**`cargo test`** runs unit tests and in-process mesh tests. The mesh tests make real iroh connections on localhost. They check that:
+**`cargo test`** runs unit tests and in-process mesh tests over real iroh connections on localhost. They check that:
 - vault mail never reaches a machine that only hosts `work`, and a machine can't push forged or wide-labelled entries;
-- strangers are refused during the handshake;
-- revoking a machine cuts it off;
-- a restarted machine catches up on mail it missed;
-- mail relays through a middle machine;
-- mail to an unheld mailbox raises a wake event, and threads stop at their length cap.
+- strangers are refused during the handshake, and the join protocol is closed while no invite is open;
+- removing a machine cuts it off;
+- the membership chain behaves:
+  - a machine that missed an owner change catches up in order;
+  - a removed owner key can't sign the next version;
+  - a jump to a far-off version, or a version that doesn't name its predecessor's hash, is refused;
+  - two owners signing different versions settle on the same one everywhere;
+- joins work as designed:
+  - a ticket join needs the owner's approval;
+  - a used ticket is refused;
+  - a joiner refuses a file signed by owners its ticket didn't name;
+- grants are enforced:
+  - converse grants decide delivery, and revoking one hides earlier letters;
+  - a tool call needs a grant, a shared boundary and a matching approval;
+  - shell streams need a grant in the right direction;
+- a restarted machine catches up, mail relays through a middle machine, and a 0.1 circle on disk is carried over;
+- the JSON-RPC filter on tool streams refuses unapproved tools and methods and server-to-client requests, and catches changed instructions or tools;
+- the connector's `read_file` refuses `..` and symlinks out of its roots.
 
-**`tests/e2e-linux.sh`** runs two daemons on one machine as stand-ins for two machines. It uses real OS users (`tme-work`, `tme-vault`, `tme-lap`, created and then removed) and the default network. It covers:
-- the invite flow;
-- delivery between the two daemons;
-- that no vault bytes reach the work-only daemon;
-- the refusals, each checked for its reason;
+**`tests/e2e-linux.sh`** runs two daemons on one machine as stand-ins for two machines. It uses real OS users (`tme-work`, `tme-vault`, `tme-lap`, `tme-none`, created and then removed) and the default network. It covers:
+- the ticket join: both sides show the same code, and the owner approves;
+- delivery between daemons, and that no vault bytes reach the work-only daemon;
+- refusals, each checked for its reason;
+- an offer published by a boundary user and approved for one of its two tools;
+- a tool call from the other machine that reaches the server through the steward: the unapproved tool and other methods are refused, and the tool list is cut to the subset;
+- shell-proxy to a stand-in sshd, and that the grant is one way;
+- bios;
 - the MCP server over stdio;
 - the hook;
-- the waker.
+- the steward waking a mailbox;
+- the connector: its socket is private to its user, it reads only under its roots, and its letters carry `guest` trust and don't wake a default mailbox;
+- the TUI, through tmux.
 
 It prints `PASS` or `FAIL` for each check and ends with `ALL PASSED`.
 
-## 2. Two machines
+**`tests/distros.sh`** runs that script and `deploy/setup-linux.sh` in Debian 13, Ubuntu 24.04, Fedora 42, Arch, openSUSE Tumbleweed and Alpine 3.22 containers, on the static musl binary. Name images as arguments to test others.
 
-This is the test that exercises NAT traversal and relays. Use two Linux machines, ideally on different networks. We'll call them **alpha**, which hosts `work` and `vault`, and **beta**, which hosts `work`. You need `sudo` on both.
+**`tests/e2e-windows.ps1`** is the Windows version, for an elevated PowerShell on Windows Server or Windows 11. See [Windows](#windows).
+
+## 2. Across machines
+
+Use two machines, ideally on different networks; that is what exercises NAT traversal and relays. We'll call them **alpha**, which hosts `work` and `vault` and is the owner node, and **beta**, which hosts `work`. Beta can be Linux or Windows.
 
 ### Install
-
-On each machine:
 
 ```sh
 cd /opt/tear-mesh && cargo build --release
 sudo deploy/setup-linux.sh alpha work vault     # on alpha
-sudo deploy/setup-linux.sh beta work            # on beta
+sudo deploy/setup-linux.sh beta work            # on beta (Linux)
 ```
 
-Each machine prints its node id. Note both. The script installs `/usr/local/bin/tearmesh`, creates the `tearmesh` daemon user and one user per boundary (`tm-work`, `tm-vault`), writes `/etc/tearmesh/config.toml`, and starts `tearmesh.service`.
+Each prints its node id. The script:
+- installs `/usr/local/bin/tearmesh`;
+- creates the `tearmesh` daemon user and one user per boundary (`tm-work`, `tm-vault`);
+- writes `/etc/tearmesh/config.toml`, with you as an admin;
+- starts the service (systemd or OpenRC).
 
-### Create the circle
+For a Windows beta, see [Windows](#windows).
 
-Do this on alpha, or wherever your SSH keys live. A circle needs two owner keys, so make a backup key if you don't have one:
+### Create the mesh (alpha)
 
 ```sh
-ssh-keygen -t ed25519 -f ~/.ssh/tearmesh-backup
-tearmesh circle new circle.toml --name test \
-  --owner-key ~/.ssh/id_ed25519.pub --owner-key ~/.ssh/tearmesh-backup.pub \
-  --boundary work --boundary vault
-tearmesh circle add circle.toml alpha <alpha-node-id> --boundary work --boundary vault
-tearmesh circle add circle.toml beta <beta-node-id> --boundary work
-tearmesh circle sign circle.toml --key ~/.ssh/id_ed25519
-sudo tearmesh circle apply circle.toml
-sudo tearmesh invite                             # prints tm1-…
+tearmesh setup
 ```
 
-On beta, run `sudo tearmesh join tm1-…`. Check that the owner fingerprints it prints match your keys (`ssh-keygen -lf ~/.ssh/id_ed25519.pub`), then answer `y`.
+Choose **c**. It asks for:
+- a mesh name;
+- an everyday owner key: an existing key, or a new `~/.ssh/tearmesh-owner`. Give it a passphrase; the wizard refuses a key without one;
+- a portable owner key: a security key (it creates a resident key that needs your PIN), or a key file for a removable drive.
 
-Within about 30 seconds, `sudo tearmesh status` on either machine shows the other machine with a `last_sync_ms`.
+It writes `<name>-mesh.toml` listing alpha, signs it with the everyday key, and applies it. `tearmesh status` shows version 1 or 2 and alpha's boundaries.
+
+<details><summary>The same by hand</summary>
+
+```sh
+ssh-keygen -t ed25519 -a 100 -f ~/.ssh/tearmesh-owner
+ssh-keygen -t ed25519-sk -O resident -O verify-required -f ~/.ssh/tearmesh-portable   # or a key file
+tearmesh mesh new mesh.toml --name test \
+  --owner-key ~/.ssh/tearmesh-owner.pub --owner-key ~/.ssh/tearmesh-portable.pub \
+  --boundary work --boundary vault
+tearmesh mesh add alpha <alpha-node-id> --boundary work --boundary vault --file mesh.toml --key ~/.ssh/tearmesh-owner
+tearmesh mesh apply mesh.toml
+```
+</details>
+
+### Join beta
+
+```sh
+# alpha
+tearmesh mesh invite beta --boundary work      # prints tm2-…, valid for an hour (--expires 1d)
+# beta
+tearmesh join tm2-…                             # prints "code 123456" and waits
+# alpha
+tearmesh mesh pending                           # shows beta and its code
+tearmesh mesh approve beta --key ~/.ssh/tearmesh-owner
+```
+
+Approve only if both codes match. Beta prints `joined; mesh version …`. Within about 30 seconds, `tearmesh status` on either machine shows the other with a `last_sync_ms`.
 
 ### Send mail
 
 ```sh
 # alpha
-sudo -u tm-work env TEARMESH_MAILBOX=builder tearmesh post --to admin@beta --subject hello --body "first letter"
+sudo -u tm-work env TEARMESH_MAILBOX=builder tearmesh post --to admin@beta --subject hello --body "first letter" --kind task
 # beta
-sudo -u tm-work tearmesh inbox
+sudo -u tm-work tearmesh inbox                  # shows "hello [task]"
 sudo -u tm-work tearmesh read <id>
 sudo -u tm-work tearmesh post --to builder@alpha --subject re --body "got it" --thread <id>
-# alpha
-sudo -u tm-work env TEARMESH_MAILBOX=builder tearmesh inbox
 ```
 
-### The terminal UI
+### Check the boundaries
+
+Each of these should be refused with the reason shown.
+
+| Where | Command | Expected |
+|---|---|---|
+| alpha | `sudo -u tm-vault tearmesh post --to admin@beta --subject x --body x` | `beta is not in boundary vault` |
+| alpha | `sudo -u tm-vault tearmesh read <id of a work letter>` | `no letter … in this boundary` |
+| alpha | `sudo -u nobody tearmesh who` | `isn't mapped to a boundary` |
+| alpha | `sudo -u tm-work tearmesh status` | `admin only` |
+| alpha | `sudo -u tm-work ls /home/tm-vault` | `Permission denied` |
+
+Then post a vault letter on alpha and confirm it never reaches beta:
+
+```sh
+sudo -u tm-vault tearmesh post --to '*' --subject secret --body "vault only"   # alpha
+sudo ls /var/lib/tearmesh/boundaries/            # beta, after a minute: only work.db
+sudo grep -rc "vault only" /var/lib/tearmesh/    # beta: no matches
+```
+
+### Call a tool on another machine
+
+Any stdio MCP server will do. Here beta offers one and alpha calls it.
+
+```sh
+# beta, as tm-work: ~/.config/tearmesh/offers.toml
+#   [files]
+#   command = ["npx", "-y", "@modelcontextprotocol/server-filesystem@<version>", "/home/tm-work/shared"]
+sudo -u tm-work tearmesh offer publish files       # prints its tools and the pin
+sudo systemctl enable --now tearmesh-steward@tm-work
+# alpha
+tearmesh mesh grant alpha beta tools --key ~/.ssh/tearmesh-owner
+sudo -u tm-work tearmesh offers                    # beta/files: pending approval
+tearmesh mesh approve-offer beta work files --tools <tool>,<tool> --key ~/.ssh/tearmesh-owner   # names as `offers` lists them
+sudo -iu tm-work claude mcp add files -- tearmesh mcp --remote beta/files
+```
+
+In a Claude Code session as `tm-work` on alpha, ask it to list the shared directory. Only the two approved tools appear. To see a refusal:
+1. Revoke the grant: `tearmesh mesh revoke alpha beta tools --key …`.
+2. Start a new session; the call fails with `no tools grant`.
+
+Pin the package version in `command`. `npx` and `uvx` fetch code at run time, so the offer can't carry an executable hash for them.
+
+### Shell
+
+```sh
+tearmesh mesh grant alpha beta shell --key ~/.ssh/tearmesh-owner     # alpha
+# alpha, as tm-work, in ~/.ssh/config:
+#   Host beta
+#     ProxyCommand tearmesh shell-proxy %h
+sudo -iu tm-work ssh tm-work@beta
+```
+
+Beta needs sshd, with `tm-work`'s key from alpha in beta's `/home/tm-work/.ssh/authorized_keys`. The grant only gets bytes to beta's sshd; sshd decides who logs in. Give each boundary user its own key. `ssh` from beta to alpha is refused (`no shell grant`), because the grant is one way.
+
+### Bios
+
+```sh
+printf 'role: build server\noffers: [files]\n' | sudo -u tm-work tearmesh bio set -    # beta
+sudo -u tm-work tearmesh bio show beta                                                # alpha
+```
+
+### Revoke a machine
+
+```sh
+tearmesh mesh remove beta --key ~/.ssh/tearmesh-owner    # alpha
+```
+
+Beta's sessions can no longer reach alpha, and its earlier letters are no longer delivered. To bring beta back, run `tearmesh mesh reset` on beta, then invite and join again.
+
+## The terminal UI
 
 ```sh
 tearmesh launch --boundary work --mailbox admin -- tearmesh tui     # on beta
 ```
 
-The screen has three parts: the inbox (newest first, ● marks unread), the open letter, and a header showing your address and when each machine last synced. The keys:
+The screen has three parts:
+- the inbox, newest first. ● marks unread; `[task]`, `[question]` and `[guest]` mark the kind and trust;
+- the open letter;
+- a header showing your address and when each machine last synced.
 
 | Key | Does |
 |---|---|
@@ -99,45 +223,11 @@ The screen has three parts: the inbox (newest first, ● marks unread), the open
 | `space` / `pgup` | Scroll a long letter |
 | `q` | Quit |
 
-While writing a letter, `tab` moves between To, Subject and Body. `enter` adds a new line in the body. `ctrl+s` sends and `esc` discards. Separate several recipients with commas.
-
-Send a letter from alpha's TUI to `admin@beta`. It shows up in beta's TUI within a few seconds; reply with `r`.
-
-### Check the boundaries
-
-Each of these should be refused with the reason shown.
-
-| Where | Command | Expected |
-|---|---|---|
-| alpha | `sudo -u tm-vault tearmesh post --to admin@beta --subject x --body x` | `beta is not in boundary vault` |
-| alpha | `sudo -u tm-vault tearmesh read <id of a work letter>` | `no letter … in this boundary` |
-| alpha | `sudo -u nobody tearmesh who` | `isn't mapped to a boundary` |
-| alpha | `sudo -u tm-work ls /home/tm-vault` | `Permission denied` |
-
-Then post a vault letter on alpha and confirm it never reaches beta:
-
-```sh
-# alpha
-sudo -u tm-vault tearmesh post --to '*' --subject secret --body "vault only"
-# beta, after a minute
-sudo ls /var/lib/tearmesh/boundaries/            # only work.db
-sudo grep -rc "vault only" /var/lib/tearmesh/    # no matches
-```
-
-### Revoke a machine
-
-```sh
-# alpha
-tearmesh circle remove circle.toml beta
-tearmesh circle sign circle.toml --key ~/.ssh/id_ed25519
-sudo tearmesh circle apply circle.toml
-# beta
-sudo -u tm-work tearmesh post --to builder@alpha --subject "after revoke" --body x
-# alpha, after a minute: "after revoke" never arrives
-sudo -u tm-work env TEARMESH_MAILBOX=builder tearmesh inbox
-```
-
-To bring beta back, add it again, then sign, apply, invite and join as before.
+While writing a letter:
+- `tab` moves between To, Subject and Body;
+- `enter` adds a new line in the body;
+- `ctrl+s` sends and `esc` discards;
+- separate several recipients with commas.
 
 ## 3. Claude Code
 
@@ -152,7 +242,7 @@ exit
 tearmesh launch --boundary work --mailbox builder -- claude
 ```
 
-In the session, ask "who's on tear-mesh?" (the `who` tool). Then ask it to send `admin@beta` a question. On beta, start a session the same way with `--mailbox admin` and type anything: the hook announces the letter, and the agent can `read` it and reply.
+In the session, ask "who's on tear-mesh?" (the `who` tool, which also shows bios and offers). Then ask it to send `admin@beta` a question. On beta, start a session the same way with `--mailbox admin` and type anything. The hook announces the letter, and the agent can `read` it and reply.
 
 ### Wake on mail
 
@@ -165,49 +255,78 @@ command = ["claude", "-p", "{prompt}", "--output-format", "json",
            "--allowedTools", "mcp__plugin_tearmesh_tearmesh__*"]
 ```
 
-Then:
+Then run:
 
 ```sh
-sudo systemctl enable --now tearmesh-waker@tm-work
-# alpha
-sudo -u tm-work env TEARMESH_MAILBOX=builder tearmesh post --to helper@beta --subject question --body "What is 17 times 3? Reply with just the number."
-# alpha, within a minute or two
-sudo -u tm-work env TEARMESH_MAILBOX=builder tearmesh inbox
+sudo systemctl enable --now tearmesh-steward@tm-work     # beta
+sudo -u tm-work env TEARMESH_MAILBOX=builder tearmesh post --to helper@beta --subject question \
+  --body "What is 17 times 3? Reply with just the number."   # alpha
+sudo -u tm-work env TEARMESH_MAILBOX=builder tearmesh inbox # alpha, within a minute or two
 ```
 
-`journalctl -u tearmesh-waker@tm-work` shows each wake. If the woken session can't use the tools, check the exact tool names with `/permissions` in an interactive session, and adjust `--allowedTools`.
+`journalctl -u tearmesh-steward@tm-work` shows each wake. If the woken session can't use the tools, check the exact tool names with `/permissions` in an interactive session, and adjust `--allowedTools`.
 
-## Windows (WSL2)
+## The Claude connector
 
-0.1.0 doesn't run natively on Windows. It depends on Unix sockets, Linux user ids and systemd. Inside WSL2 it runs unchanged and joins the circle like any Linux machine. Use it as **beta** in section 2.
+The connector lets Claude on your phone, the web or Claude Desktop reach the mesh. It has:
+- the mail tools;
+- two read-only tools: `repo_status` for listed git repositories and `read_file` under listed directories.
 
-1. **Install Ubuntu.** In an administrator PowerShell, run `wsl --install -d Ubuntu-24.04`, restart if asked, then open "Ubuntu" from the Start menu and create your user.
-2. **Check systemd.** `systemctl is-system-running` should print `running` or `degraded`. If it prints `offline`, add these two lines to `/etc/wsl.conf`, then run `wsl --shutdown` in PowerShell and reopen Ubuntu:
-   ```
-   [boot]
-   systemd=true
-   ```
-3. **Build:**
-   ```sh
-   sudo apt update && sudo apt install -y build-essential git
-   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && . ~/.cargo/env
-   sudo git clone <repo-url> /opt/tear-mesh && sudo chown -R "$USER" /opt/tear-mesh
-   cd /opt/tear-mesh && cargo build --release
-   ```
-   Or skip the Rust install: copy `target/release/tearmesh` from the Linux machine (both x86_64; Ubuntu 24.04 on both is safest) and run setup with `TEARMESH_BIN=/path/to/tearmesh`.
-4. Continue with **Install** in section 2 (`sudo deploy/setup-linux.sh beta work`), then join with the invite.
+It runs on a Linux member, as the user of the boundary it serves. Never run it in a boundary whose data must not reach your model provider.
 
-Notes for WSL2:
-- **Keep an Ubuntu window open while testing.** WSL stops the distribution, daemon included, a little while after its last window closes.
-- **Networking works as is**, through WSL's NAT and the relays. For direct peer-to-peer paths on Windows 11, you can add `networkingMode=mirrored` under `[wsl2]` in `%UserProfile%\.wslconfig` and restart WSL. This is optional.
-- Run the TUI in Windows Terminal, from the Ubuntu tab.
+As `tm-work`, write `~/.config/tearmesh/connector.toml`:
+
+```toml
+hosts = ["mesh.example.com"]          # the public hostname your tunnel forwards
+mailbox = "phone"                     # letters are from phone@<this machine>
+roots = ["/home/tm-work/notes"]
+repos = ["/home/tm-work/src/project"]
+```
+
+Then run it, for example as a user service: `tearmesh mcp --http`. It listens on `~/.local/state/tearmesh/connector/mcp.sock`, which only `tm-work` can open.
+
+Put a tunnel and OAuth in front:
+1. Run cloudflared as `tm-work` with an ingress rule `service: unix:/home/tm-work/.local/state/tearmesh/connector/mcp.sock`.
+2. Protect the hostname with an OAuth layer.
+3. Add `https://mesh.example.com/mcp` as a custom connector in Claude's settings.
+
+Check before relying on it:
+- that your OAuth layer works with Claude's connector sign-in, which uses OAuth with dynamic client registration or a client ID and secret;
+- that voice mode can use connector tools.
+
+Letters from the connector are marked `guest`, and mailboxes don't wake on them unless `wake_on` lists `guest`.
+
+## Windows
+
+tear-mesh runs natively on Windows 10/11 and Windows Server 2022.
+- The local socket is the named pipe `\\.\pipe\tearmesh`.
+- A session's boundary is its Windows account.
+- The daemon runs as the service `tearmesh` under `NT SERVICE\tearmesh`.
+
+The steps are filled in with the Windows release; see `deploy/setup-windows.ps1` and `tests/e2e-windows.ps1`.
+
+WSL2 still works, as for any Linux machine. The connector needs Linux.
+
+## Upgrading from 0.1
+
+0.1 and 0.2 daemons can't talk to each other, so upgrade every machine. Each 0.2 daemon carries its stored 0.1 circle over and keeps its logs. Then turn the circle file into the next version:
+
+```sh
+tearmesh mesh migrate --file circle.toml --key ~/.ssh/id_ed25519
+```
+
+This applies the new version to the local daemon, and it spreads from there. Mail keeps flowing among all machines (`* → *` converse) until you change the grants. The waker is now the steward: run `systemctl disable --now 'tearmesh-waker@*'` and enable `tearmesh-steward@<user>` instead.
 
 ## 4. Uninstall
 
+Linux:
+
 ```sh
-sudo systemctl disable --now tearmesh 'tearmesh-waker@*'
-sudo rm /etc/systemd/system/tearmesh.service /etc/systemd/system/tearmesh-waker@.service
+sudo systemctl disable --now tearmesh 'tearmesh-steward@*'
+sudo rm /etc/systemd/system/tearmesh.service /etc/systemd/system/tearmesh-steward@.service
 sudo systemctl daemon-reload
 sudo userdel -r tm-work; sudo userdel -r tm-vault; sudo userdel tearmesh
 sudo rm -rf /var/lib/tearmesh /etc/tearmesh /usr/local/bin/tearmesh
 ```
+
+On OpenRC, use `rc-service tearmesh stop; rc-update del tearmesh; rm /etc/init.d/tearmesh` in place of the systemd lines.

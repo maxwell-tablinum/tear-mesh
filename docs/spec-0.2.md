@@ -1,6 +1,6 @@
 # tear-mesh 0.2.0: Spec
 
-Draft · 2026-10-17 · builds on [design.md](design.md) rev 3 and a design review held 2026-10-16/17.
+2026-10-18 · builds on [design.md](design.md) rev 3 and a design review held 2026-10-16/17. The decisions in §15 were settled on 2026-10-18 after an adversarial review; §15 lists what changed. Implemented in 0.2.0.
 
 Status markers: 🟩 settled · 🟨 proposed, needs a maintainer decision · 🟥 open, check before building
 
@@ -35,6 +35,8 @@ What's different from Cloudflare Tunnel or ngrok with OAuth, or from Tailscale w
 | **M3 Tools** | Offers, the steward, `tearmesh mcp --remote`, `tear-mesh/mcp/1`, pinning and approval, bios (§6–7) | M2 |
 | **M4 Shell** | `tear-mesh/shell/1` to the local sshd, `tearmesh shell-proxy` (§9). Cut it first if 0.2 runs long. | M2; shares M3's stream code |
 
+Native Windows (named pipes, Windows accounts as boundaries, a Windows service) was pulled into 0.2 as well.
+
 **Not in 0.2:**
 - short join codes;
 - the honeypot reader, reader/gatekeeper/worker and taint;
@@ -43,11 +45,11 @@ What's different from Cloudflare Tunnel or ngrok with OAuth, or from Tailscale w
 - the routing admin;
 - a Claude Desktop extension;
 - HTTP MCP servers on the offering side;
-- macOS and native Windows;
+- macOS;
 - the egress lock;
 - Channels push and other harness adapters.
 
-Rev 3 had planned macOS, native Windows, the egress lock, Channels push and the adapters for 0.2. They move to 0.3 or later.
+Rev 3 had planned macOS, the egress lock, Channels push and the adapters for 0.2. They move to 0.3 or later.
 
 ## 1. Terms
 
@@ -185,7 +187,7 @@ tools = ["export_step", "read_properties"]   # optional subset
 
 ### 4.2 Tickets with approval 🟩
 
-Tickets are 0.2's only join method. They're about 120 characters with n0 relays, and longer with custom relay URLs.
+Tickets are 0.2's only join method. They're about 150–250 characters, depending on the relay URL and addresses they carry.
 
 1. **On the owner node**, `tearmesh mesh invite --name beta --boundary work [--expires 1h]` prints `tm2-…`. The ticket is built at that moment from the current settings and holds:
    - the owner node's id and current addresses;
@@ -413,7 +415,7 @@ An idea for later: an add-on MCP authors drop into their servers, for author-sig
 - Anthropic's MCP tunnels avoid a public endpoint, but they're an Enterprise research preview.
 
 **Build:**
-- **Server:** `tearmesh mcp --http 127.0.0.1:8787` serves MCP over streamable HTTP (rmcp's `transport-streamable-http-server`). It runs as a boundary user and goes through the daemon socket, using the same tool code as the stdio server.
+- **Server:** `tearmesh mcp --http` serves MCP over streamable HTTP (rmcp's `transport-streamable-http-server`) on a Unix socket in a directory only its boundary user can enter. It runs as that user and goes through the daemon socket, like the stdio server.
 - **Tools:**
   - **`who`, `inbox`, `read`** (reading also marks a letter read).
   - **`post`**, the one write: letters only.
@@ -421,7 +423,7 @@ An idea for later: an add-on MCP authors drop into their servers, for author-sig
   - **`read_file`**: read-only, configured roots only. It resolves symlinks before checking the root, and has a size cap.
   - No tool calls, no shell and no pushes through this door.
 - **Trust:** letters posted through it carry trust `guest`. Recipients see that, and mailboxes don't wake on them unless configured (§8).
-- **HTTP safety:** it binds to localhost only and checks `Host` and `Origin` (DNS-rebinding protection). Authentication happens in front of it.
+- **HTTP safety:** no TCP port at all, so another local user (another boundary) can't reach it. It checks `Host` against the configured public hostnames. Authentication happens in front of it, in the tunnel's OAuth layer.
 - **Which boundary:** it runs in the boundary whose agents it talks to. Same-boundary-only means a separate low boundary couldn't reach anyone yet. So the earlier rule "the public endpoint gets only the lowest tier" becomes, with boundaries: the lowest trust, inside an existing boundary.
 
   Never run it as the user of a boundary whose data must not reach the model provider.
@@ -509,7 +511,7 @@ Each gate is an automated test, in the style of `tests/mesh.rs` (in-process iroh
 
 | # | Gate | Milestone |
 |---|---|---|
-| G1 | `read_file` refuses paths outside its roots, including through a symlink. The HTTP server binds only to localhost. Connector posts carry `guest` trust, and guest letters don't wake a default mailbox. | M1 |
+| G1 | `read_file` refuses paths outside its roots, including through a symlink (`openat2` with `RESOLVE_BENEATH`). Another local user can't reach the connector's socket. Connector posts carry `guest` trust, and guest letters don't wake a default mailbox. | M1 |
 | G2 | A format-1 circle migrates to format 2 without a re-pin, and its logs survive | M2 |
 | G3 | A non-member reaches only the join ALPN, only while an invite is pending. Used, expired and wrong-secret tickets are refused. Both ends compute the same code. | M2 |
 | G4 | A joiner refuses a file whose owner set doesn't match its ticket | M2 |
@@ -519,21 +521,27 @@ Each gate is an automated test, in the style of `tests/mesh.rs` (in-process iroh
 | G8 | A steward attach from the wrong uid is refused, and the daemon never starts a process | M3 |
 | G9 | A shell stream without a grant is refused. With a grant, bytes reach a local TCP stand-in for sshd. A `*` shell grant fails validation. | M4 |
 
-## 15. Decisions needed before M2
+## 15. Decisions (settled 2026-10-18)
 
-| # | Question | Recommendation |
+| # | Decision | Settled as |
 |---|---|---|
-| 1 | Rename circle → mesh everywhere? | Yes. The format breaks anyway. |
-| 2 | Owner model: the owner node's key plus the portable key make up the two required owner keys? | Yes, with a security key as the recommended portable key |
-| 3 | Signing threshold: keep 1-of-N, or require 2-of-N for owner-list changes? | 1-of-N for 0.2 |
-| 4 | Converse as its own category, enforced at posting and delivery? | Yes |
-| 5 | Grants as one directed edge, with speak and listen as views of it? | Yes |
-| 6 | Tools and shell follow same-boundary-only automatically? | Yes |
-| 7 | Optional per-tool subset in approvals? | Yes |
-| 8 | Bios: anyone in the boundary may write, with the log as the history? Or agent edits as proposals? | Anyone may write; `sudo` marks a bio `owner` |
-| 9 | Ship M1 early as 0.1.1? | Yes |
-| 10 | Short join codes and the honeypot move to 0.3? | Yes. Both need things 0.2 doesn't have yet: a rendezvous host, and a hold-until-screened path. |
-| 11 | The steward's name? | `steward`, or keep `waker` |
+| 1 | Rename circle → mesh | Yes. The trust levels become `guest`, `member` (was `circle`) and `admin` (was `owner`); version-1 entries still verify. Format 2 signs under the namespace `tear-mesh-membership`. |
+| 2 | Owner node key + portable key | They are the two required owner keys. Security-key signatures must carry user verification (a PIN), not just presence, and `tearmesh setup` refuses an everyday key without a passphrase: any process running as the person could otherwise sign with it. |
+| 3 | Signing threshold | One owner key signs. The chain fixes below matter more. Two-of-N would lock a two-key mesh for good after losing either key. Revisit with a third, offline key. |
+| 4 | Converse | Its own category. It is checked on posting, and on every read path through one visibility check: inbox, read by id, notify, wake, thread roots, `who`. Offers and bios are never hidden; mail within one machine is always allowed. |
+| 5 | Grants | One directed edge each. Grants only add. Removing a machine removes its grants and approvals. Adding a name already in use needs `--replace`. |
+| 6 | Same-boundary-only for tools and shell | Automatic for tools. For shell, both ends check the caller's boundary, and `authorized_keys` decides the login. |
+| 7 | Per-tool subsets | Yes. The tool list is cut to the subset, the pin covers the subset and the server's instructions, and only the core tool methods pass (no server-to-client requests). |
+| 8 | Bios | Any session in the boundary may write; bios posted through the admin socket carry `admin` trust. Bios count against the hourly post limit. |
+| 9 | Connector first | Built in 0.2. It listens on a Unix socket private to its user, because a TCP port on localhost would let another boundary's user reach it. |
+| 10 | Join codes and honeypot | 0.3. |
+| 11 | The steward's name | `steward`. |
+
+Four problems the review found are fixed in 0.2:
+1. **A machine that missed an owner change was stuck.** Versions now name their predecessor's hash, must be exactly one higher, and peers send every version the other lacks.
+2. **One signature could freeze the mesh** with a huge version number. Fixed by the same rule.
+3. **Two owners signing different next versions split the mesh silently.** The lower hash now wins everywhere, and `status` says which changes to re-apply.
+4. **The connector on a localhost TCP port crossed boundaries.** It now listens on a private Unix socket instead.
 
 ## 16. Superseded or changed
 
