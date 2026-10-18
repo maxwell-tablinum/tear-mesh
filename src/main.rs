@@ -133,6 +133,14 @@ enum Cmd {
         #[arg(last = true, required = true)]
         command: Vec<String>,
     },
+    /// For `launch` on Windows: runas can't pass environment variables, so it runs this.
+    #[command(hide = true)]
+    EnvRun {
+        #[arg(long = "set", value_name = "K=V")]
+        set: Vec<String>,
+        #[arg(last = true, required = true)]
+        command: Vec<String>,
+    },
 }
 
 #[derive(clap::Args, Clone)]
@@ -324,13 +332,17 @@ fn main() -> Result<()> {
     {
         return launch(boundary, mailbox.as_deref(), config, command);
     }
-    tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info,iroh=warn,noq=warn".into()),
-        )
-        .init();
+    if let Cmd::EnvRun { set, command } = &cli.cmd {
+        let mut c = std::process::Command::new(&command[0]);
+        c.args(&command[1..]);
+        for kv in set {
+            let (k, v) = kv.split_once('=').context("--set takes K=V")?;
+            c.env(k, v);
+        }
+        let status = c.status().with_context(|| format!("running {}", command[0]))?;
+        std::process::exit(status.code().unwrap_or(1));
+    }
+    // The service logs to a file (its stderr goes nowhere), so it sets up its own logging.
     if let Cmd::Daemon {
         config,
         service: true,
@@ -338,6 +350,13 @@ fn main() -> Result<()> {
     {
         return tearmesh::os::run_service(config.clone());
     }
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "info,iroh=warn,noq=warn".into()),
+        )
+        .init();
     tokio::runtime::Runtime::new()?.block_on(run(cli.cmd))
 }
 
@@ -489,7 +508,7 @@ async fn run(cmd: Cmd) -> Result<()> {
             let (r, w) = c.into_raw();
             tearmesh::shell::splice(tokio::io::stdin(), tokio::io::stdout(), r, w).await?;
         }
-        Cmd::Launch { .. } => unreachable!(),
+        Cmd::Launch { .. } | Cmd::EnvRun { .. } => unreachable!(),
     }
     Ok(())
 }

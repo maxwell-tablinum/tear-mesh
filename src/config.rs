@@ -161,6 +161,14 @@ impl Config {
             self.socket.as_os_str().len() < 108,
             "socket path must be under 108 bytes (a Unix socket limit)"
         );
+        #[cfg(windows)]
+        ensure!(
+            self.socket
+                .to_str()
+                .and_then(|s| s.get(..9))
+                .is_some_and(|p| p.eq_ignore_ascii_case(r"\\.\pipe\")),
+            r"socket must be a named pipe, \\.\pipe\<name>"
+        );
         ensure!(
             self.sync_interval_secs >= 1,
             "sync_interval_secs must be at least 1"
