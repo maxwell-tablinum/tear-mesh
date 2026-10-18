@@ -298,12 +298,62 @@ Letters from the connector are marked `guest`, and mailboxes don't wake on them 
 
 ## Windows
 
-tear-mesh runs natively on Windows 10/11 and Windows Server 2022.
+tear-mesh runs natively on Windows. It is tested on Windows Server 2022; Windows 10 and 11 use the same APIs but haven't been tested yet.
 - The local socket is the named pipe `\\.\pipe\tearmesh`.
-- A session's boundary is its Windows account.
-- The daemon runs as the service `tearmesh` under `NT SERVICE\tearmesh`.
+- A session's boundary is the Windows account it runs as. The daemon learns it by briefly impersonating the pipe client.
+- Only an elevated Administrator, SYSTEM, the daemon's own account or a listed `admins` user may run admin commands. A non-elevated Administrator is not admin.
+- The daemon runs as the service `tearmesh` under the virtual account `NT SERVICE\tearmesh`.
+- Clients refuse a pipe that SYSTEM, Administrators or that account didn't create, so another program can't take the name and pose as the daemon.
+- The pipe refuses other machines. SSH sessions on the same machine work, as the user they log in as.
 
-The steps are filled in with the Windows release; see `deploy/setup-windows.ps1` and `tests/e2e-windows.ps1`.
+### Build
+
+Build on Windows with Rust (`cargo build --release`, MSVC). Or cross-compile on Linux with mingw-w64:
+
+```sh
+rustup target add x86_64-pc-windows-gnu
+cargo build --release --target x86_64-pc-windows-gnu      # target/x86_64-pc-windows-gnu/release/tearmesh.exe
+```
+
+### Install
+
+In an elevated PowerShell:
+
+```powershell
+deploy\setup-windows.ps1 -Machine beta -Boundaries work -Exe C:\path\to\tearmesh.exe -Stewards
+```
+
+This:
+- installs `C:\Program Files\tearmesh\tearmesh.exe`;
+- creates the local user `tm-work` with a random password, saved to `C:\ProgramData\tearmesh\passwords.txt`, which only SYSTEM and Administrators can read;
+- writes `C:\ProgramData\tearmesh\config.toml`, with you as an admin;
+- locks down the state directory;
+- creates and starts the service;
+- allows inbound UDP for the private and domain profiles;
+- with `-Stewards`, starts a steward for each boundary user at boot.
+
+It prints the node id. `deploy\setup-windows.ps1 -Uninstall -Boundaries work` removes it all again.
+
+Then join as on Linux, from an elevated prompt: `tearmesh join tm2-…`. Run sessions as the boundary user, with `tearmesh launch --boundary work --mailbox admin -- claude` (runas asks for the password) or from a login as `tm-work`. The steward reads `%USERPROFILE%\.config\tearmesh\mailboxes.toml` and `offers.toml`, as on Linux.
+
+### Tests
+
+The Windows tests need an elevated PowerShell on a machine where you can create local users, such as a test VM:
+
+```powershell
+tests\e2e-windows.ps1 -Exe C:\path\to\tearmesh.exe
+```
+
+It creates `tme-*` users, runs two daemons, and checks:
+- the ticket join;
+- mail between the daemons, and that no vault bytes reach the work-only daemon;
+- the refusals: an unmapped user, a boundary user asking for admin, one boundary reading another's files or the daemon's state;
+- that an elevated Administrator is admin;
+- that an SSH session is identified as its user;
+- that a client refuses a pipe another user created, and that a daemon won't start on a name another program holds;
+- MCP over stdio, and the hook.
+
+The test users' commands run as scheduled tasks, because `Start-Process -Credential` fails from SSH. For the unit and mesh tests, cross-compile them with `cargo test --release --target x86_64-pc-windows-gnu --no-run` and run the two `.exe` files from `target/x86_64-pc-windows-gnu/release/deps/` as SYSTEM or an elevated Administrator. The debug build doesn't link with mingw.
 
 WSL2 still works, as for any Linux machine. The connector needs Linux.
 

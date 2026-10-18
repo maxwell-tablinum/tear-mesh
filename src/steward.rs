@@ -132,10 +132,13 @@ pub async fn run(mailboxes: &Path, offers_path: &Path) -> Result<()> {
         mailboxes.display(),
         offers_path.display()
     );
-    let state = crate::os::home_dir()
-        .join(".local")
-        .join("state")
-        .join("tearmesh");
+    #[cfg(unix)]
+    let state = crate::os::home_dir().join(".local").join("state");
+    #[cfg(windows)]
+    let state = std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(crate::os::home_dir);
+    let state = state.join("tearmesh");
     let mut w = Waker {
         boxes,
         offers,

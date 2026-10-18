@@ -178,12 +178,13 @@ The setup is in [docs/testing.md](docs/testing.md#the-claude-connector).
 
 ## Windows
 
-tear-mesh runs natively on Windows:
-- The local socket is a named pipe, and a session's boundary is its Windows account.
-- The daemon runs as a service under the virtual account `NT SERVICE\tearmesh`.
-- `deploy/setup-windows.ps1` installs it.
+tear-mesh runs natively on Windows. It is tested on Windows Server 2022; Windows 10 and 11 use the same APIs but haven't been tested yet.
 
-The Windows steps are in [docs/testing.md](docs/testing.md#windows). The connector runs on Linux.
+- The local socket is a named pipe, and a session's boundary is its Windows account. The daemon identifies a caller by impersonating it.
+- The daemon runs as a service under the virtual account `NT SERVICE\tearmesh`.
+- Clients refuse a pipe that account (or SYSTEM, or Administrators) didn't create.
+
+Install it in an elevated PowerShell with `deploy\setup-windows.ps1 -Machine <name> -Boundaries work -Stewards`. The steps are in [docs/testing.md](docs/testing.md#windows). The connector runs on Linux.
 
 ## Config
 

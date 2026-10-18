@@ -60,6 +60,10 @@ impl World {
         let mut c = Config::new(name);
         c.state_dir = self.dir.path().join(name);
         c.socket = self.dir.path().join(format!("{name}.sock"));
+        #[cfg(windows)]
+        {
+            c.socket = format!(r"\\.\pipe\tm-test-{name}-{}", std::process::id()).into();
+        }
         c.network = Network {
             relay: Some(Relay::Preset("none".into())),
             lookup: Some(vec![]),
