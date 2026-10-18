@@ -419,7 +419,7 @@ An idea for later: an add-on MCP authors drop into their servers, for author-sig
 - **Tools:**
   - **`who`, `inbox`, `read`** (reading also marks a letter read).
   - **`post`**, the one write: letters only.
-  - **`repo_status`**: read-only. Shows `git status` and the recent log for configured repos. It runs git with `-c core.fsmonitor=false`, so a repo's own config can't run commands.
+  - **`repo_status`**: read-only. Shows `git status` and the recent log for configured repos. It turns off fsmonitor, signature checks and index writes. Clean filters set in a repo's own config can still run during `git status`; anyone who can edit `.git/config` already runs code as that boundary user.
   - **`read_file`**: read-only, configured roots only. It resolves symlinks before checking the root, and has a size cap.
   - No tool calls, no shell and no pushes through this door.
 - **Trust:** letters posted through it carry trust `guest`. Recipients see that, and mailboxes don't wake on them unless configured (§8).
