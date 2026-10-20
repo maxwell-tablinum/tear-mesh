@@ -12,6 +12,7 @@ pub mod hook;
 pub mod hub;
 pub mod ipc;
 pub mod join;
+pub mod keys;
 pub mod mcp;
 pub mod menu;
 pub mod mesh;

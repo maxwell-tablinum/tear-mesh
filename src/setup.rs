@@ -1,26 +1,27 @@
-//! `tearmesh setup`: the first-run wizard, also reached from `tearmesh menu`. Every prompt
-//! re-asks on bad input and takes `b` (back) and `q` (quit). Running it again on a machine that
-//! is already set up changes nothing unless asked. Nothing is written until the last step: keys
-//! are made in a private temporary directory, and a stop at any point (including Ctrl-C) leaves
-//! the machine as it was.
+//! `tearmesh setup`: the line-by-line first-run wizard (`tearmesh menu` does the same on one
+//! screen). Every prompt re-asks on bad input and takes `b` (back) and `q` (quit). Running it
+//! again on a machine that is already set up changes nothing unless asked. Keys and the signed
+//! first version are made in memory, so a stop at any point before the last step (including
+//! Ctrl-C) leaves the machine as it was.
 //!
-//! Keys: the owner keys sign every change to the mesh. Setup makes two plain key files, shows
-//! each one and asks the person to copy it somewhere safe. The everyday key stays on this machine
-//! under a passphrase; the recovery key is shown once and then deleted from this machine.
+//! Keys: two owner keys sign every change to the mesh. The everyday key stays on this machine
+//! under the person's passphrase. The recovery key is encrypted with a passphrase setup makes
+//! (six random words), shown once with it, and never kept here.
 
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, Result, ensure};
+use iroh::EndpointId;
 use serde_json::Value;
+use zeroize::Zeroizing;
 
 use crate::config::Config;
 use crate::ipc::{Client, Request, socket_path};
-use crate::mesh::{Machine, Mesh, ssh_sign};
+use crate::keys::{self, NewKey};
+use crate::mesh::{Machine, Mesh};
 use crate::valid_name;
-
-const TMP_PREFIX: &str = "tearmesh-setup-";
 
 /// What the person typed at a prompt.
 #[derive(Debug, PartialEq)]
@@ -117,12 +118,6 @@ pub fn fingerprint_of(pub_file: &Path) -> Option<String> {
     Some(k.fingerprint(Default::default()).to_string())
 }
 
-fn sig_path(file: &Path) -> PathBuf {
-    let mut s = file.as_os_str().to_owned();
-    s.push(".sig");
-    s.into()
-}
-
 pub fn pub_path(key: &Path) -> PathBuf {
     let mut s = key.as_os_str().to_owned();
     s.push(".pub");
@@ -141,310 +136,6 @@ pub fn private_dir(prefix: &str) -> Result<PathBuf> {
     #[cfg(not(unix))]
     std::fs::DirBuilder::new().create(&d)?;
     Ok(d)
-}
-
-/// Removes a directory holding key material, overwriting its files first.
-fn shred_dir(d: &Path) {
-    if let Ok(rd) = std::fs::read_dir(d) {
-        for e in rd.flatten() {
-            if let Ok(m) = e.metadata() {
-                let _ = std::fs::write(e.path(), vec![0u8; m.len() as usize]);
-            }
-        }
-    }
-    let _ = std::fs::remove_dir_all(d);
-}
-
-/// What a stop (Ctrl-C) must undo.
-#[derive(Default)]
-struct Undo {
-    tmp: Option<PathBuf>,
-    /// An owner key this run put in ~/.ssh before the mesh was applied.
-    placed: Vec<PathBuf>,
-    /// Files this run moved aside to `.old-*`, as (where it is now, where it was).
-    renamed: Vec<(PathBuf, PathBuf)>,
-}
-
-impl Undo {
-    fn run(&mut self) {
-        if let Some(d) = self.tmp.take() {
-            shred_dir(&d);
-        }
-        self.unplace();
-    }
-
-    fn unplace(&mut self) {
-        for p in self.placed.drain(..) {
-            let _ = std::fs::remove_file(pub_path(&p));
-            let _ = std::fs::remove_file(&p);
-        }
-        for (now, was) in self.renamed.drain(..) {
-            let _ = std::fs::rename(now, was);
-        }
-    }
-
-    /// The mesh was applied: what this run put in place stays.
-    fn keep(&mut self) {
-        self.placed.clear();
-        self.renamed.clear();
-    }
-}
-
-struct Wizard {
-    input: Box<dyn BufRead + Send>,
-    undo: Arc<Mutex<Undo>>,
-}
-
-impl Wizard {
-    fn ask(&mut self, q: &str) -> Result<Answer> {
-        eprint!("{q}\n  [b back, q quit] > ");
-        std::io::stderr().flush()?;
-        // Bytes, not read_line: input that isn't UTF-8 is a bad answer to re-ask, not an error.
-        let mut a = Vec::new();
-        let n = self.input.read_until(b'\n', &mut a)?;
-        let a = String::from_utf8_lossy(&a);
-        Ok(parse_answer((n > 0).then_some(&*a)))
-    }
-
-    /// Asks until the answer is one of `keys`. Enter picks `default` when there is one.
-    fn choose(&mut self, q: &str, keys: &[&str], default: Option<&str>) -> Result<Answer> {
-        loop {
-            match self.ask(q)? {
-                Answer::Text(t) if keys.contains(&t.as_str()) => return Ok(Answer::Text(t)),
-                Answer::Text(t) if t.is_empty() && default.is_some() => {
-                    return Ok(Answer::Text(default.unwrap().into()));
-                }
-                Answer::Text(t) => eprintln!("  {t:?} isn't one of the choices: {}", keys.join(", ")),
-                other => return Ok(other),
-            }
-        }
-    }
-
-    /// Asks until `check` accepts the answer.
-    fn text(&mut self, q: &str, check: impl Fn(&str) -> Result<()>) -> Result<Answer> {
-        loop {
-            match self.ask(q)? {
-                Answer::Text(t) => match check(&t) {
-                    Ok(()) => return Ok(Answer::Text(t)),
-                    Err(e) => eprintln!("  {e}"),
-                },
-                other => return Ok(other),
-            }
-        }
-    }
-
-    /// Waits for the word `saved`, then clears the key off a terminal's screen and scrollback.
-    fn saved(&mut self) -> Result<Answer> {
-        let a = self.text("Type `saved` once you have copied it.", |t| {
-            ensure!(t.eq_ignore_ascii_case("saved"), "type the word saved (or b, q)");
-            Ok(())
-        })?;
-        if matches!(a, Answer::Text(_)) && std::io::IsTerminal::is_terminal(&std::io::stderr()) {
-            eprint!("\x1b[2J\x1b[3J\x1b[H");
-            eprintln!("(Cleared the key from this screen. A terminal log or tmux history may still hold it.)");
-        }
-        Ok(a)
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum Step {
-    Check,
-    Choose,
-    Join,
-    Name,
-    Keys,
-    Confirm,
-}
-
-#[derive(Default)]
-struct Plan {
-    name: String,
-    boundaries: Vec<String>,
-    tmp: Option<PathBuf>,
-    owner_src: Option<PathBuf>,
-    /// Reusing a key already at the owner key path.
-    reuse: bool,
-    recovery_pub: Option<String>,
-}
-
-pub async fn run(config: &Path) -> Result<()> {
-    clean_stale();
-    let undo = Arc::new(Mutex::new(Undo::default()));
-    let u = undo.clone();
-    let stop = tokio::spawn(async move {
-        if stopped().await {
-            u.lock().unwrap().run();
-            eprintln!("\nSetup stopped. Nothing was changed; run `tearmesh setup` again to start over.");
-            std::process::exit(130);
-        }
-    });
-    let mut w = Wizard {
-        input: Box::new(std::io::BufReader::new(std::io::stdin())),
-        undo: undo.clone(),
-    };
-    let r = wizard(&mut w, config).await;
-    undo.lock().unwrap().run();
-    stop.abort();
-    match r {
-        Ok(true) => Ok(()),
-        Ok(false) => {
-            eprintln!("Setup stopped. Nothing was changed.");
-            Ok(())
-        }
-        Err(e) => Err(e),
-    }
-}
-
-/// Ctrl-C, or (on Unix) the terminal closing or a plain kill.
-async fn stopped() -> bool {
-    #[cfg(unix)]
-    {
-        use tokio::signal::unix::{SignalKind, signal};
-        let (Ok(mut term), Ok(mut hup)) = (signal(SignalKind::terminate()), signal(SignalKind::hangup())) else {
-            return tokio::signal::ctrl_c().await.is_ok();
-        };
-        tokio::select! {
-            r = tokio::signal::ctrl_c() => r.is_ok(),
-            _ = term.recv() => true,
-            _ = hup.recv() => true,
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        tokio::signal::ctrl_c().await.is_ok()
-    }
-}
-
-/// Whether the setup that made a temp directory is still running (it wrote its pid there).
-fn alive(dir: &Path) -> bool {
-    let Some(pid) = std::fs::read_to_string(dir.join("pid")).ok().and_then(|s| s.trim().parse::<i32>().ok()) else {
-        return false;
-    };
-    #[cfg(unix)]
-    {
-        nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok()
-    }
-    // shortcut: Windows can't cheaply ask whether a pid lives; treat a directory under an hour old
-    // as in use. Upgrade to OpenProcess if two setups at once ever matter there.
-    #[cfg(not(unix))]
-    {
-        let _ = pid;
-        std::fs::metadata(dir)
-            .and_then(|m| m.modified())
-            .is_ok_and(|t| t.elapsed().is_ok_and(|e| e.as_secs() < 3600))
-    }
-}
-
-/// Leftovers of a setup that was killed outright (signals are handled; SIGKILL isn't). A
-/// setup still running (from another terminal, or the menu) keeps its directory.
-fn clean_stale() {
-    let Ok(rd) = std::fs::read_dir(std::env::temp_dir()) else {
-        return;
-    };
-    for e in rd.flatten() {
-        let mine = e.file_name().to_string_lossy().starts_with(TMP_PREFIX);
-        // Only directories this user owns are ours to remove (Unix temp is shared).
-        #[cfg(unix)]
-        let mine = mine
-            && e.metadata().is_ok_and(|m| {
-                std::os::unix::fs::MetadataExt::uid(&m) == nix::unistd::geteuid().as_raw()
-            });
-        if mine && !alive(&e.path()) {
-            shred_dir(&e.path());
-        }
-    }
-}
-
-async fn admin(req: Request) -> Result<Value> {
-    Client::connect(&socket_path()).await?.call(&req).await
-}
-
-/// Ok(true) when setup finished, Ok(false) when the person quit.
-async fn wizard(w: &mut Wizard, config: &Path) -> Result<bool> {
-    let mut step = Step::Check;
-    let mut plan = Plan::default();
-    let mut cfg: Option<Config> = None;
-    loop {
-        step = match step {
-            Step::Check => {
-                let (c, status) = match preflight(w, config).await? {
-                    Some(x) => x,
-                    None => return Ok(false),
-                };
-                let next = existing(w, &c, &status).await?;
-                cfg = Some(c);
-                match next {
-                    Some(s) => s,
-                    None => return Ok(status["mesh"].is_object()),
-                }
-            }
-            Step::Choose => {
-                eprintln!("\nThis machine isn't in a mesh yet.");
-                eprintln!("  1  Create a new mesh. This machine becomes its owner node: it holds the owner key and approves new machines.");
-                eprintln!("  2  Join a mesh. You need a ticket from the owner node (`tearmesh mesh invite`).");
-                match w.choose("Choose 1 or 2.", &["1", "2"], None)? {
-                    Answer::Text(t) if t == "1" => Step::Name,
-                    Answer::Text(_) => Step::Join,
-                    Answer::Back => Step::Check,
-                    Answer::Quit => return Ok(false),
-                }
-            }
-            Step::Join => match join(w).await? {
-                Some(true) => return Ok(true),
-                Some(false) => Step::Choose,
-                None => return Ok(false),
-            },
-            Step::Name => {
-                let c = cfg.as_ref().expect("checked");
-                let mut b: Vec<String> = c.users.values().cloned().collect();
-                b.sort();
-                b.dedup();
-                if b.is_empty() {
-                    eprintln!(
-                        "\nThe config maps no OS users to boundaries, so a mesh would have nothing in it. \
-                         Add users under [users] in the config (the install script does this), then run setup again."
-                    );
-                    return Ok(false);
-                }
-                plan.boundaries = b;
-                match w.text("\nName for the new mesh (a-z, 0-9, -), e.g. home:", check_mesh_name)? {
-                    Answer::Text(t) => {
-                        plan.name = t;
-                        Step::Keys
-                    }
-                    Answer::Back => Step::Choose,
-                    Answer::Quit => return Ok(false),
-                }
-            }
-            Step::Keys => match keys(w, &mut plan)? {
-                Some(true) => Step::Confirm,
-                Some(false) => Step::Name,
-                None => return Ok(false),
-            },
-            Step::Confirm => {
-                let c = cfg.as_ref().expect("checked");
-                eprintln!("\nReady to create the mesh:");
-                eprintln!("  mesh        {}", plan.name);
-                eprintln!("  machine     {} (this one)", c.machine);
-                eprintln!("  boundaries  {}", plan.boundaries.join(", "));
-                eprintln!("  owner key   {}", owner_key_path(&plan.name).display());
-                eprintln!("  recovery    the key you copied (deleted from this machine after this step)");
-                match w.choose("Create it now? y to create.", &["y", "Y"], None)? {
-                    Answer::Text(_) => match commit(w, c, &plan).await {
-                        Ok(()) => return Ok(true),
-                        Err(e) => {
-                            w.undo.lock().unwrap().unplace();
-                            eprintln!("\nThat didn't work: {e:#}\nNothing was changed. Try again, go back, or quit.");
-                            Step::Confirm
-                        }
-                    },
-                    Answer::Back => Step::Keys,
-                    Answer::Quit => return Ok(false),
-                }
-            }
-        };
-    }
 }
 
 /// Loads the config and reaches the daemon, offering to retry. None when the person quits.
@@ -540,24 +231,26 @@ async fn existing(w: &mut Wizard, c: &Config, status: &Value) -> Result<Option<S
 async fn join(w: &mut Wizard) -> Result<Option<bool>> {
     loop {
         let ticket = match w.text(
-            "\nOn the owner node run `tearmesh mesh invite <name for this machine> --boundary <b>`, then paste the ticket here:",
+            "\nOn the owner node run `tearmesh mesh invite` (or Owner → I in `tearmesh menu`), then paste the ticket here:",
             check_ticket,
         )? {
             Answer::Text(t) => t,
             Answer::Back => return Ok(Some(false)),
             Answer::Quit => return Ok(None),
         };
+        JOINING.store(true, Ordering::SeqCst);
         let r = async {
             let mut c = Client::connect(&socket_path()).await?;
             c.call_each(&Request::Join { ticket }, |d| {
                 eprintln!(
-                    "\nCode {}. Check that the owner node shows the same code, then approve it there.\nWaiting for approval (Ctrl-C stops; nothing is changed until approval)...",
+                    "\nCode {}. Check that the owner node shows the same code, then approve it there.\nWaiting for approval (Ctrl-C stops and cancels the request)...",
                     d["code"].as_str().unwrap_or_default()
                 );
             })
             .await
         }
         .await;
+        JOINING.store(false, Ordering::SeqCst);
         match r {
             Ok(v) => {
                 eprintln!("\nJoined. Mesh version {}. `tearmesh menu` shows the other machines.", v["version"]);
@@ -568,203 +261,413 @@ async fn join(w: &mut Wizard) -> Result<Option<bool>> {
     }
 }
 
-/// Makes (or reuses) the owner key and makes the recovery key, showing each one.
-/// Some(true) done, Some(false) back, None quit.
-fn keys(w: &mut Wizard, plan: &mut Plan) -> Result<Option<bool>> {
-    if let Some(d) = plan.tmp.take() {
-        shred_dir(&d);
-    }
-    let tmp = private_dir(TMP_PREFIX)?;
-    std::fs::write(tmp.join("pid"), std::process::id().to_string())?;
-    w.undo.lock().unwrap().tmp = Some(tmp.clone());
-    plan.tmp = Some(tmp.clone());
-    plan.reuse = false;
-    let dest = owner_key_path(&plan.name);
-    eprintln!(
-        "\nOwner keys sign every change to the mesh: adding machines, grants, revoking a machine. \
-         There are two, and you need either one to manage the mesh."
-    );
-    if dest.exists() {
-        eprintln!(
-            "\nThere is already an owner key for {} at {} (fingerprint {}).",
-            plan.name,
-            dest.display(),
-            fingerprint_of(&pub_path(&dest)).unwrap_or_else(|| "unreadable".into())
-        );
-        match w.choose(
-            "1 reuse it (you copied it earlier), 2 make a new one (the old file is kept as .old).",
-            &["1", "2"],
-            None,
-        )? {
-            Answer::Text(t) if t == "1" => {
-                if !has_passphrase(&dest) {
-                    eprintln!(
-                        "  That key has no passphrase, so any program running as you could sign with it. \
-                         Add one with `ssh-keygen -p -f {}` and run setup again, or make a new key.",
-                        dest.display()
-                    );
-                    return Ok(Some(false));
-                }
-                plan.reuse = true
-            }
-            Answer::Text(_) => {}
-            Answer::Back => return Ok(Some(false)),
-            Answer::Quit => return Ok(None),
-        }
-    }
-    if !plan.reuse {
-        eprintln!(
-            "\nKey 1 of 2, the everyday key. It stays on this machine. Choose a passphrase when asked: \
-             without one, any program running as you could sign with it."
-        );
-        let k = tmp.join("owner");
-        loop {
-            keygen(&k, &format!("tearmesh owner {}", plan.name))?;
-            if has_passphrase(&k) {
-                break;
-            }
-            eprintln!("  That key has no passphrase. Making it again: enter a passphrase this time.");
-            let _ = std::fs::remove_file(&k);
-            let _ = std::fs::remove_file(pub_path(&k));
-        }
-        show_key(&k, "1 of 2: everyday owner key", &format!(
-            "This machine keeps it at {}. The copy you save is your backup.",
-            dest.display()
-        ))?;
-        match w.saved()? {
-            Answer::Text(_) => {}
-            Answer::Back => return Ok(Some(false)),
-            Answer::Quit => return Ok(None),
-        }
-        plan.owner_src = Some(k);
-    }
-    eprintln!(
-        "\nKey 2 of 2, the recovery key. It does not stay on this machine: it is your way back in if \
-         this machine is lost, or if its key leaks and must be removed. A passphrase is optional; \
-         if you set one, store it with the key."
-    );
-    let r = tmp.join("recovery");
-    keygen(&r, &format!("tearmesh recovery {}", plan.name))?;
-    show_key(&r, "2 of 2: recovery key", "This is the only copy. Setup deletes it from this machine when it finishes.")?;
-    match w.saved()? {
-        Answer::Text(_) => {}
-        Answer::Back => return Ok(Some(false)),
-        Answer::Quit => return Ok(None),
-    }
-    plan.recovery_pub = Some(std::fs::read_to_string(pub_path(&r))?.trim().to_string());
-    Ok(Some(true))
+/// Version 1 of a new mesh with this machine in it, signed in memory with a new everyday key.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NewMesh {
+    pub name: String,
+    pub machine: String,
+    pub boundaries: Vec<String>,
+    /// Encrypted with the person's passphrase; goes to ~/.ssh.
+    pub owner: NewKey,
+    /// Encrypted with `recovery_pass`; shown once, never kept here.
+    pub recovery: NewKey,
+    pub recovery_pass: Zeroizing<String>,
+    pub toml: String,
+    pub sig: String,
 }
 
-fn show_key(path: &Path, title: &str, note: &str) -> Result<()> {
-    let text = std::fs::read_to_string(path)?;
-    let fp = fingerprint_of(&pub_path(path)).unwrap_or_default();
-    eprintln!("\n──── Key {title} ({fp}) ────\n{}", text.trim_end());
-    eprintln!("────────────────────────────────────────────");
-    eprintln!("Copy this and put it somewhere safe.");
-    eprintln!("{note} A password manager or a printed copy in a drawer works. Don't email it.");
-    Ok(())
-}
-
-fn keygen(path: &Path, comment: &str) -> Result<()> {
-    let ok = std::process::Command::new("ssh-keygen")
-        .args(["-q", "-t", "ed25519", "-a", "100", "-C", comment, "-f"])
-        .arg(path)
-        .status()
-        .context("running ssh-keygen (install OpenSSH: it makes and uses the owner keys)")?
-        .success();
-    ensure!(ok, "ssh-keygen didn't make the key");
-    Ok(())
-}
-
-fn has_passphrase(key: &Path) -> bool {
-    !std::process::Command::new("ssh-keygen")
-        .args(["-y", "-P", ""])
-        .arg("-f")
-        .arg(key)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success())
-}
-
-/// Builds, signs and applies the first membership file, then puts the owner key in place.
-async fn commit(w: &mut Wizard, c: &Config, plan: &Plan) -> Result<()> {
-    let tmp = plan.tmp.as_ref().context("keys first")?;
-    let dest = owner_key_path(&plan.name);
-    let owner_pub = match &plan.owner_src {
-        Some(k) if !plan.reuse => std::fs::read_to_string(pub_path(k))?,
-        _ => std::fs::read_to_string(pub_path(&dest))?,
-    };
-    let mut m = Mesh::new(
-        &plan.name,
-        vec![
-            owner_pub.trim().to_string(),
-            plan.recovery_pub.clone().context("recovery key")?,
-        ],
-        plan.boundaries.clone(),
-        None,
-    )?;
-    let status = admin(Request::Status).await?;
+/// The boundaries a new mesh gets: the ones this machine's config maps users to.
+pub fn boundaries(cfg: &Config) -> Result<Vec<String>> {
+    let mut b: Vec<String> = cfg.users.values().cloned().collect();
+    b.sort();
+    b.dedup();
     ensure!(
-        status["mesh"].is_null(),
-        "this machine joined a mesh while setup was running; run setup again"
+        !b.is_empty(),
+        "the config maps no OS users to boundaries, so a mesh would have nothing in it. \
+         Add boundaries with `sudo tearmesh install {} <boundary>...`, then try again",
+        cfg.machine
     );
-    let id = status["node_id"]
+    Ok(b)
+}
+
+pub fn check_passphrase(p: &str, again: &str) -> Result<()> {
+    ensure!(p.chars().count() >= 8, "the passphrase needs at least 8 characters");
+    ensure!(p == again, "the two passphrases differ");
+    Ok(())
+}
+
+/// Makes both keys and signs version 1. Pure, and slow (bcrypt): run it off the UI thread.
+pub fn version_one(
+    name: &str,
+    machine: &str,
+    boundaries: Vec<String>,
+    node_id: EndpointId,
+    pass: &str,
+) -> Result<NewMesh> {
+    let (owner_key, owner) = keys::generate(&format!("tearmesh owner {name}"), pass)?;
+    let recovery_pass = keys::passphrase();
+    let (_, recovery) = keys::generate(&format!("tearmesh recovery {name}"), &recovery_pass)?;
+    let mut m = Mesh::new(name, vec![owner.public.clone(), recovery.public.clone()], boundaries.clone(), None)?;
+    m.add_machine(
+        Machine {
+            name: machine.into(),
+            id: node_id,
+            boundaries: boundaries.clone(),
+        },
+        false,
+    )?;
+    let toml = m.to_toml()?;
+    let sig = keys::sign(&owner_key, &toml)?;
+    Ok(NewMesh {
+        name: name.into(),
+        machine: machine.into(),
+        boundaries,
+        owner,
+        recovery,
+        recovery_pass,
+        toml,
+        sig,
+    })
+}
+
+/// Checks this machine can start mesh `name`, then makes it in memory (nothing is written).
+pub async fn new_mesh(name: &str, cfg: &Config, pass: &str) -> Result<NewMesh> {
+    check_mesh_name(name)?;
+    let b = boundaries(cfg)?;
+    let status = admin(Request::Status).await?;
+    ensure!(status["mesh"].is_null(), "this machine is already in a mesh");
+    let id: EndpointId = status["node_id"]
         .as_str()
         .context("the daemon didn't report its node id")?
         .parse()
         .map_err(|e| anyhow::anyhow!("node id: {e}"))?;
-    m.add_machine(
-        Machine {
-            name: c.machine.clone(),
-            id,
-            boundaries: plan.boundaries.clone(),
-        },
-        false,
-    )?;
-    let file = tmp.join(format!("{}-mesh.toml", plan.name));
-    let toml = m.to_toml()?;
-    std::fs::write(&file, &toml)?;
-    eprintln!("\nSigning the mesh with the everyday key (enter its passphrase):");
-    let signer = if plan.reuse { dest.clone() } else { plan.owner_src.clone().context("owner key")? };
-    ssh_sign(&signer, &file).context("signing (wrong passphrase?)")?;
-    if !plan.reuse {
-        place_key(w, plan.owner_src.as_ref().expect("made"), &dest)?;
-    }
-    let sig = std::fs::read_to_string(sig_path(&file))?;
-    admin(Request::ApplyMesh { toml, sig }).await?;
-    // Applied: the key in ~/.ssh is now the mesh's, not something to undo.
-    w.undo.lock().unwrap().keep();
-    eprintln!(
-        "\nMesh {} is created, with this machine ({}) in it. This is its owner node.\n\
-         The recovery key has been deleted from this machine; your saved copy is the only one.\n\
-         Next: `tearmesh menu`, or add a machine with `tearmesh mesh invite <name> --boundary <b>`.",
-        plan.name, c.machine
-    );
-    Ok(())
+    let (name, machine, pass) = (name.to_string(), cfg.machine.clone(), Zeroizing::new(pass.to_string()));
+    tokio::task::spawn_blocking(move || version_one(&name, &machine, b, id, &pass)).await?
 }
 
-/// Copies the owner key into ~/.ssh, keeping any file already there as `.old`.
-fn place_key(w: &mut Wizard, src: &Path, dest: &Path) -> Result<()> {
+/// Puts the everyday key in ~/.ssh (an older file there is kept as `.old-<ms>`), then applies
+/// version 1. If the daemon refuses, the key comes out again. Returns the key's path.
+pub async fn commit(m: &NewMesh) -> Result<PathBuf> {
+    let status = admin(Request::Status).await?;
+    ensure!(
+        status["mesh"].is_null(),
+        "this machine joined a mesh in the meantime; nothing was changed"
+    );
+    let dest = owner_key_path(&m.name);
+    let moved = place_key(&m.owner, &dest)?;
+    let r = admin(Request::ApplyMesh {
+        toml: m.toml.clone(),
+        sig: m.sig.clone(),
+    })
+    .await;
+    if let Err(e) = r {
+        let _ = std::fs::remove_file(&dest);
+        let _ = std::fs::remove_file(pub_path(&dest));
+        for (now, was) in moved {
+            let _ = std::fs::rename(now, was);
+        }
+        return Err(e);
+    }
+    Ok(dest)
+}
+
+/// Writes the key to `dest`, moving files already there aside. Returns the moves.
+fn place_key(k: &NewKey, dest: &Path) -> Result<Vec<(PathBuf, PathBuf)>> {
     if let Some(d) = dest.parent() {
         std::fs::create_dir_all(d)?;
     }
-    if dest.exists() {
-        let stamp = crate::now_ms();
-        for p in [dest.to_path_buf(), pub_path(dest)] {
-            if p.exists() {
-                let mut old = p.as_os_str().to_owned();
-                old.push(format!(".old-{stamp}"));
-                let old = PathBuf::from(old);
-                std::fs::rename(&p, &old)?;
-                w.undo.lock().unwrap().renamed.push((old, p));
+    let stamp = crate::now_ms();
+    let mut moved = vec![];
+    for p in [dest.to_path_buf(), pub_path(dest)] {
+        if p.exists() {
+            let mut old = p.as_os_str().to_owned();
+            old.push(format!(".old-{stamp}"));
+            let old = PathBuf::from(old);
+            std::fs::rename(&p, &old)?;
+            moved.push((old, p));
+        }
+    }
+    crate::os::write_private(dest, k.private.as_bytes())?;
+    std::fs::write(pub_path(dest), format!("{}\n", k.public))?;
+    Ok(moved)
+}
+
+struct Wizard {
+    input: Box<dyn BufRead + Send>,
+    /// Read passphrases without echo (a terminal), rather than as plain lines (a script).
+    tty: bool,
+}
+
+impl Wizard {
+    fn ask(&mut self, q: &str) -> Result<Answer> {
+        eprint!("{q}\n  [b back, q quit] > ");
+        std::io::stderr().flush()?;
+        // Bytes, not read_line: input that isn't UTF-8 is a bad answer to re-ask, not an error.
+        let mut a = Vec::new();
+        let n = self.input.read_until(b'\n', &mut a)?;
+        let a = String::from_utf8_lossy(&a);
+        Ok(parse_answer((n > 0).then_some(&*a)))
+    }
+
+    /// Asks until the answer is one of `keys`. Enter picks `default` when there is one.
+    fn choose(&mut self, q: &str, keys: &[&str], default: Option<&str>) -> Result<Answer> {
+        loop {
+            match self.ask(q)? {
+                Answer::Text(t) if keys.contains(&t.as_str()) => return Ok(Answer::Text(t)),
+                Answer::Text(t) if t.is_empty() && default.is_some() => {
+                    return Ok(Answer::Text(default.unwrap().into()));
+                }
+                Answer::Text(t) => eprintln!("  {t:?} isn't one of the choices: {}", keys.join(", ")),
+                other => return Ok(other),
             }
         }
     }
-    w.undo.lock().unwrap().placed.push(dest.to_path_buf());
-    crate::os::write_private(dest, &std::fs::read(src)?)?;
-    std::fs::write(pub_path(dest), std::fs::read(pub_path(src))?)?;
-    Ok(())
+
+    /// Asks until `check` accepts the answer.
+    fn text(&mut self, q: &str, check: impl Fn(&str) -> Result<()>) -> Result<Answer> {
+        loop {
+            match self.ask(q)? {
+                Answer::Text(t) => match check(&t) {
+                    Ok(()) => return Ok(Answer::Text(t)),
+                    Err(e) => eprintln!("  {e}"),
+                },
+                other => return Ok(other),
+            }
+        }
+    }
+
+    /// A passphrase: no echo on a terminal (Ctrl-C or an empty line quits), a line otherwise.
+    fn secret(&mut self, q: &str) -> Result<Option<Zeroizing<String>>> {
+        eprint!("{q} ");
+        std::io::stderr().flush()?;
+        if !self.tty {
+            let mut a = Zeroizing::new(String::new());
+            let n = self.input.read_line(&mut a)?;
+            let t = Zeroizing::new(a.trim_end_matches(['\r', '\n']).to_string());
+            return Ok((n > 0).then_some(t));
+        }
+        use ratatui::crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers, read};
+        ratatui::crossterm::terminal::enable_raw_mode()?;
+        let mut s = Zeroizing::new(String::with_capacity(256));
+        let r = loop {
+            match read() {
+                Ok(Event::Key(k)) if k.kind != KeyEventKind::Release => match k.code {
+                    KeyCode::Enter => break Ok(Some(())),
+                    KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => break Ok(None),
+                    KeyCode::Backspace => {
+                        s.pop();
+                    }
+                    KeyCode::Char(c) if s.len() < 128 => s.push(c),
+                    _ => {}
+                },
+                Ok(_) => {}
+                Err(e) => break Err(e),
+            }
+        };
+        ratatui::crossterm::terminal::disable_raw_mode()?;
+        eprintln!();
+        Ok(r?.map(|_| s))
+    }
+
+    /// Waits for the word `saved`, then clears the key off a terminal's screen and scrollback.
+    fn saved(&mut self) -> Result<Answer> {
+        let a = self.text("Type `saved` once you have copied both.", |t| {
+            ensure!(t.eq_ignore_ascii_case("saved"), "type the word saved (or b, q)");
+            Ok(())
+        })?;
+        if matches!(a, Answer::Text(_)) && std::io::IsTerminal::is_terminal(&std::io::stderr()) {
+            eprint!("\x1b[2J\x1b[3J\x1b[H");
+            eprintln!("(Cleared the key from this screen. A terminal log or tmux history may still hold it.)");
+        }
+        Ok(a)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Step {
+    Check,
+    Choose,
+    Join,
+    Name,
+    Pass,
+    Recovery,
+    Confirm,
+}
+
+/// Set while a join is waiting, so a stop cancels it in the daemon too.
+static JOINING: AtomicBool = AtomicBool::new(false);
+
+pub async fn run(config: &Path) -> Result<()> {
+    let stop = tokio::spawn(async {
+        if stopped().await {
+            if JOINING.load(Ordering::SeqCst) {
+                let _ = admin(Request::JoinCancel).await;
+            }
+            eprintln!("\nSetup stopped. Nothing was changed; run `tearmesh setup` again to start over.");
+            std::process::exit(130);
+        }
+    });
+    let mut w = Wizard {
+        input: Box::new(std::io::BufReader::new(std::io::stdin())),
+        tty: std::io::IsTerminal::is_terminal(&std::io::stdin()),
+    };
+    let r = wizard(&mut w, config).await;
+    stop.abort();
+    match r {
+        Ok(true) => Ok(()),
+        Ok(false) => {
+            eprintln!("Setup stopped. Nothing was changed.");
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Ctrl-C, or (on Unix) the terminal closing or a plain kill.
+async fn stopped() -> bool {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let (Ok(mut term), Ok(mut hup)) = (signal(SignalKind::terminate()), signal(SignalKind::hangup())) else {
+            return tokio::signal::ctrl_c().await.is_ok();
+        };
+        tokio::select! {
+            r = tokio::signal::ctrl_c() => r.is_ok(),
+            _ = term.recv() => true,
+            _ = hup.recv() => true,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await.is_ok()
+    }
+}
+
+async fn admin(req: Request) -> Result<Value> {
+    Client::connect(&socket_path()).await?.call(&req).await
+}
+
+/// Ok(true) when setup finished, Ok(false) when the person quit.
+async fn wizard(w: &mut Wizard, config: &Path) -> Result<bool> {
+    let mut step = Step::Check;
+    let mut name = String::new();
+    let mut made: Option<NewMesh> = None;
+    let mut cfg: Option<Config> = None;
+    loop {
+        step = match step {
+            Step::Check => {
+                let (c, status) = match preflight(w, config).await? {
+                    Some(x) => x,
+                    None => return Ok(false),
+                };
+                let next = existing(w, &c, &status).await?;
+                cfg = Some(c);
+                match next {
+                    Some(s) => s,
+                    None => return Ok(status["mesh"].is_object()),
+                }
+            }
+            Step::Choose => {
+                eprintln!("\nThis machine isn't in a mesh yet.");
+                eprintln!("  1  Create a new mesh. This machine becomes its owner node: it holds the owner key and approves new machines.");
+                eprintln!("  2  Join a mesh. You need a ticket from the owner node (`tearmesh mesh invite`).");
+                match w.choose("Choose 1 or 2.", &["1", "2"], None)? {
+                    Answer::Text(t) if t == "1" => Step::Name,
+                    Answer::Text(_) => Step::Join,
+                    Answer::Back => Step::Check,
+                    Answer::Quit => return Ok(false),
+                }
+            }
+            Step::Join => match join(w).await? {
+                Some(true) => return Ok(true),
+                Some(false) => Step::Choose,
+                None => return Ok(false),
+            },
+            Step::Name => {
+                if let Err(e) = boundaries(cfg.as_ref().expect("checked")) {
+                    eprintln!("\n{e:#}");
+                    return Ok(false);
+                }
+                match w.text("\nName for the new mesh (a-z, 0-9, -), e.g. home:", check_mesh_name)? {
+                    Answer::Text(t) => {
+                        name = t;
+                        Step::Pass
+                    }
+                    Answer::Back => Step::Choose,
+                    Answer::Quit => return Ok(false),
+                }
+            }
+            Step::Pass => {
+                eprintln!(
+                    "\nThe owner key signs every change to the mesh. It stays on this machine, locked with a \
+                     passphrase, so programs running as you can't sign with it. Choose one (8 or more characters)."
+                );
+                let Some(p) = w.secret("Passphrase:")? else { return Ok(false) };
+                let Some(again) = w.secret("Same passphrase again:")? else { return Ok(false) };
+                match check_passphrase(&p, &again) {
+                    Err(e) => {
+                        eprintln!("  {e}");
+                        Step::Pass
+                    }
+                    Ok(()) => {
+                        eprintln!("Making the owner keys…");
+                        made = Some(new_mesh(&name, cfg.as_ref().expect("checked"), &p).await?);
+                        Step::Recovery
+                    }
+                }
+            }
+            Step::Recovery => {
+                let m = made.as_ref().expect("made");
+                show_recovery(m);
+                match w.saved()? {
+                    Answer::Text(_) => Step::Confirm,
+                    Answer::Back => Step::Pass,
+                    Answer::Quit => return Ok(false),
+                }
+            }
+            Step::Confirm => {
+                let m = made.as_ref().expect("made");
+                eprintln!("\nReady to create the mesh:");
+                eprintln!("  mesh        {}", m.name);
+                eprintln!("  machine     {} (this one, the owner node)", m.machine);
+                eprintln!("  boundaries  {}", m.boundaries.join(", "));
+                eprintln!("  owner key   {}", owner_key_path(&m.name).display());
+                eprintln!("  recovery    the key and passphrase you saved (not kept here)");
+                match w.choose("Create it now? y to create.", &["y", "Y"], None)? {
+                    Answer::Text(_) => match commit(m).await {
+                        Ok(_) => {
+                            eprintln!(
+                                "\nMesh {} is created, with this machine ({}) in it. This is its owner node.\n\
+                                 Next: `tearmesh menu`, or add a machine with `tearmesh mesh invite`.",
+                                m.name, m.machine
+                            );
+                            return Ok(true);
+                        }
+                        Err(e) => {
+                            eprintln!("\nThat didn't work: {e:#}\nNothing was changed. Try again, go back, or quit.");
+                            Step::Confirm
+                        }
+                    },
+                    Answer::Back => Step::Recovery,
+                    Answer::Quit => return Ok(false),
+                }
+            }
+        };
+    }
+}
+
+fn show_recovery(m: &NewMesh) {
+    let fp = ssh_key::PublicKey::from_openssh(&m.recovery.public)
+        .map(|k| k.fingerprint(Default::default()).to_string())
+        .unwrap_or_default();
+    eprintln!("\n──── Recovery key for mesh {} ({fp}) ────\n{}", m.name, m.recovery.private.trim_end());
+    eprintln!("──── Its passphrase ────\n{}", *m.recovery_pass);
+    eprintln!("────────────────────────────────────────────");
+    eprintln!(
+        "Save both somewhere off this machine: a password manager, or a printout in a drawer. Keep the \
+         passphrase apart from the key file, or both in a password manager. This is your way back in if \
+         this machine is lost or its key leaks. It isn't kept here. Don't email it."
+    );
 }
 
 #[cfg(test)]
@@ -791,12 +694,15 @@ mod tests {
         assert!(check_mesh_name("Home").is_err());
         assert!(check_mesh_name("-x").is_err());
         assert!(check_mesh_name("").is_err());
+        assert!(check_passphrase("short", "short").is_err());
+        assert!(check_passphrase("long enough", "long enougH").is_err());
+        assert!(check_passphrase("long enough", "long enough").is_ok());
     }
 
     fn wizard(input: &str) -> Wizard {
         Wizard {
             input: Box::new(std::io::Cursor::new(input.to_string())),
-            undo: Arc::default(),
+            tty: false,
         }
     }
 
@@ -812,33 +718,34 @@ mod tests {
         assert_eq!(w.saved().unwrap(), Answer::Back);
         let mut w = Wizard {
             input: Box::new(std::io::Cursor::new(b"\xff\xfe\n2\n".to_vec())),
-            undo: Arc::default(),
+            tty: false,
         };
         assert_eq!(w.choose("?", &["1", "2"], None).unwrap(), Answer::Text("2".into()));
         // A closed input quits instead of spinning.
         let mut w = wizard("x\n");
         assert_eq!(w.choose("?", &["1"], None).unwrap(), Answer::Quit);
+        let mut w = wizard("pass word\n");
+        assert_eq!(w.secret("?").unwrap().as_deref().map(|s| s.as_str()), Some("pass word"));
+        assert!(w.secret("?").unwrap().is_none());
     }
 
     #[test]
-    fn undo_removes_temp_and_placed_keys() {
+    fn version_one_is_signed_and_keys_open() {
+        let id = iroh::SecretKey::generate().public();
+        let m = version_one("home", "ws", vec!["work".into()], id, "everyday pass").unwrap();
+        let s = crate::mesh::SignedMesh::verify_first(&m.toml, &m.sig).unwrap();
+        assert_eq!(s.mesh.machine("ws").unwrap().id, id);
         let d = tempfile::tempdir().unwrap();
-        let tmp = d.path().join("t");
-        std::fs::create_dir(&tmp).unwrap();
-        std::fs::write(tmp.join("recovery"), "secret").unwrap();
-        let placed = d.path().join("k");
-        std::fs::write(&placed, "k").unwrap();
-        std::fs::write(pub_path(&placed), "k").unwrap();
-        let old = d.path().join("k.old-1");
-        std::fs::write(&old, "previous").unwrap();
-        let mut u = Undo {
-            tmp: Some(tmp.clone()),
-            placed: vec![placed.clone()],
-            renamed: vec![(old.clone(), placed.clone())],
-        };
-        u.run();
-        assert!(!tmp.exists() && !pub_path(&placed).exists());
-        assert_eq!(std::fs::read_to_string(&placed).unwrap(), "previous", "the old key is back");
-        assert!(!old.exists());
+        let rec = d.path().join("rec");
+        std::fs::write(&rec, m.recovery.private.as_bytes()).unwrap();
+        assert!(keys::open(&rec, &m.recovery_pass).is_ok());
+        assert!(keys::open(&rec, "everyday pass").is_err(), "the recovery key has its own passphrase");
+
+        // Placing a key keeps the one already there.
+        let dest = d.path().join("ssh/k");
+        place_key(&m.owner, &dest).unwrap();
+        let moved = place_key(&m.recovery, &dest).unwrap();
+        assert_eq!(moved.len(), 2);
+        assert!(keys::open(&moved[0].0, "everyday pass").is_ok());
     }
 }
