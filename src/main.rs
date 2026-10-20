@@ -86,7 +86,10 @@ enum Cmd {
     /// Show a letter and mark it read.
     Read { id: String },
     /// Full-screen menu: status, a live map of the mesh, nodes, setup and owner actions.
-    Menu,
+    Menu {
+        #[arg(long, env = "TEARMESH_CONFIG", default_value = DEFAULT_CONFIG)]
+        config: PathBuf,
+    },
     /// Terminal mail client for your mailbox (TEARMESH_MAILBOX, default `admin`).
     Tui {
         #[arg(long)]
@@ -537,7 +540,7 @@ async fn run(cmd: Cmd) -> Result<()> {
             println!("\n{}", l.body.unwrap_or_default());
         }
         Cmd::Tui { mailbox } => tui::run(mailbox).await?,
-        Cmd::Menu => tearmesh::menu::run().await?,
+        Cmd::Menu { config } => tearmesh::menu::run(&config).await?,
         Cmd::Bio(BioCmd::Show { machine }) => {
             let who: Who = serde_json::from_value(session(Request::Who).await?)?;
             for m in who.machines {
