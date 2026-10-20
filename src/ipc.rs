@@ -92,9 +92,12 @@ pub enum Request {
         toml: String,
         sig: String,
     },
-    /// A one-time ticket for a new machine (on the owner node).
+    /// A one-time ticket for a new machine (on the owner node). With no name, the new machine
+    /// proposes its own; boundaries, when given, pin what it may host.
     Invite {
-        name: String,
+        #[serde(default)]
+        name: Option<String>,
+        #[serde(default)]
         boundaries: Vec<String>,
         #[serde(default)]
         replace: bool,
@@ -102,6 +105,13 @@ pub enum Request {
         ttl_secs: Option<u64>,
     },
     Pending,
+    /// Refuses the join request from `name`; with no name, closes every open invite.
+    Reject {
+        #[serde(default)]
+        name: Option<String>,
+    },
+    /// Stops this machine's own join.
+    JoinCancel,
     /// Joins with a ticket. Replies twice: the 6-digit code, then the adopted version.
     Join {
         ticket: String,
@@ -411,7 +421,7 @@ async fn handle(
                 ttl_secs,
             } => need_admin().and_then(|_| {
                 let ttl = Duration::from_secs(ttl_secs.unwrap_or(3600));
-                Ok(json!({ "ticket": node.invite(&name, boundaries, replace, ttl)? }))
+                Ok(json!({ "ticket": node.invite(name.as_deref(), boundaries, replace, ttl)? }))
             }),
             Request::Pending => {
                 need_admin().and_then(|_| Ok(serde_json::to_value(node.joins.pending())?))
@@ -421,17 +431,31 @@ async fn handle(
                     reply(&mut write, Err(e)).await?;
                     continue;
                 }
-                match join::start(&node, &ticket).await {
-                    Ok(j) => {
-                        let mut line =
-                            serde_json::to_vec(&json!({ "ok": true, "more": true, "data": { "code": j.code } }))?;
-                        line.push(b'\n');
-                        write.write_all(&line).await?;
-                        j.finish(&node).await.map(|v| json!({ "version": v }))
-                    }
+                // The join runs in the daemon: a client that leaves doesn't stop it.
+                match node.join(&ticket) {
+                    Ok(mut rx) => loop {
+                        let p = rx.borrow_and_update().clone();
+                        match p {
+                            join::JoinProgress::Waiting { code } => {
+                                let mut line =
+                                    serde_json::to_vec(&json!({ "ok": true, "more": true, "data": { "code": code } }))?;
+                                line.push(b'\n');
+                                write.write_all(&line).await?;
+                            }
+                            join::JoinProgress::Joined { version } => break Ok(json!({ "version": version })),
+                            join::JoinProgress::Failed { reason } => break Err(anyhow::anyhow!(reason)),
+                            join::JoinProgress::Dialing => {}
+                        }
+                        if rx.changed().await.is_err() {
+                            break Err(anyhow::anyhow!("the join was replaced by another one"));
+                        }
+                    },
                     Err(e) => Err(e),
                 }
             }
+            Request::Reject { name } => need_admin()
+                .and_then(|_| Ok(json!({ "rejected": node.joins.reject(name.as_deref())? }))),
+            Request::JoinCancel => need_admin().and_then(|_| Ok(json!({ "cancelled": node.cancel_join() }))),
             Request::Reset => need_admin().and_then(|_| {
                 node.reset()?;
                 Ok(json!({ "reset": true }))

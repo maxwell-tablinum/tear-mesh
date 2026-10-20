@@ -51,10 +51,15 @@ pub(crate) async fn send_json<T: Serialize>(send: &mut SendStream, f: &T) -> Res
 }
 
 pub(crate) async fn recv_json<T: serde::de::DeserializeOwned>(recv: &mut RecvStream) -> Result<T> {
+    recv_json_max(recv, MAX_FRAME).await
+}
+
+/// `recv_json` with a smaller cap, for frames from strangers.
+pub(crate) async fn recv_json_max<T: serde::de::DeserializeOwned>(recv: &mut RecvStream, max: usize) -> Result<T> {
     let mut len = [0u8; 4];
     recv.read_exact(&mut len).await?;
     let n = u32::from_be_bytes(len) as usize;
-    ensure!(n <= MAX_FRAME, "frame too large");
+    ensure!(n <= max, "frame too large");
     let mut buf = vec![0; n];
     recv.read_exact(&mut buf).await?;
     Ok(serde_json::from_slice(&buf)?)

@@ -88,6 +88,29 @@ pub fn find_owner_keys(owners: &[String]) -> Vec<PathBuf> {
     out
 }
 
+/// The one owner key of `m` in ~/.ssh, for commands that sign without `--key`.
+pub fn owner_key(m: &Mesh) -> Result<PathBuf> {
+    let owners: Vec<String> = m
+        .owner_keys()?
+        .iter()
+        .map(|k| k.fingerprint(Default::default()).to_string())
+        .collect();
+    let mut found = find_owner_keys(&owners);
+    match found.len() {
+        1 => Ok(found.remove(0)),
+        0 => anyhow::bail!(
+            "no owner key for mesh {} in ~/.ssh (looked for {}); pass --key PATH, or --no-sign",
+            m.name,
+            owners.join(", ")
+        ),
+        _ => anyhow::bail!(
+            "several owner keys for mesh {} in ~/.ssh: {}; pick one with --key",
+            m.name,
+            found.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", ")
+        ),
+    }
+}
+
 pub fn fingerprint_of(pub_file: &Path) -> Option<String> {
     let s = std::fs::read_to_string(pub_file).ok()?;
     let k = ssh_key::PublicKey::from_openssh(s.trim()).ok()?;

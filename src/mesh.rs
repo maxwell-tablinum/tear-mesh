@@ -501,6 +501,156 @@ impl Mesh {
     }
 }
 
+/// One change to the membership file. A new version is any list of these under one signature.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Change {
+    AddMachine { machine: Machine, replace: bool },
+    RemoveMachine(String),
+    Grant(Grant),
+    /// Takes `allow` away from the exact `from → to` grant.
+    Revoke(Grant),
+    AddBoundary(String),
+    /// Replaces the boundaries `machine` hosts; drops its approvals in any it stops hosting.
+    SetHosts { machine: String, boundaries: Vec<String> },
+    /// An OpenSSH public key line.
+    OwnerAdd(String),
+    /// A SHA256 fingerprint.
+    OwnerRemove(String),
+    /// `tools-sharing`, `relays` or `lookup`, with `mesh set`'s values.
+    Set { setting: String, value: String },
+}
+
+impl std::fmt::Display for Change {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        let cats = |g: &Grant| g.allow.iter().map(|c| format!("{c:?}").to_lowercase()).collect::<Vec<_>>().join(",");
+        match self {
+            Change::AddMachine { machine: m, replace } => write!(
+                f,
+                "{} machine {} hosting {}",
+                if *replace { "replace" } else { "add" },
+                m.name,
+                m.boundaries.join(", ")
+            ),
+            Change::RemoveMachine(n) => write!(f, "remove machine {n}"),
+            Change::Grant(g) => write!(f, "grant {} -> {}: {}", g.from, g.to, cats(g)),
+            Change::Revoke(g) => write!(f, "revoke {} -> {}: {}", g.from, g.to, cats(g)),
+            Change::AddBoundary(b) => write!(f, "add boundary {b}"),
+            Change::SetHosts { machine, boundaries } => write!(f, "{machine} hosts {}", boundaries.join(", ")),
+            Change::OwnerAdd(k) => write!(f, "add owner key {}", k.split_whitespace().take(2).last().unwrap_or(k)),
+            Change::OwnerRemove(fp) => write!(f, "remove owner key {fp}"),
+            Change::Set { setting, value } => write!(f, "set {setting} = {value}"),
+        }
+    }
+}
+
+/// `from:to:cat,cat`, e.g. `laptop:ws:tools,shell`.
+impl std::str::FromStr for Grant {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> Result<Self> {
+        let mut p = s.splitn(3, ':');
+        let (Some(from), Some(to), Some(cats)) = (p.next(), p.next(), p.next()) else {
+            bail!("a grant is from:to:categories, e.g. laptop:ws:tools,shell");
+        };
+        Ok(Grant {
+            from: from.into(),
+            to: to.into(),
+            allow: cats.split(',').map(str::parse).collect::<Result<_>>()?,
+        })
+    }
+}
+
+impl Mesh {
+    /// Makes one change. Returns a note worth telling the person, if any.
+    pub fn change(&mut self, c: &Change) -> Result<Option<String>> {
+        match c {
+            Change::AddMachine { machine, replace } => self.add_machine(machine.clone(), *replace)?,
+            Change::RemoveMachine(n) => self.remove_machine(n)?,
+            Change::Grant(g) => self.grant(&g.from, &g.to, &g.allow),
+            Change::Revoke(g) => {
+                let still = self.revoke(&g.from, &g.to, &g.allow)?;
+                if !still.is_empty() {
+                    return Ok(Some(format!(
+                        "a wildcard grant still allows {still:?} for {} -> {}; replace it with explicit grants to exclude this pair",
+                        g.from, g.to
+                    )));
+                }
+            }
+            Change::AddBoundary(b) => {
+                ensure!(valid_name(b), "bad boundary name {b:?}");
+                ensure!(!self.boundaries.contains(b), "the mesh already has boundary {b}");
+                self.boundaries.push(b.clone());
+            }
+            Change::SetHosts { machine, boundaries } => {
+                let m = self
+                    .machines
+                    .iter_mut()
+                    .find(|m| &m.name == machine)
+                    .with_context(|| format!("no machine named {machine}"))?;
+                m.boundaries = boundaries.clone();
+                let n = self.approvals.len();
+                self.approvals
+                    .retain(|a| &a.machine != machine || boundaries.contains(&a.boundary));
+                if self.approvals.len() < n {
+                    return Ok(Some(format!(
+                        "dropped {} approval(s) in boundaries {machine} no longer hosts",
+                        n - self.approvals.len()
+                    )));
+                }
+            }
+            Change::OwnerAdd(k) => self.owners.push(k.trim().to_string()),
+            Change::OwnerRemove(fp) => {
+                let keys = self.owner_keys()?;
+                let n = self.owners.len();
+                let owners = std::mem::take(&mut self.owners);
+                self.owners = owners
+                    .into_iter()
+                    .zip(keys)
+                    .filter(|(_, k)| k.fingerprint(Default::default()).to_string() != *fp)
+                    .map(|(s, _)| s)
+                    .collect();
+                ensure!(self.owners.len() < n, "no owner key with fingerprint {fp}");
+            }
+            Change::Set { setting, value } => match setting.as_str() {
+                "tools-sharing" => {
+                    self.settings.tools_sharing = match value.as_str() {
+                        "approval" => Sharing::Approval,
+                        "free" => Sharing::Free,
+                        _ => bail!("tools-sharing is approval or free"),
+                    }
+                }
+                "relays" => {
+                    self.settings.relays = match value.as_str() {
+                        "n0" | "none" => Relay::Preset(value.clone()),
+                        urls => Relay::Urls(urls.split(',').map(String::from).collect()),
+                    }
+                }
+                "lookup" => {
+                    self.settings.lookup = value
+                        .split(',')
+                        .filter(|s| !s.is_empty())
+                        .map(String::from)
+                        .collect()
+                }
+                _ => bail!("unknown setting {setting} (tools-sharing, relays, lookup)"),
+            },
+        }
+        Ok(None)
+    }
+}
+
+/// The version after `prev_toml` (the exact signed bytes of the current one) with `changes` made,
+/// and any notes. The caller signs the returned text.
+pub fn next_version(prev_toml: &str, changes: &[Change]) -> Result<(Mesh, String, Vec<String>)> {
+    let mut m = Mesh::parse(prev_toml)?;
+    let mut notes = vec![];
+    for c in changes {
+        notes.extend(m.change(c)?);
+    }
+    m.bump(prev_toml)?;
+    let toml = m.to_toml()?;
+    Ok((m, toml, notes))
+}
+
 /// A membership file plus the owner signature that was checked against it.
 #[derive(Clone, Debug)]
 pub struct SignedMesh {
@@ -655,6 +805,37 @@ pub(crate) mod tests {
 
     pub fn sign(dir: &Path, key: &Path, toml: &str) -> String {
         sign_ns(dir, key, toml, SIG_NAMESPACE)
+    }
+
+    #[test]
+    fn changes_batch_into_one_version() {
+        let d = tempfile::tempdir().unwrap();
+        let (_, a) = keygen(d.path(), "a");
+        let (_, b) = keygen(d.path(), "b");
+        let mut m = Mesh::new("home", vec![a, b.clone()], vec!["work".into()], None).unwrap();
+        m.add_machine(machine("ws", &["work"]), false).unwrap();
+        let v1 = m.to_toml().unwrap();
+        let (n, toml, _) = next_version(
+            &v1,
+            &[
+                Change::AddBoundary("lab".into()),
+                Change::AddMachine { machine: machine("beta", &["lab"]), replace: false },
+                "beta:ws:tools".parse::<Grant>().map(Change::Grant).unwrap(),
+                Change::SetHosts { machine: "ws".into(), boundaries: vec!["work".into(), "lab".into()] },
+            ],
+        )
+        .unwrap();
+        assert_eq!((n.version, n.prev.as_deref()), (2, Some(hash(&v1).as_str())));
+        assert!(n.allows("beta", "ws", Category::Tools) && n.hosts("ws", "lab"));
+        assert_eq!(Mesh::parse(&toml).unwrap(), n);
+
+        let no = |c: Change| next_version(&v1, &[c]).is_err();
+        assert!(no(Change::AddMachine { machine: machine("beta", &["lab"]), replace: false }), "unknown boundary");
+        assert!(no(Change::AddBoundary("work".into())));
+        assert!(no(Change::Set { setting: "tools-sharing".into(), value: "x".into() }));
+        let fp = PublicKey::from_openssh(&b).unwrap().fingerprint(Default::default()).to_string();
+        assert!(no(Change::OwnerRemove(fp)), "keeps two owner keys");
+        assert!("a:b".parse::<Grant>().is_err() && "a:b:fly".parse::<Grant>().is_err());
     }
 
     fn machine(name: &str, bs: &[&str]) -> Machine {

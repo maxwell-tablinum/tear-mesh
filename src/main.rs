@@ -10,7 +10,7 @@ use tearmesh::config::{Config, DEFAULT_CONFIG};
 use tearmesh::envelope::Kind;
 use tearmesh::ipc::{Client, Request, socket_path};
 use tearmesh::join::PendingInfo;
-use tearmesh::mesh::{Approval, Category, Machine, Mesh, Sharing, ssh_sign};
+use tearmesh::mesh::{Approval, Category, Change, Grant, Machine, Mesh, ssh_sign};
 use tearmesh::node::{Letter, Node, Who, load_or_create_key};
 use tearmesh::offer::Offer;
 use tearmesh::{hook, ipc, mcp, steward, tui};
@@ -49,8 +49,14 @@ enum Cmd {
     /// The membership file: machines, grants, approvals, owners (admin).
     #[command(subcommand)]
     Mesh(MeshCmd),
-    /// Join a mesh with a ticket from its owner node (admin, on the new machine).
-    Join { ticket: String },
+    /// Join a mesh with a ticket from its owner node (admin, on the new machine). The join runs
+    /// in the daemon: Ctrl-C leaves it waiting, `--cancel` stops it.
+    Join {
+        #[arg(required_unless_present = "cancel")]
+        ticket: Option<String>,
+        #[arg(long, conflicts_with = "ticket")]
+        cancel: bool,
+    },
     /// Daemon status (admin).
     Status,
     /// Ping every other machine in the mesh: which answer, and how fast (admin).
@@ -157,9 +163,13 @@ struct Edit {
     /// Where to write the new version when editing the daemon's copy (default ./mesh-v<N>.toml).
     #[arg(long)]
     out: Option<PathBuf>,
-    /// Sign with this owner key, then apply to the local daemon.
-    #[arg(long)]
+    /// Sign with this owner key, then apply to the local daemon (default: this mesh's one owner
+    /// key in ~/.ssh).
+    #[arg(long, conflicts_with = "no_sign")]
     key: Option<PathBuf>,
+    /// Only write the new version; sign it later with `tearmesh mesh sign`.
+    #[arg(long)]
+    no_sign: bool,
     /// Don't apply after signing.
     #[arg(long)]
     no_apply: bool,
@@ -270,17 +280,22 @@ enum MeshCmd {
     /// Sign a file with an owner key (`ssh-keygen -Y sign`); writes FILE.sig. Needs no daemon.
     Sign {
         file: PathBuf,
+        /// Default: the file's one owner key in ~/.ssh.
         #[arg(long)]
-        key: PathBuf,
+        key: Option<PathBuf>,
     },
     /// Hand a signed file (FILE and FILE.sig) to the local daemon.
     Apply { file: PathBuf },
-    /// Print a one-time ticket for a new machine (on the owner node).
+    /// Print a one-time ticket for a new machine (on the owner node). Without NAME, the new
+    /// machine proposes its name and boundaries and you approve what you see.
     Invite {
-        name: String,
-        #[arg(long = "boundary", required = true)]
+        /// Only a machine configured with this name may use the ticket.
+        name: Option<String>,
+        /// Only for a machine hosting exactly these boundaries.
+        #[arg(long = "boundary")]
         boundaries: Vec<String>,
-        #[arg(long)]
+        /// Give the existing machine NAME a new node id (a reinstall).
+        #[arg(long, requires = "name")]
         replace: bool,
         /// How long the ticket works: e.g. 30m, 2h, 1d.
         #[arg(long, default_value = "1h")]
@@ -288,19 +303,57 @@ enum MeshCmd {
     },
     /// Join requests waiting for approval.
     Pending,
-    /// Approve a waiting join: compare its code with the new machine's screen, then sign.
+    /// Approve a waiting join: compare its code with the new machine's screen, then sign. One
+    /// version adds the machine, any new boundaries and grants.
     Approve {
         name: String,
+        /// Add this boundary the machine asked for to the mesh (repeat for more).
+        #[arg(long = "add-boundary")]
+        add_boundaries: Vec<String>,
+        /// Also grant FROM:TO:CATEGORIES, e.g. laptop:ws:tools,shell (repeat for more).
+        #[arg(long = "grant")]
+        grants: Vec<tearmesh::mesh::Grant>,
+        /// Default: this mesh's one owner key in ~/.ssh.
         #[arg(long)]
-        key: PathBuf,
+        key: Option<PathBuf>,
         /// Skip the confirmation (for scripts that compared the code).
         #[arg(long)]
         yes: bool,
+    },
+    /// Refuse a waiting join, or with --all close every open invite (a leaked ticket).
+    Reject {
+        #[arg(required_unless_present = "all")]
+        name: Option<String>,
+        #[arg(long, conflicts_with = "name")]
+        all: bool,
+    },
+    /// Add a boundary to the mesh, optionally hosted by machines that already have its user.
+    #[command(subcommand)]
+    Boundary(BoundaryCmd),
+    /// Set which boundaries MACHINE hosts (each must be in the mesh).
+    Hosts {
+        machine: String,
+        #[arg(required = true)]
+        boundaries: Vec<String>,
+        #[command(flatten)]
+        edit: Edit,
     },
     /// Forget the adopted membership file (logs stay), to adopt a new first one.
     Reset {
         #[arg(long)]
         yes: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum BoundaryCmd {
+    /// Add boundary B to the mesh; --host M also makes machine M host it.
+    Add {
+        boundary: String,
+        #[arg(long = "host")]
+        hosts: Vec<String>,
+        #[command(flatten)]
+        edit: Edit,
     },
 }
 
@@ -390,12 +443,17 @@ async fn run(cmd: Cmd) -> Result<()> {
         }
         Cmd::Setup { config } => tearmesh::setup::run(&config).await?,
         Cmd::Mesh(c) => mesh_cmd(c).await?,
-        Cmd::Join { ticket } => {
+        Cmd::Join { cancel: true, .. } => {
+            let v = admin(Request::JoinCancel).await?;
+            println!("{}", if v["cancelled"] == true { "cancelled" } else { "no join was running" });
+        }
+        Cmd::Join { ticket, .. } => {
+            let ticket = ticket.unwrap_or_default();
             let mut c = Client::connect(&socket_path()).await?;
             let v = c
                 .call_each(&Request::Join { ticket }, |d| {
                     println!(
-                        "code {}: check that the owner node shows the same code, then wait for approval.",
+                        "code {}: check that the owner node shows the same code, then wait for approval.\n(Ctrl-C leaves it waiting in the daemon; `tearmesh join --cancel` stops it.)",
                         d["code"].as_str().unwrap_or_default()
                     );
                 })
@@ -646,7 +704,14 @@ async fn edit(e: Edit, change: impl FnOnce(&mut Mesh) -> Result<()>) -> Result<(
             (v["toml"].as_str().unwrap_or_default().to_string(), true)
         }
     };
-    let mut m = Mesh::parse(&prev_toml)?;
+    let prev = Mesh::parse(&prev_toml)?;
+    // The previous version's owners sign the next one.
+    let key = match (&e.key, e.no_sign) {
+        (_, true) => None,
+        (Some(k), _) => Some(k.clone()),
+        (None, false) => Some(tearmesh::setup::owner_key(&prev)?),
+    };
+    let mut m = prev;
     change(&mut m)?;
     m.bump(&prev_toml)?;
     let out = match (&e.file, &e.out) {
@@ -657,7 +722,7 @@ async fn edit(e: Edit, change: impl FnOnce(&mut Mesh) -> Result<()>) -> Result<(
     std::fs::write(&out, m.to_toml()?)?;
     let _ = std::fs::remove_file(sig_path(&out));
     println!("{} is now version {}", out.display(), m.version);
-    match &e.key {
+    match &key {
         Some(k) => {
             ssh_sign(k, &out)?;
             // A local file signed offline is applied only if a daemon is there to take it.
@@ -760,18 +825,7 @@ async fn mesh_cmd(cmd: MeshCmd) -> Result<()> {
             to,
             categories,
             edit: e,
-        } => {
-            edit(e, |m| {
-                let still = m.revoke(&from, &to, &categories)?;
-                if !still.is_empty() {
-                    eprintln!(
-                        "note: a wildcard grant still allows {still:?} for {from} -> {to}; replace it with explicit grants to exclude this pair"
-                    );
-                }
-                Ok(())
-            })
-            .await?
-        }
+        } => edit(e, |m| change(m, Change::Revoke(Grant { from, to, allow: categories }))).await?,
         MeshCmd::ApproveOffer {
             machine,
             boundary,
@@ -835,70 +889,46 @@ async fn mesh_cmd(cmd: MeshCmd) -> Result<()> {
             setting,
             value,
             edit: e,
-        } => {
+        } => edit(e, |m| change(m, Change::Set { setting, value })).await?,
+        MeshCmd::OwnerAdd { pubkey, edit: e } => {
+            let k = std::fs::read_to_string(pubkey)?;
+            edit(e, |m| change(m, Change::OwnerAdd(k))).await?
+        }
+        MeshCmd::OwnerRemove {
+            fingerprint,
+            edit: e,
+        } => edit(e, |m| change(m, Change::OwnerRemove(fingerprint))).await?,
+        MeshCmd::Boundary(BoundaryCmd::Add {
+            boundary,
+            hosts,
+            edit: e,
+        }) => {
             edit(e, |m| {
-                match setting.as_str() {
-                    "tools-sharing" => {
-                        m.settings.tools_sharing = match value.as_str() {
-                            "approval" => Sharing::Approval,
-                            "free" => Sharing::Free,
-                            _ => bail!("tools-sharing is approval or free"),
-                        }
-                    }
-                    "relays" => {
-                        m.settings.relays = match value.as_str() {
-                            "n0" | "none" => tearmesh::config::Relay::Preset(value),
-                            urls => tearmesh::config::Relay::Urls(
-                                urls.split(',').map(String::from).collect(),
-                            ),
-                        }
-                    }
-                    "lookup" => {
-                        m.settings.lookup = value
-                            .split(',')
-                            .filter(|s| !s.is_empty())
-                            .map(String::from)
-                            .collect()
-                    }
-                    _ => bail!("unknown setting {setting} (tools-sharing, relays, lookup)"),
+                change(m, Change::AddBoundary(boundary.clone()))?;
+                for h in hosts {
+                    let mut b = m.machine(&h).with_context(|| format!("no machine named {h}"))?.boundaries.clone();
+                    b.push(boundary.clone());
+                    change(m, Change::SetHosts { machine: h, boundaries: b })?;
                 }
                 Ok(())
             })
             .await?
         }
-        MeshCmd::OwnerAdd { pubkey, edit: e } => {
-            let k = std::fs::read_to_string(pubkey)?.trim().to_string();
-            edit(e, |m| {
-                m.owners.push(k);
-                Ok(())
-            })
-            .await?
-        }
-        MeshCmd::OwnerRemove {
-            fingerprint,
+        MeshCmd::Hosts {
+            machine,
+            boundaries,
             edit: e,
-        } => {
-            edit(e, |m| {
-                let keys = m.owner_keys()?;
-                let n = m.owners.len();
-                let owners = std::mem::take(&mut m.owners);
-                m.owners = owners
-                    .into_iter()
-                    .zip(keys)
-                    .filter(|(_, k)| k.fingerprint(Default::default()).to_string() != fingerprint)
-                    .map(|(s, _)| s)
-                    .collect();
-                ensure!(m.owners.len() < n, "no owner key with fingerprint {fingerprint}");
-                Ok(())
-            })
-            .await?
-        }
+        } => edit(e, |m| change(m, Change::SetHosts { machine, boundaries })).await?,
         MeshCmd::Migrate { edit: e } => {
             ensure!(e.file.is_some(), "migrate needs --file <0.1 circle.toml>");
             edit(e, |_| Ok(())).await?
         }
         MeshCmd::Sign { file, key } => {
-            Mesh::parse(&std::fs::read_to_string(&file)?)?;
+            let m = Mesh::parse(&std::fs::read_to_string(&file)?)?;
+            let key = match key {
+                Some(k) => k,
+                None => tearmesh::setup::owner_key(&m)?,
+            };
             let _ = std::fs::remove_file(sig_path(&file));
             ssh_sign(&key, &file)?;
             println!("wrote {}", sig_path(&file).display());
@@ -919,8 +949,9 @@ async fn mesh_cmd(cmd: MeshCmd) -> Result<()> {
             })
             .await?;
             println!("{}", v["ticket"].as_str().unwrap_or_default());
+            let n = name.as_deref().unwrap_or("<name>");
             eprintln!(
-                "On {name}: `sudo tearmesh join <ticket>`. Then `tearmesh mesh approve {name} --key <owner key>` here, after checking both screens show the same code."
+                "On the new machine: `tearmesh menu` (J, then paste it), `tearmesh setup`, or `sudo tearmesh join <ticket>`. Then here: `tearmesh mesh approve {n}` once both screens show the same code."
             );
         }
         MeshCmd::Pending => {
@@ -930,28 +961,47 @@ async fn mesh_cmd(cmd: MeshCmd) -> Result<()> {
             }
             for x in p {
                 println!(
-                    "{}  code {}  node {}  boundaries {}{}",
+                    "{}  code {}  node {}  boundaries {}  {}{}{}",
                     x.name,
                     x.code,
                     x.node_id,
                     x.boundaries.join(","),
-                    if x.replace { "  (replaces the existing machine)" } else { "" }
+                    if x.waiting { "waiting" } else { "away" },
+                    if x.replace { "  (replaces the existing machine)" } else { "" },
+                    if x.contested { "\n  WARNING: another machine also tried this ticket; approve only if the code matches on the right machine's own screen" } else { "" }
                 );
             }
         }
-        MeshCmd::Approve { name, key, yes } => {
+        MeshCmd::Approve {
+            name,
+            add_boundaries,
+            grants,
+            key,
+            yes,
+        } => {
             let p: Vec<PendingInfo> = serde_json::from_value(admin(Request::Pending).await?)?;
             let x = p
                 .into_iter()
                 .find(|x| x.name == name)
                 .with_context(|| format!("no join request from {name} is waiting"))?;
+            let cur = admin(Request::MeshCurrent).await?;
+            let mesh = Mesh::parse(cur["toml"].as_str().unwrap_or_default())?;
+            let changes = x.changes(&mesh, &add_boundaries, &grants)?;
             println!(
-                "{} (node {}) wants to join with boundaries {}.\nCode: {}",
+                "{} (node {}) wants to join with boundaries {}.\nCode: {} (read it off {}'s own screen)",
                 x.name,
                 x.node_id,
                 x.boundaries.join(", "),
-                x.code
+                x.code,
+                x.name
             );
+            if x.contested {
+                println!("WARNING: another machine also tried this ticket.");
+            }
+            for c in &changes {
+                println!("  {c}");
+            }
+            ensure!(!(yes && x.contested), "another machine also tried this ticket; approve without --yes, after comparing codes");
             if !yes && !confirm("Does the new machine show the same code? Approve and sign?")? {
                 bail!("not approved");
             }
@@ -959,22 +1009,26 @@ async fn mesh_cmd(cmd: MeshCmd) -> Result<()> {
             let e = Edit {
                 file: None,
                 out: Some(dir.join(format!("{name}.toml"))),
-                key: Some(key),
+                key,
+                no_sign: false,
                 no_apply: false,
             };
             let r = edit(e, |m| {
-                m.add_machine(
-                    Machine {
-                        name: x.name,
-                        id: x.node_id,
-                        boundaries: x.boundaries,
-                    },
-                    x.replace,
-                )
+                for c in changes {
+                    change(m, c)?;
+                }
+                Ok(())
             })
             .await;
             let _ = std::fs::remove_dir_all(&dir);
             r?;
+            if !x.waiting {
+                println!("{name} is away; it gets the file when it runs join again with the same ticket.");
+            }
+        }
+        MeshCmd::Reject { name, .. } => {
+            let v = admin(Request::Reject { name }).await?;
+            println!("refused {} request(s) or invite(s)", v["rejected"]);
         }
         MeshCmd::Reset { yes } => {
             if !yes
@@ -985,6 +1039,14 @@ async fn mesh_cmd(cmd: MeshCmd) -> Result<()> {
             admin(Request::Reset).await?;
             println!("reset; apply a new membership file with `tearmesh mesh apply`");
         }
+    }
+    Ok(())
+}
+
+/// One change, printing its note.
+fn change(m: &mut Mesh, c: Change) -> Result<()> {
+    if let Some(n) = m.change(&c)? {
+        eprintln!("note: {n}");
     }
     Ok(())
 }

@@ -638,51 +638,53 @@ async fn a_split_heals_the_same_way_everywhere() {
     stop(&[&ws, &laptop]).await;
 }
 
+fn with_users(mut c: Config, users: &[(&str, &str)]) -> Config {
+    c.users = users.iter().map(|(u, b)| (u.to_string(), b.to_string())).collect();
+    c
+}
+
+/// Waits until the owner sees the joiner as away (its connection closed).
+async fn until_away(ws: &Arc<Node>) {
+    for _ in 0..100 {
+        if ws.joins_pending().iter().all(|p| !p.waiting) {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    panic!("the joiner still shows as waiting");
+}
+
 #[tokio::test]
 async fn joining_with_a_ticket() {
     let w = World::new();
     let v1 = w.sign(&w.mesh(&[("ws", &["work", "vault"])]));
     let ws = w.start("ws", &v1).await;
-    let laptop = w.start_bare("laptop").await;
-    assert!(
-        ws.invite(
-            "laptop",
-            vec!["nope".into()],
-            false,
-            std::time::Duration::from_secs(60)
-        )
-        .is_err()
-    );
-    assert!(
-        ws.invite(
-            "ws",
-            vec!["work".into()],
-            false,
-            std::time::Duration::from_secs(60)
-        )
-        .is_err(),
-        "name in use"
-    );
+    let laptop = Node::start(with_users(w.cfg("laptop"), &[("u1", "work"), ("u2", "play")]))
+        .await
+        .unwrap();
+    let d = std::time::Duration::from_secs(60);
+    assert!(ws.invite(Some("laptop"), vec!["nope".into()], false, d).is_err());
+    assert!(ws.invite(Some("ws"), vec![], false, d).is_err(), "name in use");
+    assert!(ws.invite(None, vec![], true, d).is_err(), "--replace needs a name");
+    // No name, no boundaries: the new machine proposes them, the person approves.
     let ticket = ws
-        .invite(
-            "laptop",
-            vec!["work".into()],
-            false,
-            std::time::Duration::from_secs(600),
-        )
+        .invite(None, vec![], false, std::time::Duration::from_secs(600))
         .unwrap();
     assert!(ticket.len() < 300, "{} chars", ticket.len());
 
     let joining = tearmesh::join::start(&laptop, &ticket).await.unwrap();
     let pending = ws.joins_pending();
     assert_eq!(pending.len(), 1);
+    let p = pending[0].clone();
     assert_eq!(
-        (pending[0].name.as_str(), pending[0].code.as_str()),
+        (p.name.as_str(), p.code.as_str()),
         ("laptop", joining.code.as_str())
     );
-    assert_eq!(pending[0].node_id, laptop.id());
+    assert_eq!(p.node_id, laptop.id());
+    assert_eq!(p.boundaries, vec!["play", "work"]);
+    assert!(p.waiting && !p.contested);
 
-    // The ticket is single use: another machine with the same ticket gets nowhere.
+    // The ticket admits one node: another machine with it is refused, and the owner hears of it.
     let thief_world = World::new();
     let mut tcfg = thief_world.cfg("laptop");
     tcfg.state_dir = w.dir.path().join("thief");
@@ -692,23 +694,27 @@ async fn joining_with_a_ticket() {
         .err()
         .map(|e| format!("{e:#}"))
         .unwrap_or_default();
-    assert!(
-        err.contains("no open invite") || err.contains("not reachable") || err.contains("member"),
-        "{err}"
-    );
+    assert!(err.contains("already used by another machine"), "{err}");
+    assert!(ws.joins_pending()[0].contested);
 
-    // The person approves on the owner node: a version listing the machine.
-    let v2 = w.next(&v1, |m| {
-        let p = &pending[0];
-        m.add_machine(
-            Machine {
-                name: p.name.clone(),
-                id: p.node_id,
-                boundaries: p.boundaries.clone(),
-            },
-            false,
+    // The joiner leaves and comes back with the same ticket: the same code.
+    drop(joining);
+    until_away(&ws).await;
+    let joining = tearmesh::join::start(&laptop, &ticket).await.unwrap();
+    assert_eq!(joining.code, p.code);
+
+    // One version adds the new boundary, the machine and a grant.
+    let changes = p
+        .changes(
+            &Mesh::parse(&v1.0).unwrap(),
+            &["play".into()],
+            &["laptop:ws:tools".parse().unwrap()],
         )
-        .unwrap()
+        .unwrap();
+    let v2 = w.next(&v1, |m| {
+        for c in &changes {
+            m.change(c).unwrap();
+        }
     });
     let handle = tokio::spawn({
         let laptop = laptop.clone();
@@ -716,7 +722,10 @@ async fn joining_with_a_ticket() {
     });
     apply(&ws, &v2).unwrap();
     assert_eq!(handle.await.unwrap().unwrap(), 2);
-    assert_eq!(laptop.mesh().unwrap().version, 2);
+    let m = laptop.mesh().unwrap();
+    assert_eq!(m.version, 2);
+    assert_eq!(m.machine("laptop").unwrap().boundaries, vec!["play", "work"]);
+    assert!(m.allows("laptop", "ws", Category::Tools));
     assert!(ws.joins_pending().is_empty());
 
     // Now they're members: mail flows.
@@ -736,6 +745,134 @@ async fn joining_with_a_ticket() {
 }
 
 #[tokio::test]
+async fn a_join_approved_while_away_survives_an_owner_restart() {
+    let w = World::new();
+    let v1 = w.sign(&w.mesh(&[("ws", &["work"])]));
+    let ws = w.start("ws", &v1).await;
+    let laptop = Node::start(with_users(w.cfg("laptop"), &[("u1", "work")]))
+        .await
+        .unwrap();
+    let ticket = ws
+        .invite(None, vec![], false, std::time::Duration::from_secs(600))
+        .unwrap();
+    let joining = tearmesh::join::start(&laptop, &ticket).await.unwrap();
+    drop(joining);
+    until_away(&ws).await;
+    stop(&[&ws]).await;
+
+    // The invite and its claim come back with the daemon.
+    let ws = w.start("ws", &v1).await;
+    let p = ws.joins_pending();
+    assert_eq!(p.len(), 1);
+    assert!(!p[0].waiting);
+    let changes = p[0].changes(&ws.mesh().unwrap(), &[], &[]).unwrap();
+    let v2 = w.next(&v1, |m| {
+        for c in &changes {
+            m.change(c).unwrap();
+        }
+    });
+    apply(&ws, &v2).unwrap();
+    assert!(ws.joins_pending().is_empty(), "approved, waiting for the machine to come back");
+
+    // The owner node has a new address after its restart.
+    let mut t = tearmesh::join::Ticket::decode(&ticket).unwrap();
+    t.owner_node = ws.endpoint.addr();
+    let joining = tearmesh::join::start(&laptop, &t.encode()).await.unwrap();
+    assert!(joining.code.is_empty(), "the file comes at once");
+    assert_eq!(joining.finish(&laptop).await.unwrap(), 2);
+    stop(&[&ws, &laptop]).await;
+}
+
+#[tokio::test]
+async fn pins_and_rejections() {
+    let w = World::new();
+    let v1 = w.sign(&w.mesh(&[("ws", &["work"])]));
+    let ws = w.start("ws", &v1).await;
+    let laptop = Node::start(with_users(w.cfg("laptop"), &[("u1", "work"), ("u2", "vault")]))
+        .await
+        .unwrap();
+    let d = std::time::Duration::from_secs(600);
+    let err = |r: anyhow::Result<tearmesh::join::Joining>| format!("{:#}", r.err().unwrap());
+
+    let t = ws.invite(Some("other"), vec![], false, d).unwrap();
+    let e = err(tearmesh::join::start(&laptop, &t).await);
+    assert!(e.contains("the ticket is for other"), "{e}");
+    let t = ws.invite(Some("laptop"), vec!["work".into()], false, d).unwrap();
+    let e = err(tearmesh::join::start(&laptop, &t).await);
+    assert!(e.contains("the ticket is for boundaries work"), "{e}");
+    assert!(ws.joins_pending().is_empty(), "a mismatch claims nothing");
+
+    // Refused while waiting: the joiner hears it, and the ticket is gone.
+    let t = ws.invite(None, vec![], false, d).unwrap();
+    let joining = tearmesh::join::start(&laptop, &t).await.unwrap();
+    let handle = tokio::spawn({
+        let laptop = laptop.clone();
+        async move { joining.finish(&laptop).await }
+    });
+    assert_eq!(ws.reject_join(Some("laptop")).unwrap(), 1);
+    let e = format!("{:#}", handle.await.unwrap().unwrap_err());
+    assert!(e.contains("refused: the owner refused this machine"), "{e}");
+    let e = err(tearmesh::join::start(&laptop, &t).await);
+    assert!(e.contains("no open invite"), "{e}");
+    assert!(ws.reject_join(Some("laptop")).is_err());
+
+    // Closing every invite voids the rest.
+    assert_eq!(ws.reject_join(None).unwrap(), 2);
+    stop(&[&ws, &laptop]).await;
+}
+
+#[tokio::test]
+async fn the_daemon_holds_the_join() {
+    use tearmesh::join::JoinProgress;
+    let w = World::new();
+    let v1 = w.sign(&w.mesh(&[("ws", &["work"])]));
+    let ws = w.start("ws", &v1).await;
+    let laptop = Node::start(with_users(w.cfg("laptop"), &[("u1", "work")]))
+        .await
+        .unwrap();
+    let ticket = ws
+        .invite(None, vec![], false, std::time::Duration::from_secs(600))
+        .unwrap();
+    let mut rx = laptop.join(&ticket).unwrap();
+    let code = loop {
+        if let JoinProgress::Waiting { code } = rx.borrow_and_update().clone() {
+            break code;
+        }
+        rx.changed().await.unwrap();
+    };
+    assert_eq!(laptop.status().joining, Some(JoinProgress::Waiting { code: code.clone() }));
+    // The same ticket again follows the running join.
+    assert_eq!(*laptop.join(&ticket).unwrap().borrow(), JoinProgress::Waiting { code: code.clone() });
+    assert!(laptop.cancel_join());
+    assert!(matches!(laptop.status().joining, Some(JoinProgress::Failed { .. })));
+    until_away(&ws).await;
+
+    let mut rx = laptop.join(&ticket).unwrap();
+    loop {
+        if let JoinProgress::Waiting { code: c } = rx.borrow_and_update().clone() {
+            assert_eq!(c, code);
+            break;
+        }
+        rx.changed().await.unwrap();
+    }
+    let p = ws.joins_pending();
+    let v2 = w.next(&v1, |m| {
+        for c in p[0].changes(&Mesh::parse(&v1.0).unwrap(), &[], &[]).unwrap() {
+            m.change(&c).unwrap();
+        }
+    });
+    apply(&ws, &v2).unwrap();
+    loop {
+        if let JoinProgress::Joined { version } = rx.borrow_and_update().clone() {
+            assert_eq!(version, 2);
+            break;
+        }
+        rx.changed().await.unwrap();
+    }
+    stop(&[&ws, &laptop]).await;
+}
+
+#[tokio::test]
 async fn a_joiner_refuses_owners_the_ticket_didnt_name() {
     let w = World::new();
     let (other_key, other_pub) = keygen(w.dir.path(), "other");
@@ -744,7 +881,7 @@ async fn a_joiner_refuses_owners_the_ticket_didnt_name() {
     let laptop = w.start_bare("laptop").await;
     let ticket = ws
         .invite(
-            "laptop",
+            Some("laptop"),
             vec!["work".into()],
             false,
             std::time::Duration::from_secs(600),

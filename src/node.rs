@@ -107,6 +107,9 @@ pub struct Status {
     pub entries: BTreeMap<String, u64>,
     pub peers: Vec<PeerInfo>,
     pub pending_joins: Vec<join::PendingInfo>,
+    /// This machine's own join, while one runs (and its outcome after).
+    #[serde(default)]
+    pub joining: Option<join::JoinProgress>,
     pub warnings: Vec<String>,
 }
 
@@ -282,7 +285,7 @@ impl Node {
             .map(|s| s.current().mesh.settings.clone())
             .unwrap_or_default();
         let mesh = Arc::new(RwLock::new(state));
-        let joins = Arc::new(join::Joins::default());
+        let joins = Arc::new(join::Joins::load(dir));
 
         let lookup = MemoryLookup::new();
         let mut b = Endpoint::builder(presets::Minimal)
@@ -1114,6 +1117,7 @@ impl Node {
             entries,
             peers,
             pending_joins: self.joins.pending(),
+            joining: self.joins.progress(),
             warnings,
         }
     }
