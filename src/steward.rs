@@ -276,7 +276,7 @@ pub fn prompt(address: &str, letters: &[Letter]) -> String {
 }
 
 /// Fills the `{prompt}` placeholder, or appends the prompt when there is none.
-fn command_args(args: &[String], prompt: &str) -> Vec<String> {
+pub(crate) fn command_args(args: &[String], prompt: &str) -> Vec<String> {
     let mut out: Vec<String> = args
         .iter()
         .map(|a| {

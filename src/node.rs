@@ -23,7 +23,7 @@ use crate::envelope::{
 use crate::mesh::{Mesh, SignedMesh};
 use crate::os::write_private;
 use crate::store::{Seen, Store, Stored};
-use crate::{bridge, join, now_ms, policy, shell, sync, valid_name};
+use crate::{bridge, join, now_ms, ping, policy, shell, sync, valid_name};
 
 /// New mail for a local mailbox that no session currently holds.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -184,7 +184,7 @@ impl EndpointHooks for Members {
         let ok = if alpn == join::ALPN {
             conn.side() == Side::Client || self.joins.open()
         } else {
-            member && [sync::ALPN, bridge::ALPN, shell::ALPN].contains(&alpn)
+            member && [sync::ALPN, bridge::ALPN, shell::ALPN, ping::ALPN].contains(&alpn)
         };
         async move {
             if ok {
@@ -292,6 +292,7 @@ impl Node {
                 join::ALPN.to_vec(),
                 bridge::ALPN.to_vec(),
                 shell::ALPN.to_vec(),
+                ping::ALPN.to_vec(),
             ])
             .hooks(Members {
                 mesh: mesh.clone(),
@@ -374,6 +375,8 @@ impl Node {
                         bridge::serve(&n, conn).await
                     } else if alpn == shell::ALPN {
                         shell::serve(&n, conn).await
+                    } else if alpn == ping::ALPN {
+                        ping::serve(conn).await
                     } else {
                         Ok(())
                     };

@@ -167,7 +167,34 @@ fn client_token(pipe: &OwnedHandle) -> Result<OwnedHandle> {
 }
 
 pub async fn connect(path: &Path) -> Result<(BoxRead, BoxWrite)> {
-    let ctx = || format!("connecting to the tear-mesh daemon at {}", path.display());
+    connect_checked(path, verify_server).await
+}
+
+/// Connects to a pipe this user's own process made (the MCP hub's).
+pub async fn connect_mine(path: &Path) -> Result<(BoxRead, BoxWrite)> {
+    connect_checked(path, verify_mine).await
+}
+
+/// This process's identity, in the form `Caller::id` takes.
+pub fn my_identity() -> Result<String> {
+    process_user()
+}
+
+fn verify_mine(pipe: &NamedPipeClient) -> Result<()> {
+    let owner = pipe_owner(pipe)?;
+    let me = process_user()?;
+    ensure!(
+        owner == me || (owner == ADMINISTRATORS && is_member(null_mut(), ADMINISTRATORS)?),
+        "the pipe belongs to {owner}, not to you: another program may have taken its name"
+    );
+    Ok(())
+}
+
+async fn connect_checked(
+    path: &Path,
+    verify: fn(&NamedPipeClient) -> Result<()>,
+) -> Result<(BoxRead, BoxWrite)> {
+    let ctx = || format!("connecting to {}", path.display());
     let mut tries = 0;
     let pipe = loop {
         match open(path) {
@@ -180,7 +207,7 @@ pub async fn connect(path: &Path) -> Result<(BoxRead, BoxWrite)> {
             Err(e) => return Err(e).with_context(ctx),
         }
     };
-    verify_server(&pipe).with_context(ctx)?;
+    verify(&pipe).with_context(ctx)?;
     let (r, w) = tokio::io::split(pipe);
     Ok((Box::new(r), Box::new(w)))
 }
@@ -213,6 +240,17 @@ fn open(path: &Path) -> io::Result<NamedPipeClient> {
 /// NetworkService aren't trusted: many unrelated services run as them. (The server process's
 /// token would say the same, but ordinary users may not open it.)
 fn verify_server(pipe: &NamedPipeClient) -> Result<()> {
+    let owner = pipe_owner(pipe)?;
+    let trusted = [SYSTEM, ADMINISTRATORS].contains(&owner.as_str())
+        || user_identity(SERVICE_ACCOUNT).is_ok_and(|s| s == owner);
+    ensure!(
+        trusted,
+        "the pipe belongs to {owner}, not the tear-mesh service: another program may have taken its name"
+    );
+    Ok(())
+}
+
+fn pipe_owner(pipe: &NamedPipeClient) -> Result<String> {
     let (mut owner, mut sd) = (null_mut(), null_mut());
     let err = unsafe {
         GetSecurityInfo(
@@ -232,14 +270,7 @@ fn verify_server(pipe: &NamedPipeClient) -> Result<()> {
         io::Error::from_raw_os_error(err as i32)
     );
     let _sd = Local(sd);
-    let owner = sid_string(owner)?;
-    let trusted = [SYSTEM, ADMINISTRATORS].contains(&owner.as_str())
-        || user_identity(SERVICE_ACCOUNT).is_ok_and(|s| s == owner);
-    ensure!(
-        trusted,
-        "the pipe belongs to {owner}, not the tear-mesh service: another program may have taken its name"
-    );
-    Ok(())
+    sid_string(owner)
 }
 
 /// The account's SID. Takes `name`, `MACHINE\name` or `NT SERVICE\name`.

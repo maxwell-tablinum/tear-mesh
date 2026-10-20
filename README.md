@@ -7,7 +7,7 @@ A peer-to-peer mesh that connects the apps and agents on your own machines, not 
 
 All of it is encrypted app to app over [iroh](https://iroh.computer), with no VPN and no public endpoint, under permissions you sign with an ordinary SSH key. Every machine keeps each **boundary**'s data inside that boundary. The daemon and the operating system enforce that, never a model's judgment.
 
-**Status: 0.2.0, early.** It runs on Linux (systemd or OpenRC; one static binary for any distribution) and natively on Windows. The design and its open questions are in [docs/design.md](docs/design.md); this release is specified in [docs/spec-0.2.md](docs/spec-0.2.md). The project stays at 0.x until the maintainers declare it launched.
+**Status: 0.3.0, early.** It runs on Linux (systemd or OpenRC; one static binary for any distribution) and natively on Windows. The design and its open questions are in [docs/design.md](docs/design.md); 0.2 is specified in [docs/spec-0.2.md](docs/spec-0.2.md); 0.3 adds `tearmesh menu`, a rebuilt `tearmesh setup` and the MCP hub (see below). The project stays at 0.x until the maintainers declare it launched.
 
 **About the name:** in intelligence reporting, a *tear line* separates the classified part of a document from a cleaned-up summary that can be torn off and shared at a lower clearance. The hyphen in tear-mesh is that line.
 
@@ -32,7 +32,7 @@ Some overlap is real: machine bios resemble A2A Agent Cards and MCP registry met
   - the MCP servers you approved;
   - the owner keys.
 
-  You sign it with `ssh-keygen -Y sign`, and YubiKeys work. At least two owner keys are required, typically an everyday key and a portable one, so losing one doesn't lock you out. Versions form a hash chain: each one names the one before and is signed by an owner of it. A machine that missed versions gets each one. If two owners sign different versions at once:
+  You sign it with `ssh-keygen -Y sign`. At least two owner keys are required, so losing one doesn't lock you out: `tearmesh setup` makes an everyday key that stays on the owner node and a recovery key it shows once for you to keep somewhere safe. Any OpenSSH ed25519 key works, security keys included. Versions form a hash chain: each one names the one before and is signed by an owner of it. A machine that missed versions gets each one. If two owners sign different versions at once:
   - a version that removes the other's signer wins;
   - otherwise the one with more versions built on it wins;
   - otherwise the lower hash wins.
@@ -110,18 +110,21 @@ This installs `/usr/local/bin/tearmesh`, creates the `tearmesh` daemon user and 
 On the first machine, the **owner node**, create the mesh:
 
 ```sh
-tearmesh setup          # "Create a mesh": owner keys, a membership file listing this machine, signed and applied
+tearmesh setup          # create a mesh: makes two owner keys and shows each one to copy somewhere safe
+tearmesh menu           # full-screen: status, a live map, nodes, invites and approvals, settings
 ```
+
+Setup re-asks on bad input, takes `b` (back) and `q` (quit) at every prompt, and writes nothing until its last step, so stopping it (even with Ctrl-C) leaves the machine as it was. Run again on a machine that's set up, it says so and changes nothing unless you ask it to leave the mesh.
 
 Add each further machine with a one-time ticket:
 
 ```sh
 tearmesh mesh invite laptop --boundary work         # on the owner node: prints tm2-…
-sudo tearmesh join tm2-…                            # on the laptop: prints a 6-digit code and waits
-tearmesh mesh approve laptop --key ~/.ssh/tearmesh-owner   # on the owner node, after checking the codes match
+tearmesh setup                                      # on the laptop: choose join, paste the ticket; shows a 6-digit code
+tearmesh mesh approve laptop --key ~/.ssh/tearmesh-owner-home   # on the owner node, after checking the codes match
 ```
 
-Grant and revoke with `tearmesh mesh grant laptop workstation tools shell --key …` and `tearmesh mesh revoke …`. Remove a machine with `tearmesh mesh remove laptop --key …`. Every change is a new signed version, applied to the local daemon and gossiped from there.
+The menu does the same: Owner → I invites, A approves. Grant and revoke with `tearmesh mesh grant laptop workstation tools shell --key …` and `tearmesh mesh revoke …`. Remove a machine with `tearmesh mesh remove laptop --key …`. Every change is a new signed version, applied to the local daemon and gossiped from there.
 
 **Agents.** Install the Claude Code plugin for each boundary user. It adds the MCP tools `who`, `post`, `inbox`, `read` and `set_bio`, plus hooks that announce new letters:
 
@@ -129,6 +132,21 @@ Grant and revoke with `tearmesh mesh grant laptop workstation tools shell --key 
 claude plugin marketplace add /path/to/tear-mesh   # your clone; the boundary user must be able to read it
 claude plugin install tearmesh@tear-mesh
 tearmesh launch --boundary work --mailbox builder -- claude
+```
+
+**Any MCP client: the hub.** `tearmesh mcp serve` is one long-running MCP service per user. It has three channels, each working both ways: conversation (`post`, `inbox`, `read`, `wait_for_mail`, with new mail pushed to open sessions), tools on other machines (`offers`, `remote_tools`, `call_tool`) and shells on other machines (`shell_exec`, or `shell_open`/`shell_send`/`shell_read`/`shell_close`). It can also start chats in agent harnesses you configure (`harnesses`, `start_chat`, `chat_status`). Register it by URL, or by command for clients that only start processes:
+
+```sh
+tearmesh mcp info     # prints the URL, the bearer token and the commands below
+claude mcp add --transport http tearmesh http://127.0.0.1:<port>/mcp --header "Authorization: Bearer <token>"
+# Claude Desktop, Cursor and others that start a command: command `tearmesh`, args ["mcp", "connect"]
+```
+
+`mcp connect` connects to the running hub, or starts it; the hub stays running after the client exits. Only `serve` binds anything (the port doubles as its lock), so a client that starts its own copy can't collide with it. The HTTP door listens on 127.0.0.1 only and needs the token; the local socket admits only the same user. Each OS user gets its own port (picked from the user, 7787–8786; `mcp info` prints it). `~/.config/tearmesh/hub.toml` sets the `port`, the `mailbox` and the harnesses:
+
+```toml
+[harness.claude]
+command = ["claude", "-p", "{prompt}"]   # the default when claude is on the PATH
 ```
 
 **Share an MCP server.** As the boundary user on the machine that has the server, write `~/.config/tearmesh/offers.toml`:
@@ -174,7 +192,7 @@ wake_on = ["member", "admin"] # default; add "guest" to wake on letters from the
 
 The setup is in [docs/testing.md](docs/testing.md#the-claude-connector).
 
-**For people:** `tearmesh tui` is a terminal mail client. `tearmesh who | post | inbox | read | bio | offers` work from scripts.
+**For people:** `tearmesh menu` is the full-screen front end (arrow keys or the keypad, Enter, Esc, and a nano-style shortcut bar). `tearmesh tui` is a terminal mail client. `tearmesh who | post | inbox | read | bio | offers` work from scripts.
 
 ## Windows
 
@@ -216,6 +234,7 @@ Mesh-wide settings live in the membership file. Change them with `tearmesh mesh 
 [docs/testing.md](docs/testing.md) has the full walkthrough.
 - `cargo test`: unit tests and in-process mesh tests over real iroh connections. They cover placement, membership, revocation, the version chain and split healing, ticket joins, converse, tool and shell grants, and carrying a 0.1 circle over.
 - `tests/e2e-linux.sh`: two daemons with real OS users. It covers the ticket join, a tool call through the steward, shell, bios, the connector, the waker and the TUI.
+- `tests/e2e-0.3.sh`: three daemons, trying to break 0.3: the setup wizard (bad input, run twice, stopped halfway), the hub (connect-or-start, one per user, auth, all three channels both ways, chats), a stolen machine key, a leaked owner key, a node dropping mid-session, the owner offline, a flapping peer, and the menu.
 - `tests/distros.sh`: the same in Debian, Ubuntu, Fedora, Arch, openSUSE and Alpine containers.
 - `tests/e2e-windows.ps1`: the Windows version.
 

@@ -56,6 +56,16 @@ PODMAN="sudo podman" tests/distros.sh      # the same in six distributions' cont
 
 It prints `PASS` or `FAIL` for each check and ends with `ALL PASSED`.
 
+**`tests/e2e-0.3.sh`** runs three daemons (`own`, the owner node, `mem` and `far`) with real OS users (`tme3-own`, `tme3-mem`, `tme3-far`, `tme3-x`) and tries to break 0.3. It covers:
+- setup: re-asking on bad choices, names and tickets; binary junk and closed input; both keys shown with "Copy this and put it somewhere safe"; the recovery key working; running twice changes nothing; Ctrl-C and `kill -9` halfway leave nothing behind (the next run cleans the killed run's temporary keys); joining through the wizard with the code matching;
+- the ping protocol behind the map, admin only;
+- the hub: `mcp connect` starts it, it outlives the client, a second `serve` exits, six clients starting it at once leave one hub, a client's own stdio copy runs beside it; private socket directory and token; HTTP refused without the token, with a wrong one or a prefix, and from a foreign `Host`;
+- conversation both ways, with `wait_for_mail` and the push to an open session; tool calls both ways, refused without a grant; shell commands both ways through the real sshd, refused without a grant, with option smuggling refused; an open shell kept across client sessions; harness chats, with the prompt passed as one argument and chat ids that can't name files;
+- oversized and junk input to the daemon, the hub socket and the hub's HTTP;
+- a node dying mid-shell and mid-call, the owner offline (members still mail each other; joins fail with a reason), a member restarting ten times while letters keep coming (each arrives once);
+- a stolen node key, revoked: it reaches nobody afterwards and its letters never arrive; a leaked owner key replaced and removed: its signatures are refused by the owner node and by a member; the recovery key still signs;
+- the menu through tmux: role detection, the Owner tab only on an owner node, the map, the nodes table, the shortcut bar, the invite form's checks.
+
 **`tests/distros.sh`** runs that script and `deploy/setup-linux.sh` in Debian 13, Ubuntu 24.04, Fedora 42, Arch, openSUSE Tumbleweed and Alpine 3.22 containers, on the static musl binary. Name images as arguments to test others.
 
 **`tests/e2e-windows.ps1`** is the Windows version, for an elevated PowerShell on Windows Server or Windows 11. See [Windows](#windows).
@@ -86,22 +96,23 @@ For a Windows beta, see [Windows](#windows).
 tearmesh setup
 ```
 
-Choose **c**. It asks for:
-- a mesh name;
-- an everyday owner key: an existing key, or a new `~/.ssh/tearmesh-owner`. Give it a passphrase; the wizard refuses a key without one;
-- a portable owner key: a security key (it creates a resident key that needs your PIN), or a key file for a removable drive.
+Choose **1** (create). It asks for a mesh name, then makes two owner keys and shows each one in full with **"Copy this and put it somewhere safe."**:
+- the everyday key, which stays at `~/.ssh/tearmesh-owner-<mesh>`. Give it a passphrase; the wizard makes it again if you don't;
+- the recovery key, which is shown once and then deleted from alpha. It's your way back in if alpha is lost or its key leaks.
 
-It writes `<name>-mesh.toml` listing alpha, signs it with the everyday key, and applies it. `tearmesh status` shows version 1 or 2 and alpha's boundaries.
+Type `saved` after copying each. It then signs a membership file listing alpha with the everyday key and applies it. `tearmesh status` (or `tearmesh menu`) shows the mesh and alpha's boundaries.
+
+Things to try: a bad answer at any prompt (it asks again), `b` to go back, `q` or Ctrl-C partway (nothing is written; run it again), and running it a second time (it says alpha is set up and changes nothing).
 
 <details><summary>The same by hand</summary>
 
 ```sh
-ssh-keygen -t ed25519 -a 100 -f ~/.ssh/tearmesh-owner
-ssh-keygen -t ed25519-sk -O resident -O verify-required -f ~/.ssh/tearmesh-portable   # or a key file
+ssh-keygen -t ed25519 -a 100 -f ~/.ssh/tearmesh-owner-test
+ssh-keygen -t ed25519 -a 100 -f ./recovery      # copy it somewhere safe, then delete it
 tearmesh mesh new mesh.toml --name test \
-  --owner-key ~/.ssh/tearmesh-owner.pub --owner-key ~/.ssh/tearmesh-portable.pub \
+  --owner-key ~/.ssh/tearmesh-owner-test.pub --owner-key ./recovery.pub \
   --boundary work --boundary vault
-tearmesh mesh add alpha <alpha-node-id> --boundary work --boundary vault --file mesh.toml --key ~/.ssh/tearmesh-owner
+tearmesh mesh add alpha <alpha-node-id> --boundary work --boundary vault --file mesh.toml --key ~/.ssh/tearmesh-owner-test
 tearmesh mesh apply mesh.toml
 ```
 </details>
@@ -112,10 +123,10 @@ tearmesh mesh apply mesh.toml
 # alpha
 tearmesh mesh invite beta --boundary work      # prints tm2-…, valid for an hour (--expires 1d)
 # beta
-tearmesh join tm2-…                             # prints "code 123456" and waits
+tearmesh setup                                  # choose 2 (join), paste the ticket: prints "Code 123456" and waits
 # alpha
-tearmesh mesh pending                           # shows beta and its code
-tearmesh mesh approve beta --key ~/.ssh/tearmesh-owner
+tearmesh mesh pending                           # shows beta and its code (or: tearmesh menu, Owner screen)
+tearmesh mesh approve beta --key ~/.ssh/tearmesh-owner-test
 ```
 
 Approve only if both codes match. Beta prints `joined; mesh version …`. Within about 30 seconds, `tearmesh status` on either machine shows the other with a `last_sync_ms`.

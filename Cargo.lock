@@ -4404,13 +4404,15 @@ dependencies = [
 
 [[package]]
 name = "tearmesh"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
  "blake3",
+ "bytes",
  "clap",
  "getrandom 0.4.3",
+ "http-body-util",
  "hyper",
  "hyper-util",
  "iroh",
@@ -4425,6 +4427,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "toml",
+ "tower-service",
  "tracing",
  "tracing-subscriber",
  "windows-service",

@@ -49,6 +49,28 @@ pub async fn connect(path: &Path) -> Result<(BoxRead, BoxWrite)> {
     Ok((Box::new(r), Box::new(w)))
 }
 
+/// Connects to a socket of this user's own (the MCP hub's). Its directory is private to this
+/// user, so nobody else can have put a socket there.
+pub async fn connect_mine(path: &Path) -> Result<(BoxRead, BoxWrite)> {
+    let s = UnixStream::connect(path)
+        .await
+        .with_context(|| format!("connecting to {}", path.display()))?;
+    // The directory should already rule out a socket planted by someone else; check anyway.
+    let uid = s.peer_cred()?.uid();
+    anyhow::ensure!(
+        uid == nix::unistd::geteuid().as_raw(),
+        "{} belongs to uid {uid}, not to you",
+        path.display()
+    );
+    let (r, w) = s.into_split();
+    Ok((Box::new(r), Box::new(w)))
+}
+
+/// This process's identity, in the form `Caller::id` takes.
+pub fn my_identity() -> Result<String> {
+    Ok(nix::unistd::geteuid().as_raw().to_string())
+}
+
 pub fn user_identity(name: &str) -> Result<String> {
     let u = nix::unistd::User::from_name(name)?.context("no such user")?;
     Ok(u.uid.as_raw().to_string())

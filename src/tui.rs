@@ -425,7 +425,7 @@ fn field_mut(c: &mut Compose) -> &mut String {
 }
 
 /// "now", "45s", "12m", "3h", "5d" since a unix-ms timestamp.
-fn age(ts: u64) -> String {
+pub(crate) fn age(ts: u64) -> String {
     let s = crate::now_ms().saturating_sub(ts) / 1000;
     match s {
         0..=4 => "now".into(),

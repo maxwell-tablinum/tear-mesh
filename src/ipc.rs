@@ -84,6 +84,8 @@ pub enum Request {
     },
     // ---- admin ----
     Status,
+    /// Dials every other machine and reports which answer (`ping::Ping` for each).
+    Ping,
     /// The current membership file, for editing and signing.
     MeshCurrent,
     ApplyMesh {
@@ -391,6 +393,10 @@ async fn handle(
                 }
             }
             Request::Status => need_admin().and_then(|_| Ok(serde_json::to_value(node.status())?)),
+            Request::Ping => match need_admin() {
+                Ok(()) => crate::ping::all(&node).await.and_then(|p| Ok(serde_json::to_value(p)?)),
+                Err(e) => Err(e),
+            },
             Request::MeshCurrent => need_admin().and_then(|_| {
                 let s = node.signed()?;
                 Ok(json!({ "toml": s.toml, "sig": s.sig }))

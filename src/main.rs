@@ -53,6 +53,8 @@ enum Cmd {
     Join { ticket: String },
     /// Daemon status (admin).
     Status,
+    /// Ping every other machine in the mesh: which answer, and how fast (admin).
+    Ping,
     /// Your address, the machines in your boundary with their bios and offers, known addresses.
     Who,
     /// Send a letter. `--body -` reads the body from stdin.
@@ -77,6 +79,8 @@ enum Cmd {
     },
     /// Show a letter and mark it read.
     Read { id: String },
+    /// Full-screen menu: status, a live map of the mesh, nodes, setup and owner actions.
+    Menu,
     /// Terminal mail client for your mailbox (TEARMESH_MAILBOX, default `admin`).
     Tui {
         #[arg(long)]
@@ -97,6 +101,8 @@ enum Cmd {
     /// MCP server for agent harnesses: stdio mail tools, a shim for a remote server, or the
     /// HTTP connector.
     Mcp {
+        #[command(subcommand)]
+        hub: Option<HubCmd>,
         /// Be a shim for `<machine>/<server>`, another machine's offered server.
         #[arg(long, conflicts_with = "http")]
         remote: Option<String>,
@@ -244,7 +250,9 @@ enum MeshCmd {
     },
     /// Add an owner key (an OpenSSH .pub file).
     OwnerAdd {
-        key: PathBuf,
+        /// The new key's OpenSSH public key file (.pub).
+        #[arg(value_name = "PUBKEY")]
+        pubkey: PathBuf,
         #[command(flatten)]
         edit: Edit,
     },
@@ -294,6 +302,17 @@ enum MeshCmd {
         #[arg(long)]
         yes: bool,
     },
+}
+
+/// The MCP hub: one long-running MCP service per user, for any client.
+#[derive(Subcommand)]
+enum HubCmd {
+    /// Run the hub (HTTP on 127.0.0.1 plus a private socket). Exits if one is already running.
+    Serve,
+    /// stdio for clients that start a command: connect to the hub, starting it if needed.
+    Connect,
+    /// The hub's URL, token and how to register it with clients.
+    Info,
 }
 
 #[derive(Subcommand)]
@@ -369,7 +388,7 @@ async fn run(cmd: Cmd) -> Result<()> {
             let cfg = Config::load(&config)?;
             println!("{}", load_or_create_key(&cfg.state_dir)?.public());
         }
-        Cmd::Setup { config } => setup(&config).await?,
+        Cmd::Setup { config } => tearmesh::setup::run(&config).await?,
         Cmd::Mesh(c) => mesh_cmd(c).await?,
         Cmd::Join { ticket } => {
             let mut c = Client::connect(&socket_path()).await?;
@@ -387,6 +406,15 @@ async fn run(cmd: Cmd) -> Result<()> {
             "{}",
             serde_json::to_string_pretty(&admin(Request::Status).await?)?
         ),
+        Cmd::Ping => {
+            let p: Vec<tearmesh::ping::Ping> = serde_json::from_value(admin(Request::Ping).await?)?;
+            for x in p {
+                match x.rtt_ms {
+                    Some(r) => println!("{:<20} up    {r} ms (dial {} ms)", x.name, x.dial_ms.unwrap_or(0)),
+                    None => println!("{:<20} DOWN  {}", x.name, x.error.unwrap_or_default()),
+                }
+            }
+        }
         Cmd::Who => println!(
             "{}",
             serde_json::to_string_pretty(&session(Request::Who).await?)?
@@ -451,6 +479,7 @@ async fn run(cmd: Cmd) -> Result<()> {
             println!("\n{}", l.body.unwrap_or_default());
         }
         Cmd::Tui { mailbox } => tui::run(mailbox).await?,
+        Cmd::Menu => tearmesh::menu::run().await?,
         Cmd::Bio(BioCmd::Show { machine }) => {
             let who: Who = serde_json::from_value(session(Request::Who).await?)?;
             for m in who.machines {
@@ -509,7 +538,14 @@ async fn run(cmd: Cmd) -> Result<()> {
             };
             println!("{}", serde_json::to_string_pretty(&v)?);
         }
-        Cmd::Mcp { remote, http } => match (remote, http) {
+        Cmd::Mcp {
+            hub: Some(h), ..
+        } => match h {
+            HubCmd::Serve => tearmesh::hub::serve().await?,
+            HubCmd::Connect => tearmesh::hub::connect().await?,
+            HubCmd::Info => tearmesh::hub::info()?,
+        },
+        Cmd::Mcp { remote, http, .. } => match (remote, http) {
             (Some(target), _) => mcp::remote(&target).await?,
             (None, Some(path)) => connector(path).await?,
             (None, None) => mcp::run().await?,
@@ -830,8 +866,8 @@ async fn mesh_cmd(cmd: MeshCmd) -> Result<()> {
             })
             .await?
         }
-        MeshCmd::OwnerAdd { key, edit: e } => {
-            let k = std::fs::read_to_string(key)?.trim().to_string();
+        MeshCmd::OwnerAdd { pubkey, edit: e } => {
+            let k = std::fs::read_to_string(pubkey)?.trim().to_string();
             edit(e, |m| {
                 m.owners.push(k);
                 Ok(())
@@ -919,7 +955,7 @@ async fn mesh_cmd(cmd: MeshCmd) -> Result<()> {
             if !yes && !confirm("Does the new machine show the same code? Approve and sign?")? {
                 bail!("not approved");
             }
-            let dir = private_dir()?;
+            let dir = tearmesh::setup::private_dir("tearmesh-")?;
             let e = Edit {
                 file: None,
                 out: Some(dir.join(format!("{name}.toml"))),
@@ -953,172 +989,6 @@ async fn mesh_cmd(cmd: MeshCmd) -> Result<()> {
     Ok(())
 }
 
-async fn setup(config: &Path) -> Result<()> {
-    let cfg = Config::load(config).with_context(|| {
-        format!(
-            "{} not found or invalid: install the daemon first (deploy/setup-linux.sh or deploy/setup-windows.ps1)",
-            config.display()
-        )
-    })?;
-    let ask = |q: &str| -> Result<String> {
-        eprint!("{q} ");
-        std::io::stderr().flush()?;
-        let mut a = String::new();
-        std::io::stdin().lock().read_line(&mut a)?;
-        Ok(a.trim().to_string())
-    };
-    let choice = ask("Create a mesh (c) or join one (j)?")?;
-    if choice.starts_with('j') {
-        let ticket = ask("Paste the ticket from the owner node:")?;
-        return Box::pin(run(Cmd::Join { ticket })).await;
-    }
-    ensure!(choice.starts_with('c'), "answer c or j");
-    let name = ask("Name for the mesh (a-z, 0-9, -):")?;
-    let boundaries: Vec<String> = {
-        let mut b: Vec<String> = cfg.users.values().cloned().collect();
-        b.sort();
-        b.dedup();
-        b
-    };
-    ensure!(
-        !boundaries.is_empty(),
-        "the config maps no users to boundaries"
-    );
-    let ssh = tearmesh::os::home_dir().join(".ssh");
-    std::fs::create_dir_all(&ssh)?;
-    eprintln!(
-        "\nOwner keys sign every change to the mesh. You need two: an everyday key on this machine and a portable one."
-    );
-    let everyday = ask(&format!(
-        "Everyday owner key (path to an existing private key, or Enter to create {}):",
-        ssh.join("tearmesh-owner").display()
-    ))?;
-    let everyday = if everyday.is_empty() {
-        let p = ssh.join("tearmesh-owner");
-        eprintln!(
-            "Creating {} (choose a passphrase: any process running as you could otherwise sign with it)",
-            p.display()
-        );
-        keygen(&["-t", "ed25519", "-a", "100", "-C", "tearmesh owner"], &p)?;
-        p
-    } else {
-        PathBuf::from(everyday)
-    };
-    ensure!(
-        !std::process::Command::new("ssh-keygen")
-            .args(["-y", "-P", ""])
-            .arg("-f")
-            .arg(&everyday)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()?
-            .success()
-            || is_sk(&everyday),
-        "{} has no passphrase; any process running as you could sign with it. Add one with `ssh-keygen -p -f {}`",
-        everyday.display(),
-        everyday.display()
-    );
-    let kind = ask(
-        "Portable key: a security key such as a YubiKey (s, recommended) or a key file on removable media (f)?",
-    )?;
-    let portable = if kind.starts_with('s') {
-        let p = ssh.join("tearmesh-portable-sk");
-        eprintln!("Touch the security key when it blinks; set a PIN when asked.");
-        keygen(
-            &[
-                "-t",
-                "ed25519-sk",
-                "-O",
-                "resident",
-                "-O",
-                "verify-required",
-                "-C",
-                "tearmesh portable",
-            ],
-            &p,
-        )?;
-        p
-    } else {
-        let p = PathBuf::from(ask("Path for the key file (on the removable drive):")?);
-        keygen(
-            &["-t", "ed25519", "-a", "100", "-C", "tearmesh portable"],
-            &p,
-        )?;
-        eprintln!("Keep {} off this machine and never email it.", p.display());
-        p
-    };
-    let pubkey = |p: &Path| -> Result<String> {
-        Ok(std::fs::read_to_string(pub_path(p))?.trim().to_string())
-    };
-    let mut m = Mesh::new(
-        &name,
-        vec![pubkey(&everyday)?, pubkey(&portable)?],
-        boundaries.clone(),
-        None,
-    )?;
-    let status = admin(Request::Status).await?;
-    let id = status["node_id"]
-        .as_str()
-        .context("the daemon didn't report its node id")?
-        .parse()
-        .map_err(|e| anyhow::anyhow!("node id: {e}"))?;
-    m.add_machine(
-        Machine {
-            name: cfg.machine.clone(),
-            id,
-            boundaries,
-        },
-        false,
-    )?;
-    let file = PathBuf::from(format!("{name}-mesh.toml"));
-    std::fs::write(&file, m.to_toml()?)?;
-    ssh_sign(&everyday, &file)?;
-    apply_file(&file).await?;
-    eprintln!(
-        "\nMesh {name} created with this machine ({}) in it. Add machines with `tearmesh mesh invite <name> --boundary <b>`.",
-        cfg.machine
-    );
-    Ok(())
-}
-
-/// A new directory only this user can enter, for files that get signed: in a shared temp
-/// directory another user could swap a file between writing and signing.
-fn private_dir() -> Result<PathBuf> {
-    let mut r = [0u8; 8];
-    getrandom::fill(&mut r).map_err(|e| anyhow::anyhow!("random: {e}"))?;
-    let d = std::env::temp_dir().join(format!("tearmesh-{}", tearmesh::envelope::hex(&r)));
-    #[cfg(unix)]
-    std::os::unix::fs::DirBuilderExt::mode(&mut std::fs::DirBuilder::new(), 0o700).create(&d)?;
-    // Windows temp directories are already private to their user.
-    #[cfg(not(unix))]
-    std::fs::DirBuilder::new().create(&d)?;
-    Ok(d)
-}
-
-/// `key.pub` next to `key`, as ssh-keygen names it.
-fn pub_path(key: &Path) -> PathBuf {
-    let mut s = key.as_os_str().to_owned();
-    s.push(".pub");
-    s.into()
-}
-
-fn is_sk(key: &Path) -> bool {
-    std::fs::read_to_string(pub_path(key)).is_ok_and(|k| k.starts_with("sk-"))
-}
-
-fn keygen(args: &[&str], path: &Path) -> Result<()> {
-    ensure!(!path.exists(), "{} already exists", path.display());
-    let ok = std::process::Command::new("ssh-keygen")
-        .args(args)
-        .arg("-f")
-        .arg(path)
-        .status()
-        .context("running ssh-keygen")?
-        .success();
-    ensure!(ok, "ssh-keygen failed");
-    Ok(())
-}
-
 fn launch(boundary: &str, mailbox: Option<&str>, config: &Path, command: &[String]) -> Result<()> {
     let cfg = Config::load(config)?;
     let user = cfg.boundary_user(boundary).with_context(|| {
@@ -1135,4 +1005,13 @@ fn launch(boundary: &str, mailbox: Option<&str>, config: &Path, command: &[Strin
         env.push(("TEARMESH_MAILBOX".into(), m.into()));
     }
     tearmesh::os::launch(user, &env, command)
+}
+
+#[cfg(test)]
+mod cli_tests {
+    #[test]
+    fn every_subcommand_parses() {
+        // Catches clashing argument names (owner-add's KEY once collided with --key).
+        <super::Cli as clap::CommandFactory>::command().debug_assert();
+    }
 }
