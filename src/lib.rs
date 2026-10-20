@@ -10,6 +10,7 @@ pub mod connector;
 pub mod envelope;
 pub mod hook;
 pub mod hub;
+pub mod install;
 pub mod ipc;
 pub mod join;
 pub mod keys;

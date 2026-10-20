@@ -46,6 +46,24 @@ enum Cmd {
         #[arg(long, env = "TEARMESH_CONFIG", default_value = DEFAULT_CONFIG)]
         config: PathBuf,
     },
+    /// Install tear-mesh on this machine (root, or an elevated prompt on Windows): the service, a
+    /// user per boundary (tm-<boundary>), the config and the Claude Code plugin. Run it again to
+    /// upgrade or to add boundaries.
+    Install {
+        /// This machine's name in the mesh.
+        machine: String,
+        #[arg(required = true)]
+        boundaries: Vec<String>,
+        /// Start a steward per boundary user (systemd, or a scheduled task on Windows).
+        #[arg(long)]
+        stewards: bool,
+    },
+    /// Remove tear-mesh from this machine, and the users of the boundaries given.
+    Uninstall {
+        boundaries: Vec<String>,
+        #[arg(long)]
+        yes: bool,
+    },
     /// The membership file: machines, grants, approvals, owners (admin).
     #[command(subcommand)]
     Mesh(MeshCmd),
@@ -446,6 +464,19 @@ async fn run(cmd: Cmd) -> Result<()> {
         }
         Cmd::Setup { config } => tearmesh::setup::run(&config).await?,
         Cmd::Mesh(c) => mesh_cmd(c).await?,
+        Cmd::Install { machine, boundaries, stewards } => tearmesh::install::install(&machine, &boundaries, stewards)?,
+        Cmd::Uninstall { boundaries, yes } => {
+            let users: Vec<String> = boundaries.iter().map(|b| format!("tm-{b}")).collect();
+            if !yes
+                && !confirm(&format!(
+                    "Remove tear-mesh from this machine: the service, its config and state, the plugin{}?",
+                    if users.is_empty() { String::new() } else { format!(", and users {} with their homes", users.join(", ")) }
+                ))?
+            {
+                bail!("not removed");
+            }
+            tearmesh::install::uninstall(&boundaries)?
+        }
         Cmd::Join { cancel: true, .. } => {
             let v = admin(Request::JoinCancel).await?;
             println!("{}", if v["cancelled"] == true { "cancelled" } else { "no join was running" });

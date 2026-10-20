@@ -2,10 +2,11 @@
 # End to end for 0.3 on one Linux box, trying to break things: the setup wizard (bad input,
 # running twice, stopping halfway), the MCP hub (connect-or-start, one service per user, auth,
 # all three channels both ways, harness chats), a stolen machine key and a leaked owner key, a
-# node dropping mid-session, the owner offline, a flapping peer, and the menu. Three daemons
+# node dropping mid-session, the owner offline, a flapping peer, and the menu, including a mesh
+# created, joined and approved without leaving it. Three daemons
 # stand in for three machines: "own" (the owner node), "mem" and "far", on the default network.
 # Needs passwordless sudo, python3, curl, tmux, and a local sshd on port 22 that takes keys.
-# Creates and removes the users tme3-own, tme3-mem, tme3-far and tme3-x.
+# Creates and removes the users tme3-own, tme3-mem, tme3-far, tme3-x and tme3-lab.
 # Usage: cargo build --release && tests/e2e-0.3.sh
 set -uo pipefail
 BIN=${TEARMESH_BIN:-$(cd "$(dirname "$0")/.." && pwd)/target/release/tearmesh}
@@ -13,7 +14,7 @@ BIN=${TEARMESH_BIN:-$(cd "$(dirname "$0")/.." && pwd)/target/release/tearmesh}
 cd /
 T=$(mktemp -d /tmp/tm-e3.XXXX)
 chmod 0755 "$T"
-USERS="tme3-own tme3-mem tme3-far tme3-x"
+USERS="tme3-own tme3-mem tme3-far tme3-x tme3-lab"
 FAILED=0
 cleanup() {
   kill $(jobs -p) 2>/dev/null
@@ -37,7 +38,9 @@ my_setup_dirs() { find /tmp -maxdepth 1 -name 'tearmesh-setup-*' -user "$(id -un
 for u in $USERS; do sudo useradd --create-home --shell /bin/bash "$u" && sudo chmod 0700 "/home/$u"; done
 cp "$BIN" "$T/tearmesh" && chmod 0755 "$T/tearmesh"
 TM=$T/tearmesh
-printf '#!/bin/sh\necho e2e-passphrase\n' >"$T/askpass" && chmod 0755 "$T/askpass"
+# ssh-keygen (the CLI's signer) reads the passphrase from here; the recovery key has its own.
+echo e2e-passphrase >"$T/pass"
+printf '#!/bin/sh\ncat %s/pass\n' "$T" >"$T/askpass" && chmod 0755 "$T/askpass"
 export SSH_ASKPASS=$T/askpass SSH_ASKPASS_REQUIRE=force DISPLAY=none
 
 for n in own mem far; do
@@ -60,21 +63,27 @@ version() { on "$1" status | python3 -c 'import json,sys;print(json.load(sys.std
 mkdir -p "$T/h-own" "$T/h-mem" "$T/h-far"
 
 echo "== setup"
-OUT=$(printf 'x\n3\n1\nBad Name\n-home\nhome\nnope\nsaved\nsaved\ny\n' | setup own "$T/h-own" 2>&1)
+OUT=$(printf 'x\n3\n1\nBad Name\n-home\nhome\nshort\nshort\ne2e-passphrase\nother-one\ne2e-passphrase\ne2e-passphrase\nnope\nsaved\ny\n' | setup own "$T/h-own" 2>&1)
 check "setup re-asks on a bad choice" has "isn't one of the choices" "$OUT"
 check "setup re-asks on a bad mesh name" has 'use 1–32 characters' "$OUT"
+check "setup refuses a short passphrase" has '8 characters' "$OUT"
+check "setup refuses passphrases that differ" has 'passphrases differ' "$OUT"
 check "setup waits for the word saved" has 'type the word saved' "$OUT"
-check "both keys are shown with the instruction" test "$(grep -c 'Copy this and put it somewhere safe.' <<<"$OUT")" = 2
-check "the keys are shown in full" test "$(grep -c 'BEGIN OPENSSH PRIVATE KEY' <<<"$OUT")" = 2
+check "only the recovery key is shown, once" test "$(grep -c 'BEGIN OPENSSH PRIVATE KEY' <<<"$OUT")" = 1
+check "  with the instruction" has 'Save both somewhere off this machine' "$OUT"
 check "setup creates the mesh" has 'Mesh home is created' "$OUT"
 OWNER=$T/h-own/.ssh/tearmesh-owner-home
 check "the everyday key is in ~/.ssh, private" test "$(stat -c %a "$OWNER" 2>/dev/null)" = 600
 check "the everyday key has a passphrase" refused "" ssh-keygen -y -P '' -f "$OWNER"
+check "  the one given at setup" bash -c "ssh-keygen -y -P e2e-passphrase -f $OWNER >/dev/null"
 check "only one private key is left on the machine" test "$(ls "$T/h-own/.ssh" | grep -vc '\.pub$')" = 1
 check "no setup leftovers in the temp directory" test "$(my_setup_dirs)" = 0
-awk '/^──── Key 2 of 2/{f=1;next} f&&/^────/{exit} f' <<<"$OUT" >"$T/recovery"
+awk '/^──── Recovery key/{f=1;next} f&&/^────/{exit} f' <<<"$OUT" >"$T/recovery"
 chmod 600 "$T/recovery"
-check "the shown recovery key is a working key" bash -c "ssh-keygen -y -P e2e-passphrase -f $T/recovery >/dev/null"
+RECPASS=$(awk '/^──── Its passphrase/{getline; print; exit}' <<<"$OUT")
+check "the recovery passphrase is six words" bash -c "[[ '$RECPASS' =~ ^[a-z]+(-[a-z]+){5}\$ ]]"
+check "the shown recovery key opens with its own passphrase" bash -c "ssh-keygen -y -P '$RECPASS' -f $T/recovery >/dev/null"
+check "  and not with the everyday one" refused "" ssh-keygen -y -P e2e-passphrase -f "$T/recovery"
 V1=$(version own)
 OUT=$(printf '\n' | setup own "$T/h-own" 2>&1)
 check "setup again: says it's set up" has 'is already set up: mesh home' "$OUT"
@@ -85,13 +94,13 @@ head -c 4000 /dev/urandom | tr -d '\000' >"$T/junk"
 check "setup survives binary junk on its input" bash -c "env HOME=$T/h-mem TEARMESH_SOCKET=$T/mem.sock $TM setup --config $T/mem.toml <$T/junk >/dev/null 2>&1"
 check "  and the junk created no mesh" has '"mesh": null' "$(on mem status)"
 
-# Stop halfway: Ctrl-C after the first key is shown, then a hard kill.
+# Stop halfway: Ctrl-C at the passphrase, then a hard kill.
 mkfifo "$T/in"
 exec 7<>"$T/in"
 env HOME="$T/h-mem" TEARMESH_SOCKET="$T/mem.sock" "$TM" setup --config "$T/mem.toml" <"$T/in" >"$T/half.out" 2>&1 &
 HALF=$!
 printf '1\nhalfway\n' >&7
-wait_for grep -q 'Type `saved`' "$T/half.out"
+wait_for grep -q 'Passphrase:' "$T/half.out"
 kill -INT $HALF; wait $HALF
 check "Ctrl-C mid-setup says nothing changed" grep -q 'Setup stopped. Nothing was changed' "$T/half.out"
 check "Ctrl-C mid-setup leaves no key" test ! -e "$T/h-mem/.ssh/tearmesh-owner-halfway"
@@ -99,22 +108,23 @@ check "Ctrl-C mid-setup leaves no temp keys" test "$(my_setup_dirs)" = 0
 check "Ctrl-C mid-setup leaves no mesh" has '"mesh": null' "$(on mem status)"
 env HOME="$T/h-mem" TEARMESH_SOCKET="$T/mem.sock" "$TM" setup --config "$T/mem.toml" <"$T/in" >"$T/half2.out" 2>&1 &
 HALF=$!
-printf '1\nhalfway\n' >&7
+printf '1\nhalfway\ne2e-passphrase\ne2e-passphrase\n' >&7
 wait_for grep -q 'Type `saved`' "$T/half2.out"
 kill -KILL $HALF; wait $HALF 2>/dev/null
-check "a killed setup leaves a temp directory (it can't clean up)" test "$(my_setup_dirs)" -ge 1
-# Rerun and join this time, giving a bad and a cut ticket first.
-TICKET=$(on own mesh invite mem --boundary work 2>/dev/null)
+check "a killed setup leaves nothing behind (keys live in memory until the end)" \
+  bash -c "test ! -e $T/h-mem/.ssh/tearmesh-owner-halfway && test \$(find /tmp -maxdepth 1 -name 'tearmesh-setup-*' -user $(id -un) | wc -l) = 0"
+# Rerun and join this time, giving a bad and a cut ticket first. The ticket names no machine.
+TICKET=$(on own mesh invite 2>"$T/invite.err")
+check "invite's hint points at the menu and setup" grep -q 'tearmesh menu' "$T/invite.err"
 env HOME="$T/h-mem" TEARMESH_SOCKET="$T/mem.sock" "$TM" setup --config "$T/mem.toml" <"$T/in" >"$T/join.out" 2>&1 &
 JOIN=$!
 printf '2\nhello\ntm2-cut\n%s\n' "$TICKET" >&7
 pending() { on own mesh pending 2>/dev/null | grep -q "^$1  code"; }
 check "the rerun's join request reaches the owner" wait_for pending mem
-check "the rerun cleaned up the killed run's temp directory" test "$(my_setup_dirs)" = 0
 check "a bad ticket is re-asked" grep -q 'a ticket starts with tm2-' "$T/join.out"
 check "a cut ticket is re-asked" grep -q 'too short' "$T/join.out"
 CODE=$(on own mesh pending | grep -o 'code [0-9]\{6\}' | cut -d' ' -f2)
-on own mesh approve mem --key "$OWNER" --yes >/dev/null 2>&1
+check "approve finds the owner key itself" has 'applied mesh version' "$(env HOME=$T/h-own TEARMESH_SOCKET=$T/own.sock $TM mesh approve mem --yes 2>&1)"
 wait $JOIN
 exec 7>&-
 check "mem joins through the wizard" grep -q 'Joined. Mesh version' "$T/join.out"
@@ -125,6 +135,8 @@ FARJ=$!
 wait_for pending far
 on own mesh approve far --key "$OWNER" --yes >/dev/null 2>&1
 wait $FARJ
+check "a home with no owner key is refused with the fingerprints" refused "no owner key for mesh home" \
+  env HOME=$T/h-far TEARMESH_SOCKET=$T/own.sock $TM mesh boundary add lab --out "$T/b0.toml"
 check "setup on a member says member" has 'It is a member' "$(printf '\n' | setup mem "$T/h-mem" 2>&1)"
 
 echo "== ping and the map"
@@ -374,7 +386,13 @@ on far mesh show >"$T/far-cur.toml" 2>/dev/null
 check "a member refuses it too" refused "owner" on far mesh grant far own shell --file "$T/far-cur.toml" --out "$T/o4.toml" --key "$OWNER"
 ssh-keygen -q -t ed25519 -N '' -f "$T/rando"
 check "a random key can't sign changes" refused "owner" on own mesh grant far own shell --key "$T/rando" --out "$T/o5.toml"
+echo "$RECPASS" >"$T/pass"
 check "the recovery key from setup still signs" has 'applied mesh version' "$(on own mesh set tools-sharing approval --key "$T/recovery" --out "$T/o6.toml" 2>&1)"
+check "a boundary can be added, hosted by a machine, in one version" has 'applied mesh version' "$(on own mesh boundary add lab --host far --key "$T/recovery" --out "$T/o7.toml" 2>&1)"
+hosts_of() { env TEARMESH_SOCKET="$T/$1.sock" "$TM" mesh show | python3 -c "import sys,tomllib;print(','.join(next(m['boundaries'] for m in tomllib.load(sys.stdin.buffer)['machine'] if m['name']=='$2')))"; }
+check "  and far hosts it" test "$(hosts_of own far)" = "work,lab"
+check "hosts sets a machine's boundaries back" has 'applied mesh version' "$(on own mesh hosts far work --key "$T/recovery" --out "$T/o8.toml" 2>&1)"
+echo e2e-passphrase >"$T/pass"
 
 echo "== the menu"
 TMX="tmux -S $T/tmux"
@@ -393,16 +411,103 @@ $TMX send-keys -t m Right
 check "nodes lists the machines" wait_for pane_has "this machine"
 check "the shortcut bar changed with the screen" pane_has "Disconnect"
 $TMX send-keys -t m c
-check "C opens the invite form" wait_for pane_has "Connect a new machine"
+check "C opens the invite form" wait_for pane_has "Invite a machine"
 $TMX send-keys -t m Enter
-check "an empty name is refused in the form" wait_for pane_has "name: use a-z"
-$TMX send-keys -t m Escape q
+check "an empty form makes a ticket, shown in the menu" wait_for pane_has "Ticket for a new machine"
+check "  with the ticket itself" pane_has "^tm2-"
+$TMX send-keys -t m Enter Escape
+# Ctrl-C in a program the menu runs stops that program, not the menu.
+$TMX send-keys -t m S
+check "S runs status in the plain terminal" wait_for pane_has "Press Enter to return"
+$TMX send-keys -t m C-c
+sleep 1
+check "Ctrl-C there leaves the menu running" $TMX has-session -t m
+$TMX send-keys -t m Enter
+check "  and Enter comes back to it" wait_for pane_has "OWNER NODE"
+$TMX send-keys -t m q
 sleep 1
 $TMX new-session -d -s f -x 140 -y 40 "env HOME=$T/h-far TEARMESH_SOCKET=$T/far.sock $TM menu"
 pane_f() { $TMX capture-pane -p -t f 2>/dev/null | grep -q -- "$1"; }
 check "on a machine without an owner key, menu says member" wait_for pane_f "MEMBER"
 check "  and has no Owner tab" bash -c "! $TMX capture-pane -p -t f | grep -q '│ Owner │'"
 $TMX send-keys -t f q
+
+echo "== a mesh made, joined and approved without leaving the menu"
+printf 'machine = "nw"\nstate_dir = "%s/nw"\nsocket = "%s/nw.sock"\n[users]\ntme3-x = "work"\n' "$T" "$T" >"$T/nw.toml"
+printf 'machine = "jn"\nstate_dir = "%s/jn"\nsocket = "%s/jn.sock"\n[users]\ntme3-x = "work"\ntme3-lab = "lab"\n' "$T" "$T" >"$T/jn.toml"
+start nw; start jn
+mkdir -p "$T/h-nw/.ssh" "$T/h-jn"
+menu() { $TMX new-session -d -s "$1" -x 140 -y 40 "env HOME=$T/h-$1 TEARMESH_SOCKET=$T/$1.sock TEARMESH_CONFIG=$T/$1.toml $TM menu"; }
+in_pane() { $TMX capture-pane -p -t "$1" 2>/dev/null | grep -q -- "$2"; }
+menu nw
+wait_for in_pane nw "NOT SET UP"
+make_mesh() { $TMX send-keys -t nw c; wait_for in_pane nw "Create a mesh"; $TMX send-keys -t nw -l menumesh; $TMX send-keys -t nw Tab; $TMX send-keys -t nw -l menu-passphrase; $TMX send-keys -t nw Tab; $TMX send-keys -t nw -l menu-passphrase; $TMX send-keys -t nw Enter; }
+make_mesh
+check "the menu shows the recovery key on a plain screen" wait_for in_pane nw "^-----BEGIN OPENSSH PRIVATE KEY-----"
+check "  with its generated passphrase" in_pane nw "Passphrase: [a-z]*-"
+check "  and no passphrase typed shows on screen" bash -c "! $TMX capture-pane -p -t nw | grep -q menu-passphrase"
+$TMX send-keys -t nw Escape
+sleep 1
+check "Esc there leaves no key and no mesh" bash -c "test -z \"\$(ls $T/h-nw/.ssh)\" && env TEARMESH_SOCKET=$T/nw.sock $TM status | grep -q '\"mesh\": null'"
+make_mesh
+wait_for in_pane nw "^-----BEGIN OPENSSH PRIVATE KEY-----"
+MPASS=$($TMX capture-pane -p -t nw | grep -o 'Passphrase: [a-z-]*' | cut -d' ' -f2)
+$TMX send-keys -t nw w Enter
+check "W saves the recovery key" wait_for in_pane nw "Saved to"
+check "  to a file only this user can read" test "$(stat -c %a "$T/h-nw/tearmesh-recovery-menumesh.key" 2>/dev/null)" = 600
+check "  that opens with the generated passphrase" bash -c "ssh-keygen -y -P '$MPASS' -f $T/h-nw/tearmesh-recovery-menumesh.key >/dev/null"
+$TMX send-keys -t nw y; $TMX send-keys -t nw -l wrong; $TMX send-keys -t nw Enter
+check "a wrong word 3 is caught" wait_for in_pane nw "isn't word 3"
+$TMX send-keys -t nw -l "$(cut -d- -f3 <<<"$MPASS")"; $TMX send-keys -t nw Enter
+wait_for in_pane nw "Create mesh menumesh now"
+$TMX send-keys -t nw y
+check "the mesh is created in the menu" wait_for in_pane nw "is ready"
+check "  the everyday key is in ~/.ssh, private" test "$(stat -c %a "$T/h-nw/.ssh/tearmesh-owner-menumesh" 2>/dev/null)" = 600
+check "  locked with the passphrase typed" bash -c "ssh-keygen -y -P menu-passphrase -f $T/h-nw/.ssh/tearmesh-owner-menumesh >/dev/null"
+$TMX send-keys -t nw Enter
+check "  and the menu is the owner node's" wait_for in_pane nw "OWNER NODE"
+$TMX send-keys -t nw Right Right c
+wait_for in_pane nw "Invite a machine"
+$TMX send-keys -t nw Enter
+wait_for in_pane nw "Ticket for a new machine"
+$TMX send-keys -t nw w Enter
+check "the ticket saves to a file" wait_for test -s "$T/h-nw/tearmesh-ticket.txt"
+$TMX send-keys -t nw Enter
+menu jn
+wait_for in_pane jn "NOT SET UP"
+$TMX send-keys -t jn j
+check "the join form shows this machine's boundaries" wait_for in_pane jn "boundaries lab, work"
+# A ticket pasted in one go (bracketed paste), as a terminal does it.
+$TMX load-buffer -b t "$T/h-nw/tearmesh-ticket.txt"
+$TMX paste-buffer -p -b t -t jn
+$TMX send-keys -t jn Enter
+check "the joining menu shows a code" wait_for in_pane jn "Code  [0-9]\{3\} [0-9]\{3\}"
+check "the owner's menu pops up the request" wait_for in_pane nw "jn wants to join with boundaries lab, work"
+JCODE=$($TMX capture-pane -p -t jn | grep -o 'Code  [0-9]\{3\} [0-9]\{3\}' | cut -c7-)
+check "  with the same code" in_pane nw "Code $JCODE"
+V0=$(version nw)
+# Tick "Add boundary lab" and "jn may use nw's tools", then the passphrase (past the note).
+$TMX send-keys -t nw Space Tab Space Tab Tab Tab Tab
+$TMX send-keys -t nw -l not-the-passphrase; $TMX send-keys -t nw Enter
+check "a wrong passphrase is refused in the form" wait_for in_pane nw "doesn't open"
+$TMX send-keys -t nw -l menu-passphrase; $TMX send-keys -t nw Enter
+check "approving signs and applies" wait_for in_pane nw "Signed and applied mesh version"
+check "jn joins" wait_for in_pane jn "Joined"
+check "  one new version for the machine, its boundary and the grant" test "$(version nw)" = $((V0 + 1))
+SHOW=$(env TEARMESH_SOCKET=$T/nw.sock $TM mesh show)
+check "  jn hosts lab and work" test "$(hosts_of nw jn)" = "lab,work"
+check "  and may use nw's tools" has 'from = "jn"' "$SHOW"
+check "jn has the same version" wait_for bash -c "test \"\$(env TEARMESH_SOCKET=$T/jn.sock $TM status | python3 -c 'import json,sys;print(json.load(sys.stdin)[\"mesh\"][\"version\"])')\" = $((V0 + 1))"
+$TMX send-keys -t nw Enter
+# A grant from the Nodes screen, signed in the menu.
+$TMX send-keys -t nw Down g
+wait_for in_pane nw "To machine"
+$TMX send-keys -t nw Enter
+wait_for in_pane nw "Passphrase for"
+$TMX send-keys -t nw -l menu-passphrase; $TMX send-keys -t nw Enter
+check "a grant signed in the menu" wait_for in_pane nw "Signed and applied mesh version $((V0 + 2))"
+$TMX send-keys -t nw Enter q
+$TMX send-keys -t jn Enter q
 
 echo
 if [ "$FAILED" = 0 ]; then echo "ALL PASSED"; else echo "SOME FAILED"; exit 1; fi

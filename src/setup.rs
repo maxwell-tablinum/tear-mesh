@@ -143,8 +143,8 @@ async fn preflight(w: &mut Wizard, config: &Path) -> Result<Option<(Config, Valu
     loop {
         let problem = match Config::load(config) {
             Err(e) => format!(
-                "{e:#}\n  Install tear-mesh on this machine first: `sudo deploy/setup-linux.sh <machine> <boundary>...` \
-                 or deploy/setup-windows.ps1. It writes {}.",
+                "{e:#}\n  Install tear-mesh on this machine first: `sudo tearmesh install <machine> <boundary>...` \
+                 (Windows: in an elevated prompt). It writes {}.",
                 config.display()
             ),
             Ok(c) => match admin(Request::Status).await {

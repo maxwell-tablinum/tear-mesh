@@ -1,6 +1,7 @@
 # Installs tear-mesh on one Windows machine: the binary, one local user per boundary (tm-<boundary>),
 # the config, and the tearmesh service, which runs as its virtual account NT SERVICE\tearmesh.
-# Run as Administrator.
+# Run as Administrator. `tearmesh install` runs a copy of this script built into the binary;
+# running it from a clone works too. Running it again upgrades the binary and adds new users.
 #
 #   deploy\setup-windows.ps1 -Machine <name> -Boundaries work,vault [-Exe tearmesh.exe] [-Stewards]
 #   deploy\setup-windows.ps1 -Uninstall [-Boundaries work,vault]
@@ -21,6 +22,8 @@ param(
   [switch]$Uninstall
 )
 $ErrorActionPreference = 'Stop'
+# With -File, "-Boundaries a,b" arrives as one string.
+$Boundaries = @($Boundaries | ForEach-Object { $_ -split ',' } | Where-Object { $_ })
 $me = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
 if (-not $me.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'run as Administrator' }
 
@@ -32,6 +35,15 @@ $Config = "$DataDir\config.toml"
 $Passwords = "$DataDir\passwords.txt"
 $Service = 'tearmesh'
 $Account = 'NT SERVICE\tearmesh'
+$EnvKey = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Environment'
+
+# The machine PATH, unexpanded, so entries like %SystemRoot% stay as they are.
+function Set-MachinePath([scriptblock]$Change) {
+  $raw = (Get-Item $EnvKey).GetValue('Path', '', 'DoNotExpandEnvironmentNames')
+  $parts = @($raw -split ';' | Where-Object { $_ })
+  $new = (& $Change $parts) -join ';'
+  if ($new -ne $raw) { Set-ItemProperty $EnvKey -Name Path -Value $new -Type ExpandString }
+}
 
 # Grants or takes back "Log on as a batch job", which a scheduled task with a stored password needs.
 function Set-BatchLogon([string[]]$Add = @(), [string[]]$Remove = @()) {
@@ -76,6 +88,7 @@ if ($Uninstall) {
     Get-CimInstance Win32_UserProfile -Filter "SID='$s'" | Remove-CimInstance -ErrorAction SilentlyContinue
     Remove-LocalUser -SID $s
   }
+  Set-MachinePath { param($p) $p | Where-Object { $_ -ne $ProgramDir } }
   Remove-Item -Recurse -Force $ProgramDir, $DataDir -ErrorAction SilentlyContinue
   Write-Host "tear-mesh removed$(if ($sids) { ", with users $(($Boundaries | ForEach-Object { "tm-$_" }) -join ', ')" })"
   exit
@@ -86,7 +99,14 @@ if (-not (Test-Path $Exe)) { throw "no binary at $Exe (pass -Exe)" }
 
 if (Get-Service $Service -ErrorAction SilentlyContinue) { Stop-Service $Service -Force }
 New-Item -ItemType Directory -Force $ProgramDir | Out-Null
-Copy-Item $Exe $Bin -Force
+if ((Resolve-Path $Exe).Path -ne $Bin) {
+  # A running exe can be renamed but not overwritten (a hub or steward may still use it).
+  Remove-Item "$Bin.old" -Force -ErrorAction SilentlyContinue
+  if (Test-Path $Bin) { Move-Item $Bin "$Bin.old" -Force }
+  Copy-Item $Exe $Bin -Force
+}
+# So `tearmesh` (and the Claude Code plugin's command) works in new prompts.
+Set-MachinePath { param($p) if ($p -contains $ProgramDir) { $p } else { $p + $ProgramDir } }
 
 # The service comes first: NT SERVICE\tearmesh exists only once it does.
 if (-not (Get-Service $Service -ErrorAction SilentlyContinue)) {

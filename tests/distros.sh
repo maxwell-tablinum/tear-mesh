@@ -1,6 +1,6 @@
 #!/bin/bash
-# Runs tests/e2e-linux.sh and deploy/setup-linux.sh inside containers of several Linux
-# distributions, with the static (musl) binary, so one build is checked everywhere.
+# Runs tests/e2e-linux.sh and `tearmesh install` (re-run, then uninstall) inside containers of
+# several Linux distributions, with the static (musl) binary, so one build is checked everywhere.
 # Needs podman (set PODMAN="sudo podman" for rootful, or PODMAN=docker) and network access for
 # the packages.
 # Usage: cargo build --release --target x86_64-unknown-linux-musl && tests/distros.sh [image...]
@@ -33,13 +33,20 @@ run_one() {
   ${PODMAN:-podman} run --rm -v "$ROOT:/src:ro" -v "$BIN:/usr/local/bin/tearmesh-test:ro" \
     -e TEARMESH_BIN=/usr/local/bin/tearmesh-test "$img" sh -c "$DEPS
       echo '== e2e'; bash /src/tests/e2e-linux.sh || true
-      echo '== setup-linux.sh'
-      TEARMESH_BIN=/usr/local/bin/tearmesh-test sh /src/deploy/setup-linux.sh box work vault 2>&1 | tail -2
-      id tm-work >/dev/null && id tm-vault >/dev/null && grep -q 'tm-work = \"work\"' /etc/tearmesh/config.toml \
-        && test \"\$(stat -c %a /home/tm-vault)\" = 700 && echo 'SETUP OK' || echo 'SETUP FAILED'" >"$log" 2>&1
+      echo '== install'
+      tearmesh-test install box work vault 2>&1 | tail -3
+      tearmesh install box work vault extra 2>&1 | tail -3
+      id tm-work >/dev/null && id tm-vault >/dev/null && id tm-extra >/dev/null \
+        && test \"\$(grep -c '^tm-work = ' /etc/tearmesh/config.toml)\" = 1 && grep -q '^tm-extra = \"extra\"' /etc/tearmesh/config.toml \
+        && test \"\$(stat -c %a /home/tm-vault)\" = 700 && test \"\$(stat -c %U /var/lib/tearmesh/node.key)\" = tearmesh \
+        && su -s /bin/sh tm-work -c 'cat /usr/local/share/tearmesh/.claude-plugin/marketplace.json' >/dev/null \
+        && ! tearmesh install other work 2>/dev/null && echo 'SETUP OK' || echo 'SETUP FAILED'
+      tearmesh uninstall --yes work vault extra 2>&1 | tail -1
+      ! id tm-work 2>/dev/null && ! id tearmesh 2>/dev/null && test ! -e /etc/tearmesh && test ! -e /usr/local/bin/tearmesh \
+        && echo 'UNINSTALL OK' || echo 'UNINSTALL FAILED'" >"$log" 2>&1
   local e2e setup
   e2e=$(grep -E '^(ALL PASSED|FAIL )' "$log" | head -3 | tr '\n' ' ')
-  setup=$(grep -E '^SETUP' "$log")
+  setup=$(grep -E '^(SETUP|UNINSTALL)' "$log" | tr '\n' ' ')
   printf '%-52s %s | %s\n' "$img" "${e2e:-no result (see $log)}" "${setup:-no setup result}"
 }
 

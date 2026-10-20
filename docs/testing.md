@@ -56,17 +56,17 @@ PODMAN="sudo podman" tests/distros.sh      # the same in six distributions' cont
 
 It prints `PASS` or `FAIL` for each check and ends with `ALL PASSED`.
 
-**`tests/e2e-0.3.sh`** runs three daemons (`own`, the owner node, `mem` and `far`) with real OS users (`tme3-own`, `tme3-mem`, `tme3-far`, `tme3-x`) and tries to break 0.3. It covers:
-- setup: re-asking on bad choices, names and tickets; binary junk and closed input; both keys shown with "Copy this and put it somewhere safe"; the recovery key working; running twice changes nothing; Ctrl-C and `kill -9` halfway leave nothing behind (the next run cleans the killed run's temporary keys); joining through the wizard with the code matching;
+**`tests/e2e-0.3.sh`** runs three daemons (`own`, the owner node, `mem` and `far`) with real OS users (`tme3-own`, `tme3-mem`, `tme3-far`, `tme3-x`, `tme3-lab`) and tries to break 0.3. It covers:
+- setup: re-asking on bad choices, names, passphrases and tickets; binary junk and closed input; only the recovery key shown, opening with its generated passphrase and not the everyday one; running twice changes nothing; Ctrl-C and `kill -9` halfway leave nothing behind; joining through the wizard with a nameless ticket and the code matching; approving without `--key`; adding a boundary and changing what a machine hosts;
 - the ping protocol behind the map, admin only;
 - the hub: `mcp connect` starts it, it outlives the client, a second `serve` exits, six clients starting it at once leave one hub, a client's own stdio copy runs beside it; private socket directory and token; HTTP refused without the token, with a wrong one or a prefix, and from a foreign `Host`;
 - conversation both ways, with `wait_for_mail` and the push to an open session; tool calls both ways, refused without a grant; shell commands both ways through the real sshd, refused without a grant, with option smuggling refused; an open shell kept across client sessions; harness chats, with the prompt passed as one argument and chat ids that can't name files;
 - oversized and junk input to the daemon, the hub socket and the hub's HTTP;
 - a node dying mid-shell and mid-call, the owner offline (members still mail each other; joins fail with a reason), a member restarting ten times while letters keep coming (each arrives once);
 - a stolen node key, revoked: it reaches nobody afterwards and its letters never arrive; a leaked owner key replaced and removed: its signatures are refused by the owner node and by a member; the recovery key still signs;
-- the menu through tmux: role detection, the Owner tab only on an owner node, the map, the nodes table, the shortcut bar, the invite form's checks.
+- the menu through tmux: role detection, the Owner tab only on an owner node, the map, the nodes table, the shortcut bar, a ticket shown in the menu, Ctrl-C in a program it runs; and a mesh made without leaving it: create (Esc first leaves nothing; the recovery key saved with W; word 3 checked), invite, join by bracketed paste, the same code on both screens, the approval popup with a new boundary and a grant in one version (a wrong passphrase refused), and a grant signed from the Nodes screen.
 
-**`tests/distros.sh`** runs that script and `deploy/setup-linux.sh` in Debian 13, Ubuntu 24.04, Fedora 42, Arch, openSUSE Tumbleweed and Alpine 3.22 containers, on the static musl binary. Name images as arguments to test others.
+**`tests/distros.sh`** runs that script and `tearmesh install` (again with an extra boundary, then `uninstall`) in Debian 13, Ubuntu 24.04, Fedora 42, Arch, openSUSE Tumbleweed and Alpine 3.22 containers, on the static musl binary. Name images as arguments to test others.
 
 **`tests/e2e-windows.ps1`** is the Windows version, for an elevated PowerShell on Windows Server or Windows 11. See [Windows](#windows).
 
@@ -76,33 +76,33 @@ Use two machines, ideally on different networks; that is what exercises NAT trav
 
 ### Install
 
+With a release binary (or `target/release/tearmesh` from `cargo build --release`):
+
 ```sh
-cd /opt/tear-mesh && cargo build --release
-sudo deploy/setup-linux.sh alpha work vault     # on alpha
-sudo deploy/setup-linux.sh beta work            # on beta (Linux)
+sudo ./tearmesh install alpha work vault     # on alpha
+sudo ./tearmesh install beta work            # on beta (Linux)
 ```
 
-Each prints its node id. The script:
+Each prints its node id. `install` runs the script built into the binary (the same as `deploy/setup-linux.sh`):
 - installs `/usr/local/bin/tearmesh`;
 - creates the `tearmesh` daemon user and one user per boundary (`tm-work`, `tm-vault`);
 - writes `/etc/tearmesh/config.toml`, with you as an admin;
-- starts the service (systemd or OpenRC).
+- writes the Claude Code plugin to `/usr/local/share/tearmesh`;
+- starts (or restarts) the service (systemd or OpenRC).
+
+Run it again to upgrade, or with more boundaries to add their users to the config. A boundary new to the mesh is then added by an owner: `tearmesh mesh boundary add lab --host beta` (or `tearmesh mesh hosts beta work lab` when the mesh already has it).
 
 For a Windows beta, see [Windows](#windows).
 
 ### Create the mesh (alpha)
 
 ```sh
-tearmesh setup
+tearmesh menu        # press C; or the line-by-line `tearmesh setup`, choosing 1
 ```
 
-Choose **1** (create). It asks for a mesh name, then makes two owner keys and shows each one in full with **"Copy this and put it somewhere safe."**:
-- the everyday key, which stays at `~/.ssh/tearmesh-owner-<mesh>`. Give it a passphrase; the wizard makes it again if you don't;
-- the recovery key, which is shown once and then deleted from alpha. It's your way back in if alpha is lost or its key leaks.
+It asks for a mesh name and a passphrase (8 or more characters, twice) for the everyday key, which stays at `~/.ssh/tearmesh-owner-<mesh>`. It then shows the recovery key with a generated six-word passphrase, once: it isn't kept on alpha, and it's your way back in if alpha is lost or its key leaks. In the menu, C copies it (OSC 52; under tmux set `set -g set-clipboard on`), P copies the passphrase, W saves the key to a file, and Y asks for word 3 of the passphrase before creating the mesh. Setup asks you to type `saved`. It then applies a membership file listing alpha, signed with the everyday key. The Overview shows the mesh and alpha's boundaries.
 
-Type `saved` after copying each. It then signs a membership file listing alpha with the everyday key and applies it. `tearmesh status` (or `tearmesh menu`) shows the mesh and alpha's boundaries.
-
-Things to try: a bad answer at any prompt (it asks again), `b` to go back, `q` or Ctrl-C partway (nothing is written; run it again), and running it a second time (it says alpha is set up and changes nothing).
+Things to try: a bad answer at any prompt (it asks again), `b` to go back, Esc, `q` or Ctrl-C partway (nothing is written; run it again), and running it a second time (it says alpha is set up and changes nothing).
 
 <details><summary>The same by hand</summary>
 
@@ -119,17 +119,19 @@ tearmesh mesh apply mesh.toml
 
 ### Join beta
 
+In the menu: on alpha, Owner → I and Enter shows a ticket (C copies it, W saves it). On beta, J, paste it, Enter: beta shows "Code 123 456" and waits. Alpha's menu pops up "beta wants to join with boundaries work" with the code; tick any grants, enter the passphrase, Enter. From the command line:
+
 ```sh
 # alpha
-tearmesh mesh invite beta --boundary work      # prints tm2-…, valid for an hour (--expires 1d)
+tearmesh mesh invite                            # prints tm2-…, valid for an hour (--expires 1d); NAME pins the name
 # beta
 tearmesh setup                                  # choose 2 (join), paste the ticket: prints "Code 123456" and waits
 # alpha
-tearmesh mesh pending                           # shows beta and its code (or: tearmesh menu, Owner screen)
-tearmesh mesh approve beta --key ~/.ssh/tearmesh-owner-test
+tearmesh mesh pending                           # shows beta, its code and boundaries (or: the menu's Owner screen)
+tearmesh mesh approve beta --grant beta:alpha:tools   # finds the owner key in ~/.ssh; --add-boundary for a new one
 ```
 
-Approve only if both codes match. Beta prints `joined; mesh version …`. Within about 30 seconds, `tearmesh status` on either machine shows the other with a `last_sync_ms`.
+Approve only if both codes match; `tearmesh mesh reject beta` refuses it. Beta prints `Joined. Mesh version …`. If beta's join is interrupted, running it again with the same ticket gets the same code; another machine with that ticket is refused and the owner sees a warning. Open tickets survive a daemon restart; `tearmesh mesh reject --all` voids them. Within about 30 seconds, `tearmesh status` on either machine shows the other with a `last_sync_ms`.
 
 ### Send mail
 
@@ -173,14 +175,14 @@ Any stdio MCP server will do. Here beta offers one and alpha calls it.
 sudo -u tm-work tearmesh offer publish files       # prints its tools and the pin
 sudo systemctl enable --now tearmesh-steward@tm-work
 # alpha
-tearmesh mesh grant alpha beta tools --key ~/.ssh/tearmesh-owner
+tearmesh mesh grant alpha beta tools
 sudo -u tm-work tearmesh offers                    # beta/files: pending approval
-tearmesh mesh approve-offer beta work files --tools <tool>,<tool> --key ~/.ssh/tearmesh-owner   # names as `offers` lists them
+tearmesh mesh approve-offer beta work files --tools <tool>,<tool>   # names as `offers` lists them
 sudo -iu tm-work claude mcp add files -- tearmesh mcp --remote beta/files
 ```
 
 In a Claude Code session as `tm-work` on alpha, ask it to list the shared directory. Only the two approved tools appear. To see a refusal:
-1. Revoke the grant: `tearmesh mesh revoke alpha beta tools --key …`.
+1. Revoke the grant: `tearmesh mesh revoke alpha beta tools`.
 2. Start a new session; the call fails with `no tools grant`.
 
 Pin the package version in `command`. `npx` and `uvx` fetch code at run time, so the offer can't carry an executable hash for them.
@@ -188,7 +190,7 @@ Pin the package version in `command`. `npx` and `uvx` fetch code at run time, so
 ### Shell
 
 ```sh
-tearmesh mesh grant alpha beta shell --key ~/.ssh/tearmesh-owner     # alpha
+tearmesh mesh grant alpha beta shell     # alpha
 # alpha, as tm-work, in ~/.ssh/config:
 #   Host beta
 #     ProxyCommand tearmesh shell-proxy %h
@@ -207,7 +209,7 @@ sudo -u tm-work tearmesh bio show beta                                          
 ### Revoke a machine
 
 ```sh
-tearmesh mesh remove beta --key ~/.ssh/tearmesh-owner    # alpha
+tearmesh mesh remove beta    # alpha
 ```
 
 Beta's sessions can no longer reach alpha, and its earlier letters are no longer delivered. To bring beta back, run `tearmesh mesh reset` on beta, then invite and join again.
@@ -247,7 +249,7 @@ Each boundary user needs its own Claude Code login, because a session's boundary
 ```sh
 sudo -iu tm-work
 claude                                          # log in once, then /exit
-claude plugin marketplace add /opt/tear-mesh
+claude plugin marketplace add /usr/local/share/tearmesh
 claude plugin install tearmesh@tear-mesh
 exit
 tearmesh launch --boundary work --mailbox builder -- claude
@@ -331,11 +333,13 @@ cargo build --release --target x86_64-pc-windows-gnu      # target/x86_64-pc-win
 In an elevated PowerShell:
 
 ```powershell
-deploy\setup-windows.ps1 -Machine beta -Boundaries work -Exe C:\path\to\tearmesh.exe -Stewards
+Unblock-File .\tearmesh-x86_64-windows.exe     # a downloaded release
+.\tearmesh-x86_64-windows.exe install beta work --stewards
 ```
 
-This:
-- installs `C:\Program Files\tearmesh\tearmesh.exe`;
+`install` runs the script built into the binary (the same as `deploy\setup-windows.ps1 -Machine beta -Boundaries work -Exe <exe> -Stewards`). This:
+- installs `C:\Program Files\tearmesh\tearmesh.exe` and adds that folder to the machine PATH (new prompts see it);
+- writes the Claude Code plugin there too;
 - creates the local user `tm-work` with a random password, saved to `C:\ProgramData\tearmesh\passwords.txt`, which only SYSTEM and Administrators can read;
 - writes `C:\ProgramData\tearmesh\config.toml`, with you as an admin;
 - locks down the state directory;
@@ -343,7 +347,7 @@ This:
 - allows inbound UDP for the private and domain profiles;
 - with `-Stewards`, starts a steward for each boundary user at boot.
 
-It prints the node id. `deploy\setup-windows.ps1 -Uninstall -Boundaries work` removes it all again.
+It prints the node id. `tearmesh uninstall work` removes it all again.
 
 Then join as on Linux, from an elevated prompt: `tearmesh join tm2-…`. Run sessions as the boundary user, with `tearmesh launch --boundary work --mailbox admin -- claude` (runas asks for the password) or from a login as `tm-work`. The steward reads `%USERPROFILE%\.config\tearmesh\mailboxes.toml` and `offers.toml`, as on Linux.
 
@@ -380,14 +384,15 @@ This applies the new version to the local daemon, and it spreads from there. Mai
 
 ## 4. Uninstall
 
-Linux:
-
 ```sh
-sudo systemctl disable --now tearmesh 'tearmesh-steward@*'
-sudo rm /etc/systemd/system/tearmesh.service /etc/systemd/system/tearmesh-steward@.service
-sudo systemctl daemon-reload
-sudo userdel -r tm-work; sudo userdel -r tm-vault; sudo userdel tearmesh
-sudo rm -rf /var/lib/tearmesh /etc/tearmesh /usr/local/bin/tearmesh
+sudo tearmesh uninstall work vault      # Windows: tearmesh uninstall work, elevated
 ```
 
-On OpenRC, use `rc-service tearmesh stop; rc-update del tearmesh; rm /etc/init.d/tearmesh` in place of the systemd lines.
+It stops and removes the service, the binary, the plugin, `/etc/tearmesh` and the state, and deletes the users of the boundaries named (with their homes), then the `tearmesh` user.
+
+## Releases
+
+1. Bump the version in `Cargo.toml` and `adapters/claude-code/.claude-plugin/plugin.json` (a unit test checks they match), and commit.
+2. `git tag -a v<version> -m "<notes>"` and push the tag. The `release` workflow builds the Linux (x86_64 and aarch64, musl) and Windows (MSVC) binaries, smoke-tests `install` and `uninstall` on each runner, and creates a **draft** release with `SHA256SUMS`.
+3. On the Windows test VM, download the Windows binary from the draft and run `tests\e2e-windows.ps1 -Exe <it>`.
+4. Publish the draft.

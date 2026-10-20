@@ -107,7 +107,7 @@ This reconciles "one owner node plus a portable key" with rev 3's "at least two 
 - **The portable key should be a security key** (`sk-ssh-ed25519`), which 0.1.0 already supports, with the daemon checking user presence. There is nothing to copy and nothing left on a machine after use.
 - **Fallback: a passphrase-protected ed25519 key file** on removable media. Use it in place (`--key /media/…/owner`) and don't add it to `ssh-agent`, so it isn't stored on the machine. Use a long passphrase, since a stolen file can be attacked offline. Docs say never to email it.
 - **Promoting a node to owner** means adding its key and removing the old one in one signed version. No separate revocation object.
-- **The daemon never holds an owner key.** Signing always runs `ssh-keygen -Y sign` as the person.
+- **The daemon never holds an owner key.** Signing always runs as the person, in their own process: the CLI uses `ssh-keygen -Y sign`; since 0.3 `tearmesh menu` and `setup` take the passphrase themselves and sign ed25519 key files in-process (the same SSHSIG bytes). Security keys still sign through ssh-keygen. Setup's recovery key gets its own generated passphrase (six words from the EFF large wordlist, about 77 bits).
 - **Signing threshold** 🟨. Any one owner key can sign any change, including a change to the owner list. A stolen portable key is therefore a takeover until every machine is re-pinned. Options:
   - Keep 1-of-N, with security keys as the default (recommended for 0.2).
   - Require two owner signatures to change the owner list.
@@ -189,15 +189,16 @@ tools = ["export_step", "read_properties"]   # optional subset
 
 Tickets are 0.2's only join method. They're about 150–250 characters, depending on the relay URL and addresses they carry.
 
-1. **On the owner node**, `tearmesh mesh invite --name beta --boundary work [--expires 1h]` prints `tm2-…`. The ticket is built at that moment from the current settings and holds:
+1. **On the owner node**, `tearmesh mesh invite [beta] [--boundary work] [--expires 1h]` prints `tm2-…`. Since 0.3 the name and boundaries are optional pins: without them the new machine proposes its configured name and the boundaries its config maps users to, and the owner approves what it sees. The ticket is built at that moment from the current settings and holds:
    - the owner node's id and current addresses;
    - the mesh id;
    - a hash of the owner key set;
    - a 128-bit one-time secret;
    - an expiry.
-2. **On the new machine**, `sudo tearmesh join tm2-…` dials the owner node on `tear-mesh/join/1`. It proves it holds the secret, bound to its own node id (an HMAC of its id), and asks for the name and boundaries. Both screens show the same 6-digit code, derived from the secret and both node ids.
-3. **The person compares the codes and approves.** `tearmesh mesh pending` lists requests. `tearmesh mesh approve beta` then:
-   - adds the machine;
+2. **On the new machine**, `sudo tearmesh join tm2-…` (or the menu's J) dials the owner node on `tear-mesh/join/1`. It proves it holds the secret, bound to its own node id (an HMAC of its id), and sends its name and boundaries (validated: names as everywhere, at most 16 boundaries, a 4 KiB request). The join runs in the daemon, so the client may leave and come back. Both screens show the same 6-digit code, derived from the secret and both node ids.
+3. **The person compares the codes and approves.** `tearmesh mesh pending` lists requests (the menu pops each one up). `tearmesh mesh approve beta [--add-boundary lab] [--grant beta:ws:tools]` then, in one version:
+   - adds any new boundaries it asked for that the owner ticks, and the grants;
+   - adds the machine, hosting what it asked for that the mesh then has;
    - bumps the version;
    - signs with the owner key;
    - applies the file locally.
@@ -206,7 +207,8 @@ Tickets are 0.2's only join method. They're about 150–250 characters, dependin
 4. **The joiner adopts the file** as its first membership file only if it lists the joiner's node id, its owner set matches the ticket's hash, and the signature verifies. This replaces 0.1.0's y/N prompt; the fingerprints are still printed.
 
 Rules:
-- A ticket is single use. Expired or used tickets are refused.
+- A ticket admits one node. The first node to prove it claims it; that node may retry (same code) until approval, refusal or expiry, and if it was approved while away it gets the file when it comes back. Another node is refused, and the owner sees the ticket marked as leaked (and `approve --yes` is refused). Expired tickets are refused. Open invites survive a daemon restart; `mesh reject NAME` refuses a request and `mesh reject --all` voids every open ticket.
+- `--replace` (a new node id under an existing name) needs a pinned name, so a nameless ticket can never replace a member.
 - The join ALPN refuses everything while no invite is pending. Join attempts are rate-limited and logged.
 - If the owner node is offline, `join` fails with `owner node <id> not reachable`.
 - New machines get no grants beyond the wildcard grants already in the file.
@@ -513,7 +515,7 @@ Each gate is an automated test, in the style of `tests/mesh.rs` (in-process iroh
 |---|---|---|
 | G1 | `read_file` refuses paths outside its roots, including through a symlink (`openat2` with `RESOLVE_BENEATH`). Another local user can't reach the connector's socket. Connector posts carry `guest` trust, and guest letters don't wake a default mailbox. | M1 |
 | G2 | A format-1 circle migrates to format 2 without a re-pin, and its logs survive | M2 |
-| G3 | A non-member reaches only the join ALPN, only while an invite is pending. Used, expired and wrong-secret tickets are refused. Both ends compute the same code. | M2 |
+| G3 | A non-member reaches only the join ALPN, only while an invite is pending. Expired and wrong-secret tickets are refused, and a claimed ticket admits only its first node, which may retry. Both ends compute the same code. Invites survive a restart. | M2 |
 | G4 | A joiner refuses a file whose owner set doesn't match its ticket | M2 |
 | G5 | Without a converse grant, posting is refused at the sender. A relayed letter from an ungranted author is stored but never delivered. Revoking a grant hides that author's earlier letters. | M2 |
 | G6 | A tool call without a grant is refused at both daemons. A `vault` session can't reach a `work` offer. | M3 |

@@ -7,7 +7,7 @@ A peer-to-peer mesh that connects the apps and agents on your own machines, not 
 
 All of it is encrypted app to app over [iroh](https://iroh.computer), with no VPN and no public endpoint, under permissions you sign with an ordinary SSH key. Every machine keeps each **boundary**'s data inside that boundary. The daemon and the operating system enforce that, never a model's judgment.
 
-**Status: 0.3.0, early.** It runs on Linux (systemd or OpenRC; one static binary for any distribution) and natively on Windows. The design and its open questions are in [docs/design.md](docs/design.md); 0.2 is specified in [docs/spec-0.2.md](docs/spec-0.2.md); 0.3 adds `tearmesh menu`, a rebuilt `tearmesh setup` and the MCP hub (see below). The project stays at 0.x until the maintainers declare it launched.
+**Status: 0.3.0, early.** It runs on Linux (systemd or OpenRC; one static binary for any distribution) and natively on Windows. The design and its open questions are in [docs/design.md](docs/design.md); 0.2 is specified in [docs/spec-0.2.md](docs/spec-0.2.md); 0.3 adds `tearmesh menu`, where you create, join and approve without leaving it, `tearmesh install`, a rebuilt `tearmesh setup` and the MCP hub (see below). The project stays at 0.x until the maintainers declare it launched.
 
 **About the name:** in intelligence reporting, a *tear line* separates the classified part of a document from a cleaned-up summary that can be torn off and shared at a lower clearance. The hyphen in tear-mesh is that line.
 
@@ -32,7 +32,7 @@ Some overlap is real: machine bios resemble A2A Agent Cards and MCP registry met
   - the MCP servers you approved;
   - the owner keys.
 
-  You sign it with `ssh-keygen -Y sign`. At least two owner keys are required, so losing one doesn't lock you out: `tearmesh setup` makes an everyday key that stays on the owner node and a recovery key it shows once for you to keep somewhere safe. Any OpenSSH ed25519 key works, security keys included. Versions form a hash chain: each one names the one before and is signed by an owner of it. A machine that missed versions gets each one. If two owners sign different versions at once:
+  It's signed in the SSHSIG format of `ssh-keygen -Y sign`. At least two owner keys are required, so losing one doesn't lock you out: setup makes an everyday key that stays on the owner node under your passphrase, and a recovery key with a generated six-word passphrase that it shows once for you to keep somewhere safe. Any OpenSSH ed25519 key works, security keys included. Versions form a hash chain: each one names the one before and is signed by an owner of it. A machine that missed versions gets each one. If two owners sign different versions at once:
   - a version that removes the other's signer wins;
   - otherwise the one with more versions built on it wins;
   - otherwise the lower hash wins.
@@ -97,39 +97,30 @@ Not covered:
 
 ## Quick start (Linux)
 
-Build `cargo build --release` (Rust 1.88+), or build one static binary for any distribution with `cargo build --release --target x86_64-unknown-linux-musl`.
-
-On **each machine**, install the daemon with one OS user per boundary it hosts:
+Download the binary for your machine (`tearmesh-x86_64-linux` or `tearmesh-aarch64-linux`, static, for any distribution) and `SHA256SUMS` from this repository's Releases page. On **each machine**, check it and install it with one OS user per boundary the machine hosts:
 
 ```sh
-sudo deploy/setup-linux.sh workstation work vault   # prints this machine's node id
+grep ' tearmesh-x86_64-linux$' SHA256SUMS | sha256sum -c
+chmod +x tearmesh-x86_64-linux
+sudo ./tearmesh-x86_64-linux install workstation work vault
+tearmesh menu
 ```
 
-This installs `/usr/local/bin/tearmesh`, creates the `tearmesh` daemon user and `tm-work`/`tm-vault`, writes `/etc/tearmesh/config.toml` (making you an admin), and starts the service (systemd or OpenRC).
+`install` puts the binary at `/usr/local/bin/tearmesh`, creates the `tearmesh` daemon user and `tm-work`/`tm-vault`, writes `/etc/tearmesh/config.toml` (making you an admin), installs the Claude Code plugin under `/usr/local/share/tearmesh`, and starts the service (systemd or OpenRC). Run it again to upgrade or to add boundaries; `sudo tearmesh uninstall work vault` removes it all, with those users. From source: `cargo build --release` (Rust 1.88+), then `sudo target/release/tearmesh install …`.
 
-On the first machine, the **owner node**, create the mesh:
+Everything else happens in **`tearmesh menu`** (arrow keys or the keypad, Enter, Esc, and a nano-style shortcut bar), without leaving it:
 
-```sh
-tearmesh setup          # create a mesh: makes two owner keys and shows each one to copy somewhere safe
-tearmesh menu           # full-screen: status, a live map, nodes, invites and approvals, settings
-```
+1. On the first machine, the **owner node**, press **C** to create a mesh. You choose the everyday key's passphrase; the menu shows the recovery key and its generated passphrase once, with C to copy and W to save to a file, and asks for word 3 to check you saved it.
+2. On the owner node, **Owner → I** (or Nodes → C) makes a one-time ticket. Every field is optional: the new machine proposes its name and boundaries, and you approve what you see. C copies the ticket, W saves it.
+3. On the new machine, press **J** and paste the ticket. Both screens show the same 6-digit code.
+4. The owner node pops up the request with the code. Tick any new boundary and grants (tools, shell) and enter the passphrase: one signed version adds it all.
 
-Setup re-asks on bad input, takes `b` (back) and `q` (quit) at every prompt, and writes nothing until its last step, so stopping it (even with Ctrl-C) leaves the machine as it was. Run again on a machine that's set up, it says so and changes nothing unless you ask it to leave the mesh.
-
-Add each further machine with a one-time ticket:
-
-```sh
-tearmesh mesh invite laptop --boundary work         # on the owner node: prints tm2-…
-tearmesh setup                                      # on the laptop: choose join, paste the ticket; shows a 6-digit code
-tearmesh mesh approve laptop --key ~/.ssh/tearmesh-owner-home   # on the owner node, after checking the codes match
-```
-
-The menu does the same: Owner → I invites, A approves. Grant and revoke with `tearmesh mesh grant laptop workstation tools shell --key …` and `tearmesh mesh revoke …`. Remove a machine with `tearmesh mesh remove laptop --key …`. Every change is a new signed version, applied to the local daemon and gossiped from there.
+Stopping anywhere before the last step leaves the machine as it was. The same steps work from the command line: `tearmesh setup` (create or join), `tearmesh mesh invite`, `tearmesh mesh approve laptop [--add-boundary lab] [--grant laptop:workstation:tools]`, `tearmesh mesh reject laptop`. Commands that sign find this mesh's owner key in `~/.ssh` (or take `--key`). Grant and revoke with `tearmesh mesh grant laptop workstation tools shell` and `tearmesh mesh revoke …`; remove a machine with `tearmesh mesh remove laptop`; add a boundary later with `tearmesh mesh boundary add lab --host workstation`. Every change is a new signed version, applied to the local daemon and gossiped from there.
 
 **Agents.** Install the Claude Code plugin for each boundary user. It adds the MCP tools `who`, `post`, `inbox`, `read` and `set_bio`, plus hooks that announce new letters:
 
 ```sh
-claude plugin marketplace add /path/to/tear-mesh   # your clone; the boundary user must be able to read it
+claude plugin marketplace add /usr/local/share/tearmesh   # written by install
 claude plugin install tearmesh@tear-mesh
 tearmesh launch --boundary work --mailbox builder -- claude
 ```
@@ -162,7 +153,7 @@ Then publish it, approve it, and use it from another machine:
 ```sh
 tearmesh offer publish cad                                      # as tm-work on the workstation
 sudo systemctl enable --now tearmesh-steward@tm-work            # runs offered servers and wakes mailboxes
-tearmesh mesh approve-offer workstation work cad --key …        # on the owner node; add --tools a,b for a subset
+tearmesh mesh approve-offer workstation work cad                # on the owner node; add --tools a,b for a subset
 claude mcp add cad -- tearmesh mcp --remote workstation/cad     # as tm-work on the laptop
 ```
 
@@ -202,7 +193,7 @@ tear-mesh runs natively on Windows. It is tested on Windows Server 2022; Windows
 - The daemon runs as a service under the virtual account `NT SERVICE\tearmesh`.
 - Clients refuse a pipe that account (or SYSTEM, or Administrators) didn't create.
 
-Install it in an elevated PowerShell with `deploy\setup-windows.ps1 -Machine <name> -Boundaries work -Stewards`. The steps are in [docs/testing.md](docs/testing.md#windows). The connector runs on Linux.
+Install it from an elevated prompt with the release binary: check it with `Get-FileHash tearmesh-x86_64-windows.exe` against `SHA256SUMS`, run `Unblock-File tearmesh-x86_64-windows.exe`, then `.\tearmesh-x86_64-windows.exe install <name> work --stewards`. It adds `C:\Program Files\tearmesh` to the PATH and the plugin there. The steps are in [docs/testing.md](docs/testing.md#windows). The connector runs on Linux.
 
 ## Config
 
@@ -234,8 +225,8 @@ Mesh-wide settings live in the membership file. Change them with `tearmesh mesh 
 [docs/testing.md](docs/testing.md) has the full walkthrough.
 - `cargo test`: unit tests and in-process mesh tests over real iroh connections. They cover placement, membership, revocation, the version chain and split healing, ticket joins, converse, tool and shell grants, and carrying a 0.1 circle over.
 - `tests/e2e-linux.sh`: two daemons with real OS users. It covers the ticket join, a tool call through the steward, shell, bios, the connector, the waker and the TUI.
-- `tests/e2e-0.3.sh`: three daemons, trying to break 0.3: the setup wizard (bad input, run twice, stopped halfway), the hub (connect-or-start, one per user, auth, all three channels both ways, chats), a stolen machine key, a leaked owner key, a node dropping mid-session, the owner offline, a flapping peer, and the menu.
-- `tests/distros.sh`: the same in Debian, Ubuntu, Fedora, Arch, openSUSE and Alpine containers.
+- `tests/e2e-0.3.sh`: three daemons, trying to break 0.3: the setup wizard (bad input, run twice, stopped halfway), joins (nameless tickets, key lookup, boundaries added later), a mesh created, joined and approved entirely in the menu, the hub (connect-or-start, one per user, auth, all three channels both ways, chats), a stolen machine key, a leaked owner key, a node dropping mid-session, the owner offline, a flapping peer, and the menu.
+- `tests/distros.sh`: the e2e and `tearmesh install` (re-run, uninstall) in Debian, Ubuntu, Fedora, Arch, openSUSE and Alpine containers.
 - `tests/e2e-windows.ps1`: the Windows version.
 
 ## Docs
@@ -248,3 +239,5 @@ Mesh-wide settings live in the membership file. Change them with `tearmesh mesh 
 ## License
 
 Licensed under either of [Apache License 2.0](LICENSE-APACHE) or [MIT](LICENSE-MIT), at your option. Unless you state otherwise, any contribution you intentionally submit for inclusion in this project is dual licensed as above, without additional terms.
+
+The passphrase word list is the EFF large wordlist (CC BY 3.0 US, Electronic Frontier Foundation).
