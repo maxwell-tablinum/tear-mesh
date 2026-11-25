@@ -243,7 +243,7 @@ The steps are in [docs/testing.md](docs/testing.md#the-gateway); `tests/gateway-
 
 ## Windows
 
-tear-mesh runs natively on Windows. Earlier versions were tested on Windows Server 2022; 0.3 and 0.4.0 have not been run on a real Windows machine yet. The 0.4.0 Windows build was only smoke-tested under Wine: the daemon starts on a named pipe and the stdio mail server lists its ten tools. Windows 10 and 11 use the same APIs but haven't been tested.
+tear-mesh runs natively on Windows. Earlier versions were tested on Windows Server 2022; nobody has used 0.3 or 0.4.0 on a real Windows machine yet. The release workflow installs the 0.4.0 build on a Windows Server runner through `install.ps1`, sees the service running and uninstalls it. A GNU cross-build of 0.4.0 was also smoke-tested under Wine: the daemon starts on a named pipe and the stdio mail server lists its ten tools. Windows 10 and 11 use the same APIs but haven't been tested.
 
 - The local socket is a named pipe, and a session's boundary is its Windows account. The daemon identifies a caller by impersonating it.
 - The daemon runs as a service under the virtual account `NT SERVICE\tearmesh`.

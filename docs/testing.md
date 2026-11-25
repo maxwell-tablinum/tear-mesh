@@ -469,7 +469,7 @@ If it fails, the extension's log says "tear-mesh was not found" (not on PATH: se
 
 ## Windows
 
-tear-mesh runs natively on Windows. Earlier versions were tested on Windows Server 2022; 0.3 and 0.4.0 have not been run on a real Windows machine yet. The 0.4.0 Windows build was only smoke-tested under Wine: the daemon starts on a named pipe and the stdio mail server lists its ten tools.
+tear-mesh runs natively on Windows. Earlier versions were tested on Windows Server 2022; nobody has used 0.3 or 0.4.0 on a real Windows machine yet. The release workflow installs the 0.4.0 build on a Windows Server runner through `install.ps1`, sees the service running and uninstalls it. A GNU cross-build of 0.4.0 was also smoke-tested under Wine: the daemon starts on a named pipe and the stdio mail server lists its ten tools.
 - The local socket is the named pipe `\\.\pipe\tearmesh`.
 - A session's boundary is the Windows account it runs as. The daemon learns it by briefly impersonating the pipe client.
 - Only an elevated Administrator, SYSTEM, the daemon's own account or a listed `admins` user may run admin commands. A non-elevated Administrator is not admin.
@@ -559,6 +559,6 @@ On an owner node it warns first: afterwards only the other owner keys (the recov
 ## Releases
 
 1. Bump the version in `Cargo.toml` and `adapters/claude-code/.claude-plugin/plugin.json` (a unit test checks they match), and commit.
-2. `git tag -a v<version> -m "<notes>"` and push the tag. The `release` workflow builds the Linux (x86_64 and aarch64, musl) and Windows (MSVC) binaries, smoke-tests each through the install script served from a local folder (a corrupted binary refused, install, re-run, uninstall), fills `install.sh` and `install.ps1` with the version and the binaries' SHA-256 (failing if any `@…@` placeholder is left), and creates a **draft** release with the binaries, the two scripts and `SHA256SUMS` (which lists the scripts too).
+2. `git tag -a v<version> -m "<notes>"` and push the tag. The `release` workflow builds the Linux (x86_64 and aarch64, musl) and Windows (MSVC) binaries, smoke-tests each through the install script served from a local folder (a corrupted binary refused, install, re-run, uninstall), fills `install.sh` and `install.ps1` with the version and the binaries' SHA-256 (failing if any `@…@` placeholder is left), and creates a **draft** release with the binaries, the two scripts and `SHA256SUMS` (which lists the scripts too). If no run starts within a minute, delete the tag on the remote and push it again (needed twice on 2026-11-25; the first run started only once the workflow file was on the default branch).
 3. On the Windows test VM, download the Windows binary from the draft and run `tests\e2e-windows.ps1 -Exe <it>`. On a Linux and the Windows test VM, run both one-liners that `tearmesh mesh invite` prints against the draft's assets, and check on Windows that `irm` returns `install.ps1` as text.
 4. Publish the draft.

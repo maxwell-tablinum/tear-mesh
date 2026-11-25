@@ -122,6 +122,8 @@ jobs:
           done
           if grep -n '@[A-Z0-9_]*@' dist/install.sh dist/install.ps1; then echo "placeholders left"; exit 1; fi
           cd dist && sha256sum install.sh install.ps1 >> SHA256SUMS
+      # checkout leaves the tag pointing at the commit, without its message: fetch the tag itself.
+      - run: git fetch --force --no-tags origin "+refs/tags/$GITHUB_REF_NAME:refs/tags/$GITHUB_REF_NAME"
       # --notes-from-tag, not --generate-notes, which adds handles and compare links.
       - run: gh release create "$GITHUB_REF_NAME" --draft --verify-tag --notes-from-tag dist/*
         env:
