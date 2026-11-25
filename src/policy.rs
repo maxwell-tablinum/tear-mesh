@@ -57,7 +57,10 @@ pub fn check_recipients(mesh: &Mesh, boundary: &str, to: &[String]) -> Result<()
         if a == "*" {
             continue;
         }
-        let (_, host) = parse_address(a).ok_or_else(|| anyhow::anyhow!("bad address {a:?}"))?;
+        let (_, host) = parse_address(a).ok_or_else(|| match crate::valid_name(a) {
+            true => anyhow::anyhow!("bad address {a:?}: use mailbox@machine (for example admin@{a}), or * for everyone"),
+            false => anyhow::anyhow!("bad address {a:?}: use mailbox@machine, or * for everyone"),
+        })?;
         ensure!(
             mesh.hosts(host, boundary),
             "{host} is not in boundary {boundary}; can't address {a}"
@@ -138,6 +141,23 @@ pub fn may_shell(mesh: &Mesh, caller: &str, target: &str, boundary: &str) -> Res
     Ok(())
 }
 
+/// A status record's body: a JSON object of at most 4 KiB with only `about` (a string) and
+/// `pending_questions` (a whole number), both optional.
+pub fn check_status(body: &str) -> Result<()> {
+    use crate::envelope::MAX_STATUS;
+    ensure!(body.len() <= MAX_STATUS, "a status record is at most {MAX_STATUS} bytes");
+    let m: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_str(body).map_err(|_| anyhow::anyhow!("a status record's body is a JSON object"))?;
+    for (k, v) in &m {
+        match k.as_str() {
+            "about" => ensure!(v.is_string(), "about must be text"),
+            "pending_questions" => ensure!(v.is_u64(), "pending_questions must be a whole number"),
+            _ => anyhow::bail!("a status record has only about and pending_questions, not {k:?}"),
+        }
+    }
+    Ok(())
+}
+
 /// The one check every entry passes before it is stored, local or received.
 pub fn check_entry(mesh: &Mesh, boundary: &str, entry: &Entry) -> Result<Envelope> {
     let env = entry.open()?;
@@ -162,9 +182,18 @@ pub fn check_entry(mesh: &Mesh, boundary: &str, entry: &Entry) -> Result<Envelop
     );
     ensure!(
         env.kind.is_letter() || env.to == ["*"],
-        "offers and bios go to the whole boundary"
+        "offers, bios and status records go to the whole boundary"
     );
     match env.kind {
+        crate::envelope::Kind::Claim => {
+            ensure!(env.thread.is_some(), "a claim answers a letter: it needs a thread");
+            let b = entry.body.as_bytes();
+            ensure!(
+                b.len() <= 8 && b.iter().all(u8::is_ascii_digit),
+                "a claim's body is empty or the seconds until the answer (1 to 8 digits)"
+            );
+        }
+        crate::envelope::Kind::Status => check_status(&entry.body)?,
         crate::envelope::Kind::Bio => ensure!(
             entry.body.len() <= crate::envelope::MAX_BIO,
             "bio over {} bytes",
@@ -207,6 +236,7 @@ mod tests {
             name: "home".into(),
             version: 1,
             prev: None,
+            closed: false,
             owners: vec![],
             boundaries: vec!["work".into(), "vault".into()],
             settings: Settings::default(),

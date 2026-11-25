@@ -74,7 +74,12 @@ pub fn owner_key_path(mesh: &str) -> PathBuf {
 /// Private keys under ~/.ssh whose public half is one of `owners` (SHA256 fingerprints). The
 /// menu calls this machine an owner node when it finds one.
 pub fn find_owner_keys(owners: &[String]) -> Vec<PathBuf> {
-    let Ok(rd) = std::fs::read_dir(crate::os::home_dir().join(".ssh")) else {
+    find_owner_keys_in(&crate::os::home_dir(), owners)
+}
+
+/// The same, under `home`/.ssh (uninstall looks in the sudo invoker's home).
+pub fn find_owner_keys_in(home: &Path, owners: &[String]) -> Vec<PathBuf> {
+    let Ok(rd) = std::fs::read_dir(home.join(".ssh")) else {
         return vec![];
     };
     let mut out: Vec<PathBuf> = rd
@@ -200,7 +205,7 @@ async fn existing(w: &mut Wizard, c: &Config, status: &Value) -> Result<Option<S
         }
     }
     eprintln!("  1  Keep it as it is (nothing changes)");
-    eprintln!("  2  Leave this mesh and set up again (the machine forgets the mesh; its mail logs stay)");
+    eprintln!("  2  Leave this mesh and set up again (the machine forgets the mesh; its mail logs are kept, moved aside)");
     match w.choose("Choose 1 or 2 (Enter keeps it).", &["1", "2"], Some("1"))? {
         Answer::Text(t) if t == "2" => {}
         Answer::Quit => return Ok(None),
@@ -218,7 +223,7 @@ async fn existing(w: &mut Wizard, c: &Config, status: &Value) -> Result<Option<S
         },
     )? {
         Answer::Text(_) => {
-            admin(Request::Reset).await?;
+            admin(Request::LeaveMesh).await?;
             eprintln!("This machine left mesh {name}.");
             Ok(Some(Step::Choose))
         }
@@ -231,7 +236,7 @@ async fn existing(w: &mut Wizard, c: &Config, status: &Value) -> Result<Option<S
 async fn join(w: &mut Wizard) -> Result<Option<bool>> {
     loop {
         let ticket = match w.text(
-            "\nOn the owner node run `tearmesh mesh invite` (or Owner → I in `tearmesh menu`), then paste the ticket here:",
+            "\nOn the owner node run `tearmesh mesh invite` (or Mesh → A in `tearmesh menu`), then paste the ticket here:",
             check_ticket,
         )? {
             Answer::Text(t) => t,

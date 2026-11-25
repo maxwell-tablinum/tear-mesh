@@ -14,12 +14,19 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tracing::debug;
 
-use crate::config::DEFAULT_SOCKET;
+use crate::config::{DEFAULT_SOCKET, Guest};
 use crate::envelope::{Kind, MAX_BIO, Trust};
 use crate::node::{Event, Node};
 use crate::offer::Offer;
 use crate::os::{BoxRead, BoxWrite, Caller};
 use crate::{bridge, join, shell, valid_name};
+
+impl Request {
+    /// The plain listing: unread letters, or all of them.
+    pub fn inbox(all: bool) -> Request {
+        Request::Inbox { all, thread: None }
+    }
+}
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(tag = "op", rename_all = "snake_case")]
@@ -35,17 +42,50 @@ pub enum Request {
         trust: Option<Trust>,
     },
     Who,
+    /// With no recipient and a `thread`, the letter goes to the sender of the letter the thread
+    /// names. `idem`: the same key from the same mailbox within 24 hours writes nothing and
+    /// replies with the first letter's id and `duplicate: true`.
     Post {
+        #[serde(default)]
         to: Vec<String>,
         subject: String,
         body: String,
         thread: Option<String>,
         #[serde(default)]
         kind: Option<Kind>,
+        #[serde(default)]
+        idem: Option<String>,
     },
+    /// Oldest first. `thread` (an id or prefix of any letter in it) narrows the listing to that
+    /// thread.
     Inbox {
         #[serde(default)]
         all: bool,
+        #[serde(default)]
+        thread: Option<String>,
+    },
+    /// Answers the letter `thread` names with a claim: "working on it".
+    Claim {
+        thread: String,
+        #[serde(default)]
+        expect_secs: Option<u64>,
+        #[serde(default)]
+        note: Option<String>,
+    },
+    /// Merges the given fields into this mailbox's status record. With none given, replies with
+    /// the current record and writes nothing.
+    SetStatus {
+        #[serde(default)]
+        about: Option<String>,
+        #[serde(default)]
+        task: Option<String>,
+        #[serde(default)]
+        pending_questions: Option<u64>,
+    },
+    /// Pings the named machines of the caller's boundary (all of them when empty).
+    Reach {
+        #[serde(default)]
+        machines: Vec<String>,
     },
     Read {
         id: String,
@@ -65,6 +105,40 @@ pub enum Request {
     Offers {
         #[serde(default)]
         boundary: Option<String>,
+    },
+    // Screening (`screen` in the daemon's config), for the caller's boundary (admins name one).
+    // Known limit: any session in the boundary can fetch waiting letters and give a verdict (the
+    // steward runs as the boundary's user), so screening filters inbound mail; it is not a sandbox
+    // for a local agent that is already compromised. The quarantine (its list carries the
+    // sender's subject and what the reader tried) and releasing take an admin, so a boundary's
+    // agent neither reads a flagged letter's text nor undoes a quarantine; it sees the counts in
+    // `status`.
+    /// The oldest letters waiting for the screener, with bodies, and whether screening is on.
+    ScreenNext {
+        #[serde(default)]
+        boundary: Option<String>,
+    },
+    /// `clean` or `flagged`, once per letter.
+    ScreenVerdict {
+        #[serde(default)]
+        boundary: Option<String>,
+        id: String,
+        verdict: String,
+        #[serde(default)]
+        reason: String,
+    },
+    /// Flagged letters and how many wait; with `id`, that flagged letter with its body.
+    Quarantine {
+        #[serde(default)]
+        boundary: Option<String>,
+        #[serde(default)]
+        id: Option<String>,
+    },
+    /// Flagged -> released.
+    Release {
+        #[serde(default)]
+        boundary: Option<String>,
+        id: String,
     },
     /// Opens a tool stream to `machine`'s `server`; the connection then carries MCP lines.
     Remote {
@@ -118,6 +192,15 @@ pub enum Request {
     },
     /// Forgets the mesh (logs stay) so a new first file can be adopted.
     Reset,
+    /// Leaves the mesh for good: the logs move aside and the machine is free to create or join any
+    /// mesh (a dissolved mesh is forgotten). Replies `{"left": true}`.
+    LeaveMesh,
+    /// Syncs with every machine now (on a dissolved node: hands them the closed version). Replies
+    /// with the names of the machines that completed a session.
+    SyncNow,
+    /// Tells every other machine this one is leaving (it only marks it there; an owner still
+    /// removes it). Replies with the names that heard.
+    Leave,
     /// Sets this machine's bio in `boundary` with admin trust.
     AdminBio {
         boundary: String,
@@ -142,6 +225,12 @@ pub async fn serve(node: Arc<Node>) -> Result<()> {
     let listener = crate::os::listen(&node.cfg.socket).await?;
     let ids = Arc::new(node.cfg.identity_map()?);
     let admins = Arc::new(node.cfg.admin_identities()?);
+    let guests = Arc::new(node.cfg.guest_map()?);
+    // Names were checked in the config; two names can still be one account.
+    ensure!(
+        !guests.keys().any(|id| ids.contains_key(id) || admins.contains(id)),
+        "a user under [guests] is also under [users] or admins (the same account under two names)"
+    );
     // Any local user may connect, so cap how many connections can be open at once.
     let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
     loop {
@@ -154,10 +243,10 @@ pub async fn serve(node: Arc<Node>) -> Result<()> {
                 continue;
             }
         };
-        let (node, ids, admins) = (node.clone(), ids.clone(), admins.clone());
+        let (node, ids, admins, guests) = (node.clone(), ids.clone(), admins.clone(), guests.clone());
         tokio::spawn(async move {
             let _slot = slot;
-            if let Err(e) = handle(node, inc, &ids, &admins).await {
+            if let Err(e) = handle(node, inc, &ids, &admins, &guests).await {
                 debug!("socket client: {e:#}");
             }
         });
@@ -183,6 +272,7 @@ async fn handle(
     inc: crate::os::Incoming,
     ids: &HashMap<String, String>,
     admins: &[String],
+    guests: &HashMap<String, Guest>,
 ) -> Result<()> {
     let crate::os::Incoming {
         read,
@@ -193,6 +283,9 @@ async fn handle(
     let mut who: Option<(Caller, Option<String>, bool)> = None;
     let mut mailbox = "admin".to_string();
     let mut trust = Trust::Member;
+    // A guest user's session: its boundary, mailbox and guest trust are the config's, and it is
+    // answered GUEST_OPS only.
+    let mut locked = false;
     let mut _hold = None;
     loop {
         let next = if who.is_none() {
@@ -214,20 +307,27 @@ async fn handle(
         // Windows can name the caller only after reading from it, so identify on the first line.
         if who.is_none() {
             let c = caller()?;
-            let boundary = ids.get(&c.id).cloned();
-            let admin = c.admin || admins.contains(&c.id);
-            if boundary.is_none() && !admin {
-                reply(
-                    &mut write,
-                    Err(anyhow::anyhow!(
-                        "OS user {} isn't mapped to a boundary on this machine",
-                        c.id
-                    )),
-                )
-                .await?;
-                return Ok(());
+            if let Some(g) = guests.get(&c.id) {
+                // Never an admin, whatever else the OS says of the account.
+                (locked, trust) = (true, Trust::Guest);
+                mailbox = g.mailbox.clone();
+                who = Some((c, Some(g.boundary.clone()), false));
+            } else {
+                let boundary = ids.get(&c.id).cloned();
+                let admin = c.admin || admins.contains(&c.id);
+                if boundary.is_none() && !admin {
+                    reply(
+                        &mut write,
+                        Err(anyhow::anyhow!(
+                            "OS user {} isn't mapped to a boundary on this machine",
+                            c.id
+                        )),
+                    )
+                    .await?;
+                    return Ok(());
+                }
+                who = Some((c, boundary, admin));
             }
-            who = Some((c, boundary, admin));
         }
         let (_, boundary, admin) = who.clone().expect("set above");
         let line = String::from_utf8_lossy(&buf);
@@ -238,10 +338,20 @@ async fn handle(
                 continue;
             }
         };
+        // One allow-list, so a request added later is refused to guests by default.
+        let guest_ok = matches!(
+            req,
+            Request::Hello { .. } | Request::Who | Request::Reach { .. } | Request::Post { .. } | Request::Inbox { .. } | Request::Read { .. }
+        );
+        let agent_only = matches!(req, Request::Claim { .. } | Request::SetStatus { .. } | Request::Bio { .. });
+        if (locked && !guest_ok) || (trust == Trust::Guest && agent_only) {
+            reply(&mut write, Err(anyhow::anyhow!("a guest session can't do that"))).await?;
+            continue;
+        }
         let b = || {
             boundary
                 .clone()
-                .context("this OS user isn't mapped to a boundary")
+                .context("this OS user isn't mapped to a boundary: mail belongs to a boundary user; run the command through `tearmesh launch --boundary <b> -- …`")
         };
         let need_admin = || {
             if admin {
@@ -259,6 +369,10 @@ async fn handle(
                 trust: t,
             } => (|| {
                 let b = b()?;
+                ensure!(
+                    !locked || (m.as_ref().is_none_or(|m| *m == mailbox) && t.is_none_or(|t| t == Trust::Guest) && !hold),
+                    "a guest session keeps its mailbox {mailbox} and guest trust, and can't hold the mailbox"
+                );
                 if let Some(m) = m {
                     ensure!(valid_name(&m), "bad mailbox name {m:?}");
                     mailbox = m;
@@ -270,7 +384,11 @@ async fn handle(
                 if hold {
                     _hold = Some(node.hold(&b, &mailbox));
                 }
-                Ok(json!({ "address": format!("{mailbox}@{}", node.cfg.machine), "boundary": b }))
+                let mut v = json!({ "address": format!("{mailbox}@{}", node.cfg.machine), "boundary": b });
+                if locked {
+                    v["guest"] = true.into();
+                }
+                Ok(v)
             })(),
             Request::Who => b().and_then(|b| Ok(serde_json::to_value(node.who(&b, &mailbox)?)?)),
             Request::Post {
@@ -279,17 +397,45 @@ async fn handle(
                 body,
                 thread,
                 kind,
+                idem,
             } => b().and_then(|b| {
                 let kind = kind.unwrap_or_default();
-                ensure!(kind.is_letter(), "post sends letters (info, task, question)");
-                Ok(json!({ "id": node.post_as(&b, &mailbox, trust, kind, to, subject, body, thread)? }))
+                ensure!(kind.is_letter() && kind != Kind::Claim, "post sends letters (info, task, question)");
+                if let Some(k) = &idem {
+                    ensure!(
+                        (1..=128).contains(&k.len()) && k.bytes().all(|c| (b' '..=b'~').contains(&c)),
+                        "idem is 1 to 128 printable ASCII characters"
+                    );
+                }
+                if let Some(t) = thread.as_deref().filter(|_| trust == Trust::Guest) {
+                    guest_may_see(&node, &b, &mailbox, t)?;
+                }
+                let (id, dup) =
+                    node.post_with(&b, &mailbox, trust, kind, to, subject, body, thread, idem.as_deref())?;
+                Ok(if dup { json!({ "id": id, "duplicate": true }) } else { json!({ "id": id }) })
             }),
-            Request::Inbox { all } => {
-                b().and_then(|b| Ok(serde_json::to_value(node.inbox(&b, &mailbox, all)?)?))
+            Request::Claim { thread, expect_secs, note } => b().and_then(|b| {
+                Ok(json!({ "id": node.claim(&b, &mailbox, trust, thread, expect_secs, note)? }))
+            }),
+            Request::SetStatus { about, task, pending_questions } => {
+                b().and_then(|b| node.set_status(&b, &mailbox, trust, about, task, pending_questions))
             }
-            Request::Read { id } => {
-                b().and_then(|b| Ok(serde_json::to_value(node.read(&b, &mailbox, &id)?)?))
-            }
+            Request::Reach { machines } => match b() {
+                Ok(b) => crate::ping::reach(&node, &b, machines).await.and_then(|r| Ok(serde_json::to_value(r)?)),
+                Err(e) => Err(e),
+            },
+            Request::Inbox { all, thread } => b().and_then(|b| {
+                if let Some(t) = thread.as_deref().filter(|_| trust == Trust::Guest) {
+                    guest_may_see(&node, &b, &mailbox, t)?;
+                }
+                Ok(serde_json::to_value(node.inbox_thread(&b, &mailbox, all, thread.as_deref())?)?)
+            }),
+            Request::Read { id } => b().and_then(|b| {
+                if trust == Trust::Guest {
+                    guest_may_see(&node, &b, &mailbox, &id)?;
+                }
+                Ok(serde_json::to_value(node.read(&b, &mailbox, &id)?)?)
+            }),
             Request::Notify => {
                 b().and_then(|b| Ok(serde_json::to_value(node.notify(&b, &mailbox)?)?))
             }
@@ -326,6 +472,37 @@ async fn handle(
             Request::Offers { boundary: asked } => {
                 pick_boundary(boundary.clone(), asked, admin).and_then(|b| offers(&node, &b))
             }
+            Request::ScreenNext { boundary: asked } => {
+                pick_boundary(boundary.clone(), asked, admin).and_then(|b| {
+                    Ok(json!({
+                        "screening": node.screening(&b),
+                        "machine": node.cfg.machine,
+                        "letters": node.screen_next(&b, 8)?,
+                    }))
+                })
+            }
+            Request::ScreenVerdict {
+                boundary: asked,
+                id,
+                verdict,
+                reason,
+            } => pick_boundary(boundary.clone(), asked, admin).and_then(|b| {
+                node.screen_verdict(&b, &id, &verdict, &reason)?;
+                Ok(json!({ "id": id, "verdict": verdict }))
+            }),
+            Request::Quarantine {
+                boundary: asked,
+                id,
+            } => need_admin().and_then(|_| pick_boundary(boundary.clone(), asked, admin)).and_then(|b| match id {
+                Some(id) => Ok(serde_json::to_value(node.quarantined(&b, &id)?)?),
+                None => {
+                    let (flagged, waiting) = node.quarantine(&b)?;
+                    Ok(json!({ "flagged": flagged, "waiting": waiting }))
+                }
+            }),
+            Request::Release { boundary: asked, id } => need_admin()
+                .and_then(|_| pick_boundary(boundary.clone(), asked, admin))
+                .and_then(|b| Ok(json!({ "released": node.release(&b, &id)? }))),
             Request::Subscribe => {
                 let b = match b() {
                     Ok(b) => b,
@@ -456,13 +633,43 @@ async fn handle(
             Request::Reject { name } => need_admin()
                 .and_then(|_| Ok(json!({ "rejected": node.joins.reject(name.as_deref())? }))),
             Request::JoinCancel => need_admin().and_then(|_| Ok(json!({ "cancelled": node.cancel_join() }))),
+            Request::SyncNow => match need_admin() {
+                Ok(()) => Ok(json!({ "synced": node.sync_all().await })),
+                Err(e) => Err(e),
+            },
+            Request::Leave => match need_admin() {
+                Ok(()) => crate::ping::leave(&node).await.map(|h| json!({ "heard": h })),
+                Err(e) => Err(e),
+            },
             Request::Reset => need_admin().and_then(|_| {
                 node.reset()?;
                 Ok(json!({ "reset": true }))
             }),
+            Request::LeaveMesh => need_admin().and_then(|_| {
+                node.leave()?;
+                Ok(json!({ "left": true }))
+            }),
         };
         reply(&mut write, res).await?;
     }
+    Ok(())
+}
+
+/// Whether a session of guest trust may see letter `id`: one to its mailbox or the board, or one it
+/// sent as a guest (a member session on this machine may use the same mailbox name). Anything else
+/// answers as an unknown id does.
+fn guest_may_see(node: &Node, boundary: &str, mailbox: &str, id: &str) -> Result<()> {
+    // Its own listing has no side effect and settles the letters addressed to it.
+    let listed = node.inbox_thread(boundary, mailbox, true, Some(id))?;
+    let prefix = id.to_ascii_lowercase();
+    if listed.iter().any(|l| l.id.starts_with(&prefix)) {
+        return Ok(());
+    }
+    // shortcut: node.rs has no lookup without the read mark, so this marks the letter read for the
+    // mailbox; only letters none of its listings show get here (they leave out what it sent and what
+    // isn't to it), so nothing sees the mark. Add a plain lookup to node.rs if marks are ever shown elsewhere.
+    let l = node.read(boundary, mailbox, id)?;
+    ensure!(l.from == format!("{mailbox}@{}", node.cfg.machine) && l.trust == Trust::Guest, "no letter {id} in this boundary");
     Ok(())
 }
 

@@ -1,5 +1,7 @@
 # tear-mesh: Design
 
+> **History, no longer updated (2026-11-19).** The specification of tear-mesh is [spec.md](spec.md). Where this document disagrees with it, spec.md is right.
+
 Rev 3 · 2026-10-16
 
 - Rev 1 (2026-10-12) was titled "Agent Comms Fabric".
@@ -61,6 +63,8 @@ Check quotes against METR's PDF before they go in the README.
    - The first circle a machine adopts comes out of band, from `circle apply` or an invite, and must list that machine.
    - For security-key signatures, the daemon checks the user-presence flag itself.
    - Revocation means publishing a version without the machine. Data already copied stays where it is.
+   - **The farewell rule.** A machine that a stored version removed may still open the sync protocol, and no other. It gets only the versions up to and including the one that removed it: no heads, no entries, no addresses. So it learns it was removed and leaves (its logs move aside and it may join any mesh), but only when that version arrives by sync from a member, never from a local `mesh apply`. The small leak: it reads the membership changes made between the version it held and its removal (machine names, node ids, boundaries, grants, owner keys). It never reads mail, addresses or anything later.
+   - **Dissolving** is an ordinary owner-signed next version with `closed = true` and no machines, grants or approvals. Nothing can follow it. A closed sibling beats an open tip with nothing built on it, after the removed-signer rule; an open branch with more versions on it beats the closed one, so two owners racing never split the mesh. Each machine keeps the closed version, to hand it to machines that were offline, until it creates, joins or resets. Then it forgets it for good: the mesh id goes in a tombstone file and is never adopted again, and the logs move to `boundaries-<mesh id>/`.
 5. 🟩 **One network identity per circle.** Users don't manage a tear-mesh login per boundary. Model-provider logins (for example a Claude Code token) are still per boundary per machine, because a session runs as its boundary's user. That's the provider's requirement, not tear-mesh's.
 6. 🟩 **Storage: our own per-boundary logs.** This replaces rev 2's D7 (p2panda).
    - SQLite, bundled, one file per boundary; triggers refuse UPDATE and DELETE.
@@ -113,7 +117,7 @@ What shipped:
 - **The daemon:** iroh, the signed circle with invites and revocation, per-boundary SQLite logs and sync.
 - **The local socket:** uid mapped to a boundary, plus admin commands.
 - **The MCP server, CLI, waker, and the Claude Code plugin.**
-- **A terminal UI** (`tearmesh tui`) for people: inbox, reading, replies and new letters.
+- **A terminal UI** (`tearmesh tui`, deprecated; the menu has mail) for people: inbox, reading, replies and new letters.
 - **Packaging:** systemd units and a Linux setup script.
 
 **Tests:**
@@ -154,7 +158,7 @@ Not yet tested: two machines on different networks (NAT traversal through relays
 
 ## Next
 
-- **0.2:** apps over the mesh (tools, shell, bios), grants, ticket joins with approval, and a Claude connector. See [spec-0.2.md](spec-0.2.md). The items below move to 0.3 or later.
+- **0.2:** apps over the mesh (tools, shell, bios), grants, ticket joins with approval, and a Claude connector. See [spec-0.2.md](spec-0.2.md). The items below move to 0.3 or later. 0.3 and 0.4 (see [spec.md](spec.md)) added the menu and the hub, then the conversation tools, agent status, the gateway (which replaced the connector) and the Claude Desktop extension.
 - **Was 0.2, now later:**
   - macOS (per-boundary users plus Seatbelt or pf);
   - native Windows (named pipes, a Windows account per boundary, a Windows service). Until then, Windows runs it in WSL2;
@@ -165,7 +169,7 @@ Not yet tested: two machines on different networks (NAT traversal through relays
 - **Later:**
   - **Guests and the post office.** A `public` boundary on an always-on machine, invite codes as capability tokens (mailbox, rights, quota, expiry, binds to the first key that uses it, owner-signed, revoked through the circle file), and a connector door for chat apps that don't run tear-mesh.
   - **Cross-boundary flow**, with tear-line approvals on a cleared machine and content-free phone notifications.
-  - **A gateway for phone and web chat**, with a built-in login.
+  - ~~A gateway for phone and web chat, with a built-in login.~~ Built in 0.4, as an OS user of its own that the daemon holds to guest trust (spec section 18.4). Never tried with a real Claude client.
   - **File sensitivity labels.**
   - **The hive.**
 
@@ -176,4 +180,4 @@ Not yet tested: two machines on different networks (NAT traversal through relays
 - [ ] **Guest forwarding.** Guest mail forwarded from the public boundary to an inner mailbox is an upward flow. It probably needs an explicit receive-only clearance.
 - [ ] **Naming:** the name of the public boundary, and DNS addresses for guests (for example `frontdesk@example.com` found through a TXT record).
 - [ ] **A free post office.** Serverless with wake-up fits the connector door but not the peer side (cold starts, an ephemeral disk). Free-tier VMs come with idle reclamation or IPv4 charges. Check current terms.
-- [ ] **Voice mode with connectors:** test it by hand.
+- [ ] **Voice mode with connectors:** still open in 0.4 (never tested); the gateway is built for either answer. See `open/voice-polling` in [spec.md](spec.md) and `docs/research/x2-spike/README.md`.

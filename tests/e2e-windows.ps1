@@ -243,10 +243,10 @@ Start-Sleep 60
     '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"e2e","version":"0"}}}'
     '{"jsonrpc":"2.0","method":"notifications/initialized"}'
     '{"jsonrpc":"2.0","id":2,"method":"tools/list"}'
-    '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"inbox","arguments":{"all":true}}}')
+    '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"inbox_list","arguments":{"unread_only":false}}}')
   # ping holds stdin open for two seconds so the server answers before it sees the end.
   $r = Run tme-lap "(type `"$mcpIn`" & ping -n 3 127.0.0.1 >nul) | `"$TM`" mcp" @{ TEARMESH_SOCKET = $LapSock; TEARMESH_MAILBOX = 'admin' }
-  Check "MCP server lists tools and reads the inbox over stdio" { $r.Out.Contains('"name":"post"') -and $r.Out.Contains('work note') }
+  Check "MCP server lists tools and reads the inbox over stdio" { $r.Out.Contains('"name":"send_message"') -and $r.Out.Contains('work note') }
 
   tm tme-work $WsSock builder post --to admin@laptop --subject "hook test" --body x | Out-Null
   WaitFor { (& $lapInbox) -match 'hook test' } | Out-Null

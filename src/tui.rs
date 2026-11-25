@@ -1,6 +1,6 @@
-//! `tearmesh tui`: a terminal mail client for one mailbox. It connects like any session, as the
-//! OS user it runs as, so the daemon decides its boundary. It doesn't hold the mailbox, so agents
-//! are still woken for mail; opening a letter marks it read for the mailbox.
+//! The mail client for one mailbox: the menu's Mail tab, and the deprecated `tearmesh tui`. It
+//! connects like any session, as the OS user it runs as, so the daemon decides its boundary. It
+//! doesn't hold the mailbox, so agents are still woken for mail; opening a letter marks it read.
 
 use std::time::{Duration, Instant};
 
@@ -17,7 +17,7 @@ use crate::ipc::{Client, Request, socket_path};
 use crate::node::{Letter, Who};
 
 /// Work the UI asks the runtime to do against the daemon.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Cmd {
     Refresh,
     Open(String),
@@ -198,13 +198,14 @@ impl App {
         })
     }
 
-    pub fn draw(&self, f: &mut Frame) {
+    /// Draws into `area`: the whole screen for `tearmesh tui`, the Mail tab in the menu.
+    pub fn draw_in(&self, f: &mut Frame, area: Rect) {
         let [head, main, foot] = Layout::vertical([
             Constraint::Length(1),
             Constraint::Min(3),
             Constraint::Length(1),
         ])
-        .areas(f.area());
+        .areas(area);
         let mut spans = vec![
             Span::styled(
                 " tear-mesh ",
@@ -450,20 +451,20 @@ pub async fn run(mailbox: Option<String>) -> Result<()> {
         hello["address"].as_str().unwrap_or_default().into(),
         hello["boundary"].as_str().unwrap_or_default().into(),
     );
-    exec(&mut c, &mut app, Cmd::Refresh).await;
+    shown(&mut c, &mut app, Cmd::Refresh).await;
     let mut terminal = ratatui::init();
     let res = async {
         let mut refreshed = Instant::now();
         while !app.quit {
-            terminal.draw(|f| app.draw(f))?;
+            terminal.draw(|f| app.draw_in(f, f.area()))?;
             if event::poll(Duration::from_millis(200))? {
                 if let Event::Key(k) = event::read()?
                     && let Some(cmd) = app.on_key(k)
                 {
-                    exec(&mut c, &mut app, cmd).await;
+                    shown(&mut c, &mut app, cmd).await;
                 }
             } else if refreshed.elapsed() >= Duration::from_secs(3) {
-                exec(&mut c, &mut app, Cmd::Refresh).await;
+                shown(&mut c, &mut app, Cmd::Refresh).await;
                 refreshed = Instant::now();
             }
         }
@@ -474,55 +475,57 @@ pub async fn run(mailbox: Option<String>) -> Result<()> {
     res
 }
 
-async fn exec(c: &mut Client, app: &mut App, cmd: Cmd) {
-    let r: Result<()> = async {
-        match cmd {
-            Cmd::Refresh => {
-                app.who = serde_json::from_value(c.call(&Request::Who).await?).ok();
-                let letters: Vec<Letter> =
-                    serde_json::from_value(c.call(&Request::Inbox { all: app.all }).await?)?;
-                app.set_letters(letters);
-            }
-            Cmd::Open(id) => {
-                let l: Letter = serde_json::from_value(c.call(&Request::Read { id }).await?)?;
-                if let Some(x) = app.letters.iter_mut().find(|x| x.id == l.id) {
-                    x.read = true;
-                }
-                app.scroll = 0;
-                app.open = Some(l);
-            }
-            Cmd::Send {
-                to,
-                subject,
-                body,
-                thread,
-            } => {
-                let v = c
-                    .call(&Request::Post {
-                        kind: None,
-                        to,
-                        subject,
-                        body,
-                        thread,
-                    })
-                    .await?;
-                app.compose = None;
-                app.status = format!(
-                    "sent {}",
-                    v["id"]
-                        .as_str()
-                        .and_then(|s| s.get(..12))
-                        .unwrap_or_default()
-                );
-            }
-        }
-        Ok(())
-    }
-    .await;
-    if let Err(e) = r {
+/// `exec`, with an error shown in the status line.
+async fn shown(c: &mut Client, app: &mut App, cmd: Cmd) {
+    if let Err(e) = exec(c, app, cmd).await {
         // shortcut: no reconnect; if the daemon restarts, quit and start the TUI again.
         app.status = format!("error: {e:#}");
     }
+}
+
+pub(crate) async fn exec(c: &mut Client, app: &mut App, cmd: Cmd) -> Result<()> {
+    match cmd {
+        Cmd::Refresh => {
+            app.who = serde_json::from_value(c.call(&Request::Who).await?).ok();
+            let letters: Vec<Letter> =
+                serde_json::from_value(c.call(&Request::inbox(app.all)).await?)?;
+            app.set_letters(letters);
+        }
+        Cmd::Open(id) => {
+            let l: Letter = serde_json::from_value(c.call(&Request::Read { id }).await?)?;
+            if let Some(x) = app.letters.iter_mut().find(|x| x.id == l.id) {
+                x.read = true;
+            }
+            app.scroll = 0;
+            app.open = Some(l);
+        }
+        Cmd::Send {
+            to,
+            subject,
+            body,
+            thread,
+        } => {
+            let v = c
+                .call(&Request::Post {
+                    kind: None,
+                    to,
+                    subject,
+                    body,
+                    thread,
+                    idem: None,
+                })
+                .await?;
+            app.compose = None;
+            app.status = format!(
+                "sent {}",
+                v["id"]
+                    .as_str()
+                    .and_then(|s| s.get(..12))
+                    .unwrap_or_default()
+            );
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -562,7 +565,7 @@ mod tests {
 
     fn screen(app: &App) -> String {
         let mut t = Terminal::new(TestBackend::new(110, 16)).unwrap();
-        t.draw(|f| app.draw(f)).unwrap();
+        t.draw(|f| app.draw_in(f, f.area())).unwrap();
         let buf = t.backend().buffer();
         buf.content()
             .chunks(buf.area.width as usize)
@@ -594,6 +597,7 @@ mod tests {
                 ..Default::default()
             }],
             addresses: vec![],
+            status: vec![],
         });
         let s = screen(&a);
         assert!(s.contains("admin@laptop · boundary work"), "{s}");

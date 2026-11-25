@@ -1,5 +1,6 @@
 //! One SQLite file per boundary. `entries` is append-only (triggers refuse UPDATE and DELETE);
-//! `seen` is this machine's own read/notified state and is never synced.
+//! `seen` is this machine's own read/notified state, `screen` its screening verdicts and `idem`
+//! the keys of recent posts; none is ever synced.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -39,6 +40,14 @@ CREATE TRIGGER IF NOT EXISTS entries_no_delete BEFORE DELETE ON entries
 CREATE TABLE IF NOT EXISTS seen (
   mailbox TEXT NOT NULL, id TEXT NOT NULL, kind TEXT NOT NULL, PRIMARY KEY (mailbox, id, kind)
 );
+CREATE TABLE IF NOT EXISTS screen (
+  id TEXT PRIMARY KEY, verdict TEXT NOT NULL, reason TEXT NOT NULL, ts INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS idem (
+  mailbox TEXT NOT NULL, key TEXT NOT NULL, id TEXT NOT NULL, ts INTEGER NOT NULL, what TEXT NOT NULL,
+  PRIMARY KEY (mailbox, key)
+);
+CREATE INDEX IF NOT EXISTS entries_kind_from ON entries (kind, from_addr);
 ";
 
 /// A stored letter, as returned to readers.
@@ -220,7 +229,7 @@ impl Store {
                     EXISTS (SELECT 1 FROM seen s WHERE s.mailbox = ?1 AND s.id = e.id AND s.kind = ?3)
              FROM entries e JOIN rcpt r ON r.id = e.id
              WHERE r.addr IN (?2, '*') AND e.from_addr != ?2
-               AND e.kind IN ('info', 'task', 'question')
+               AND e.kind IN ('info', 'task', 'question', 'claim')
              ORDER BY e.rowid",
         )?;
         let rows = st.query_map(params![mailbox, addr, kind.as_str()], |r| {
@@ -237,10 +246,79 @@ impl Store {
         Ok(())
     }
 
+    /// Marks where screening starts, once: after everything this log already holds. Those
+    /// letters were readable before, so they are neither hidden nor sent to the model.
+    pub fn screen_start(&self) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO screen (id, verdict, reason, ts)
+             SELECT 'start', 'start', '', COALESCE(MAX(rowid), 0) FROM entries",
+            [],
+        )?;
+        Ok(())
+    }
+
+    /// Whether the screener cleared the letter, a person released it, or it predates screening.
+    pub fn screened_ok(&self, id: &str) -> Result<bool> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT 1 FROM entries e WHERE e.id = ?1 AND (
+                   e.rowid <= (SELECT ts FROM screen WHERE id = 'start')
+                   OR EXISTS (SELECT 1 FROM screen s WHERE s.id = e.id AND s.verdict IN ('clean', 'released')))",
+                [id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
+    }
+
+    /// Records the screener's verdict; false if the letter already has one.
+    pub fn set_verdict(&self, id: &str, verdict: &str, reason: &str, ts: u64) -> Result<bool> {
+        Ok(self.conn.execute(
+            "INSERT OR IGNORE INTO screen (id, verdict, reason, ts) VALUES (?1, ?2, ?3, ?4)",
+            params![id, verdict, reason, ts],
+        )? == 1)
+    }
+
+    /// Flagged -> released; false if the letter isn't flagged.
+    pub fn release(&self, id: &str, ts: u64) -> Result<bool> {
+        Ok(self.conn.execute(
+            "UPDATE screen SET verdict = 'released', ts = ?2 WHERE id = ?1 AND verdict = 'flagged'",
+            params![id, ts],
+        )? == 1)
+    }
+
+    /// Letters to `machine` (or everyone) with no verdict yet, written by another author than
+    /// `me` or by a guest, oldest first.
+    pub fn unscreened(&self, me: &str, machine: &str) -> Result<Vec<Stored>> {
+        let mut st = self.conn.prepare(
+            "SELECT e.id, e.envelope, e.body FROM entries e
+             WHERE e.kind IN ('info', 'task', 'question', 'claim')
+               AND (e.author != ?1 OR json_extract(e.envelope, '$.label.trust') = 'guest')
+               AND NOT EXISTS (SELECT 1 FROM screen s WHERE s.id = e.id)
+               AND e.rowid > COALESCE((SELECT ts FROM screen WHERE id = 'start'), 0)
+               AND EXISTS (SELECT 1 FROM rcpt r WHERE r.id = e.id
+                           AND (r.addr = '*' OR substr(r.addr, -length(?2) - 1) = '@' || ?2))
+             ORDER BY e.rowid",
+        )?;
+        let rows = st.query_map(params![me, machine], row_stored)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Flagged letters with the reason and when, oldest first.
+    pub fn flagged(&self) -> Result<Vec<(Stored, String, u64)>> {
+        let mut st = self.conn.prepare(
+            "SELECT e.id, e.envelope, e.body, s.reason, s.ts FROM entries e JOIN screen s ON s.id = e.id
+             WHERE s.verdict = 'flagged' ORDER BY s.ts",
+        )?;
+        let rows = st.query_map([], |r| Ok((row_stored(r)?, r.get(3)?, r.get(4)?)))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
     /// Every address that has sent mail in this boundary.
     pub fn senders(&self) -> Result<Vec<String>> {
         let mut st = self.conn.prepare(
-            "SELECT DISTINCT from_addr FROM entries WHERE kind IN ('info', 'task', 'question')
+            "SELECT DISTINCT from_addr FROM entries WHERE kind IN ('info', 'task', 'question', 'claim')
              ORDER BY from_addr",
         )?;
         let rows = st.query_map([], |r| r.get(0))?;
@@ -256,14 +334,46 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
+    /// The newest record of `kind` from each sender address.
+    pub fn newest_per_sender(&self, kind: crate::envelope::Kind) -> Result<Vec<Stored>> {
+        let mut st = self.conn.prepare(
+            "SELECT id, envelope, body FROM entries WHERE rowid IN
+             (SELECT MAX(rowid) FROM entries WHERE kind = ?1 GROUP BY from_addr) ORDER BY rowid",
+        )?;
+        let rows = st.query_map([kind.as_str()], row_stored)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
     /// Letters sent from `addr`, oldest first.
     pub fn sent_by(&self, addr: &str) -> Result<Vec<Stored>> {
         let mut st = self.conn.prepare(
             "SELECT id, envelope, body FROM entries
-             WHERE from_addr = ?1 AND kind IN ('info', 'task', 'question') ORDER BY rowid",
+             WHERE from_addr = ?1 AND kind IN ('info', 'task', 'question', 'claim') ORDER BY rowid",
         )?;
         let rows = st.query_map([addr], row_stored)?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// The letter `mailbox` posted with `key` at or after `since` (unix ms), and the hash of what
+    /// was asked. Older keys are forgotten first.
+    pub fn idem(&self, mailbox: &str, key: &str, since: u64) -> Result<Option<(String, String)>> {
+        self.conn.execute("DELETE FROM idem WHERE ts < ?1", [since])?;
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT id, what FROM idem WHERE mailbox = ?1 AND key = ?2",
+                [mailbox, key],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?)
+    }
+
+    pub fn set_idem(&self, mailbox: &str, key: &str, id: &str, ts: u64, what: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO idem (mailbox, key, id, ts, what) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![mailbox, key, id, ts, what],
+        )?;
+        Ok(())
     }
 
     pub fn count(&self) -> Result<u64> {
@@ -290,6 +400,24 @@ mod tests {
     use super::*;
     use crate::envelope::tests::envelope;
     use iroh::SecretKey;
+
+    #[test]
+    fn screening_starts_after_what_the_log_already_held() {
+        let d = tempfile::tempdir().unwrap();
+        let mut s = Store::open(&d.path().join("work.db"), 1 << 30).unwrap();
+        let k = SecretKey::generate();
+        let e1 = Entry::sign(&envelope(&k, 1, None, "a"), "a".into(), &k).unwrap();
+        assert!(s.insert(&e1, &e1.open().unwrap()).unwrap());
+        assert!(!s.screened_ok(&e1.id()).unwrap(), "no start mark: nothing is exempt");
+        s.screen_start().unwrap();
+        let e2 = Entry::sign(&envelope(&k, 2, Some(e1.id()), "b"), "b".into(), &k).unwrap();
+        assert!(s.insert(&e2, &e2.open().unwrap()).unwrap());
+        s.screen_start().unwrap();
+        assert!(s.screened_ok(&e1.id()).unwrap() && !s.screened_ok(&e2.id()).unwrap(), "the mark is set once");
+        assert!(s.flagged().unwrap().is_empty());
+        assert!(s.set_verdict(&e2.id(), "clean", "", 1).unwrap());
+        assert!(s.screened_ok(&e2.id()).unwrap());
+    }
 
     #[test]
     fn chain_rules_and_append_only() {
@@ -331,5 +459,16 @@ mod tests {
         s.mark("admin", &e1.id(), Seen::Read).unwrap();
         let mail = s.mail_for("admin", "admin@laptop", Seen::Read).unwrap();
         assert!(mail[0].1 && !mail[1].1);
+    }
+
+    #[test]
+    fn idem_keys_last_a_day_per_mailbox() {
+        let d = tempfile::tempdir().unwrap();
+        let s = Store::open(&d.path().join("work.db"), 1 << 30).unwrap();
+        s.set_idem("a", "k", "id1", 1000, "h").unwrap();
+        assert_eq!(s.idem("a", "k", 500).unwrap(), Some(("id1".into(), "h".into())));
+        assert_eq!(s.idem("b", "k", 500).unwrap(), None, "another mailbox's key");
+        assert_eq!(s.idem("a", "k", 1001).unwrap(), None, "too old: forgotten");
+        assert_eq!(s.idem("a", "k", 0).unwrap(), None, "and deleted");
     }
 }

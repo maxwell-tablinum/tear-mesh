@@ -13,6 +13,8 @@ pub const MAX_SUBJECT: usize = 200;
 pub const MAX_TO: usize = 32;
 /// Largest bio.
 pub const MAX_BIO: usize = 16 * 1024;
+/// Largest status record body.
+pub const MAX_STATUS: usize = 4 * 1024;
 const MAX_ENVELOPE: usize = 16 * 1024;
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -58,11 +60,16 @@ pub enum Kind {
     Offer,
     /// A machine's "about this machine" text.
     Bio,
+    /// "Working on it": answers a letter to say a real reply is coming. The subject is a short
+    /// note, the body empty or the seconds until then.
+    Claim,
+    /// An agent's status record; the subject is its current task, the body JSON.
+    Status,
 }
 
 impl Kind {
     pub fn is_letter(self) -> bool {
-        matches!(self, Kind::Info | Kind::Task | Kind::Question)
+        matches!(self, Kind::Info | Kind::Task | Kind::Question | Kind::Claim)
     }
 
     pub fn as_str(self) -> &'static str {
@@ -72,6 +79,8 @@ impl Kind {
             Kind::Question => "question",
             Kind::Offer => "offer",
             Kind::Bio => "bio",
+            Kind::Claim => "claim",
+            Kind::Status => "status",
         }
     }
 }
@@ -224,6 +233,8 @@ pub fn hex(bytes: &[u8]) -> String {
 
 pub fn unhex(s: &str) -> Result<Vec<u8>> {
     ensure!(s.len().is_multiple_of(2), "odd hex length");
+    // Peer-supplied: a multi-byte character would make the byte slices below panic.
+    ensure!(s.bytes().all(|b| b.is_ascii_hexdigit()), "not hex");
     (0..s.len())
         .step_by(2)
         .map(|i| u8::from_str_radix(&s[i..i + 2], 16).context("hex"))
@@ -280,6 +291,14 @@ pub(crate) mod tests {
         let other = SecretKey::generate();
         let forged = Entry::sign(&envelope(&k, 1, None, "body"), "body".into(), &other).unwrap();
         assert!(forged.open().is_err(), "signed by someone else");
+
+        // A multi-byte character in a peer's signature is bad input, not a panic.
+        let mut t = e.clone();
+        t.sig = format!("a\u{e9}{}", &e.sig[3..]);
+        assert_eq!(t.sig.len(), e.sig.len());
+        assert!(t.open().is_err(), "non-hex signature");
+        assert!(unhex("a\u{e9}a").is_err() && unhex("+a").is_err());
+        assert_eq!(unhex("0aFf").unwrap(), [10, 255]);
     }
 
     #[test]

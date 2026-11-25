@@ -34,19 +34,27 @@ run_one() {
     -e TEARMESH_BIN=/usr/local/bin/tearmesh-test "$img" sh -c "$DEPS
       echo '== e2e'; bash /src/tests/e2e-linux.sh || true
       echo '== install'
+      tearmesh-test install box 2>&1 | tail -3 | tee /tmp/bare | sed 's/^/  /'
+      grep -q 'No boundaries yet' /tmp/bare && grep -q '^machine = \"box\"' /etc/tearmesh/config.toml && echo 'BARE OK' || echo 'BARE FAILED'
       tearmesh-test install box work vault 2>&1 | tail -3
-      tearmesh install box work vault extra 2>&1 | tail -3
+      # tm-pre existed before install, so uninstall keeps it.
+      { useradd -m tm-pre 2>/dev/null || adduser -D tm-pre; } >/dev/null
+      tearmesh install box work vault extra pre 2>&1 | tail -3
       id tm-work >/dev/null && id tm-vault >/dev/null && id tm-extra >/dev/null \
         && test \"\$(grep -c '^tm-work = ' /etc/tearmesh/config.toml)\" = 1 && grep -q '^tm-extra = \"extra\"' /etc/tearmesh/config.toml \
         && test \"\$(stat -c %a /home/tm-vault)\" = 700 && test \"\$(stat -c %U /var/lib/tearmesh/node.key)\" = tearmesh \
         && su -s /bin/sh tm-work -c 'cat /usr/local/share/tearmesh/.claude-plugin/marketplace.json' >/dev/null \
+        && tearmesh install >/dev/null 2>&1 && grep -q '^machine = \"box\"' /etc/tearmesh/config.toml \
         && ! tearmesh install other work 2>/dev/null && echo 'SETUP OK' || echo 'SETUP FAILED'
-      tearmesh uninstall --yes work vault extra 2>&1 | tail -1
-      ! id tm-work 2>/dev/null && ! id tearmesh 2>/dev/null && test ! -e /etc/tearmesh && test ! -e /usr/local/bin/tearmesh \
+      # With no names, uninstall deletes the tm-* users install made.
+      tearmesh uninstall --yes 2>&1 | tail -4 | tee /tmp/un
+      grep -q 'kept (not created by install): tm-pre' /tmp/un && id tm-pre >/dev/null \
+        && ! getent passwd | grep -v '^tm-pre:' | grep -q '^tm-' && ! id tearmesh 2>/dev/null && test ! -e /etc/tearmesh \
+        && test ! -e /etc/init.d/tearmesh && test ! -e /etc/systemd/system/tearmesh.service && test ! -e /usr/local/bin/tearmesh \
         && echo 'UNINSTALL OK' || echo 'UNINSTALL FAILED'" >"$log" 2>&1
   local e2e setup
   e2e=$(grep -E '^(ALL PASSED|FAIL )' "$log" | head -3 | tr '\n' ' ')
-  setup=$(grep -E '^(SETUP|UNINSTALL)' "$log" | tr '\n' ' ')
+  setup=$(grep -E '^(BARE|SETUP|UNINSTALL)' "$log" | tr '\n' ' ')
   printf '%-52s %s | %s\n' "$img" "${e2e:-no result (see $log)}" "${setup:-no setup result}"
 }
 

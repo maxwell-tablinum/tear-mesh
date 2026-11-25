@@ -82,6 +82,14 @@ pub fn home_dir() -> PathBuf {
         .unwrap_or_default()
 }
 
+/// This machine's hostname, or "" if it can't be read.
+pub fn hostname() -> String {
+    ["/proc/sys/kernel/hostname", "/etc/hostname"]
+        .iter()
+        .find_map(|p| std::fs::read_to_string(p).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()))
+        .unwrap_or_default()
+}
+
 /// Write-then-rename with fsync, mode 0600, so a crash leaves the old file or the new one.
 pub fn write_private(path: &Path, data: &[u8]) -> Result<()> {
     let tmp = path.with_extension("tmp");
@@ -104,14 +112,28 @@ pub fn secure_dir(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Replaces this process with `command` run as `user` (through sudo), with `env` set.
+/// Replaces this process with `command` run as `user` (through sudo, else su as root), with `env` set.
 pub fn launch(user: &str, env: &[(String, String)], command: &[String]) -> Result<()> {
-    let err = std::process::Command::new("sudo")
-        .args(["-u", user, "-i", "env"])
-        .args(env.iter().map(|(k, v)| format!("{k}={v}")))
-        .args(command)
-        .exec();
-    Err(err).context("running sudo")
+    let have_sudo = std::env::var_os("PATH").is_some_and(|p| std::env::split_paths(&p).any(|d| d.join("sudo").is_file()));
+    let err = launch_command(user, env, command, have_sudo, nix::unistd::geteuid().is_root())?.exec();
+    Err(err).context("running sudo or su")
+}
+
+fn launch_command(user: &str, env: &[(String, String)], command: &[String], have_sudo: bool, root: bool) -> Result<std::process::Command> {
+    let kv = env.iter().map(|(k, v)| format!("{k}={v}"));
+    let mut c;
+    if have_sudo {
+        c = std::process::Command::new("sudo");
+        c.args(["-u", user, "-i", "env"]);
+    } else if root {
+        // The command rides in "$@", so it needs no quoting; `--` keeps su from reading its flags.
+        c = std::process::Command::new("su");
+        c.args(["-s", "/bin/sh", "-l", "-c", "exec env \"$@\"", "--", user, "sh"]);
+    } else {
+        anyhow::bail!("launch needs sudo, or run it as root");
+    }
+    c.args(kv).args(command);
+    Ok(c)
 }
 
 /// Resolves on SIGTERM or Ctrl-C.
@@ -127,4 +149,21 @@ pub async fn shutdown_signal() -> Result<()> {
 /// Only Windows has a service manager mode.
 pub fn run_service(_config: PathBuf) -> Result<()> {
     anyhow::bail!("--service is for Windows; on Linux run `tearmesh daemon` under systemd")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::launch_command;
+
+    #[test]
+    fn launch_uses_sudo_else_su_else_refuses() {
+        let (env, cmd) = (vec![("A".to_string(), "1".to_string())], vec!["claude".to_string(), "--x".to_string()]);
+        let args = |c: &std::process::Command| c.get_args().map(|a| a.to_string_lossy().into_owned()).collect::<Vec<_>>();
+        let c = launch_command("tm-w", &env, &cmd, true, false).unwrap();
+        assert_eq!((c.get_program().to_str(), args(&c)), (Some("sudo"), ["-u", "tm-w", "-i", "env", "A=1", "claude", "--x"].map(String::from).to_vec()));
+        let c = launch_command("tm-w", &env, &cmd, false, true).unwrap();
+        assert_eq!(c.get_program().to_str(), Some("su"));
+        assert_eq!(args(&c)[6..], ["tm-w", "sh", "A=1", "claude", "--x"]);
+        assert!(launch_command("tm-w", &env, &cmd, false, false).unwrap_err().to_string().contains("launch needs sudo, or run it as root"));
+    }
 }

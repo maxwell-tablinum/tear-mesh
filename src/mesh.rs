@@ -125,6 +125,10 @@ pub struct Mesh {
     /// Hash of the previous version's exact signed bytes. Absent only at the start of a chain.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prev: Option<String>,
+    /// The mesh was dissolved: this is its last version, with no machines, and nothing follows.
+    /// Absent (false) in every other version, so their bytes and hashes are unchanged.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub closed: bool,
     /// OpenSSH public keys. Any one may sign the next version; at least two are required so
     /// losing one key doesn't lock the mesh forever.
     pub owners: Vec<String>,
@@ -190,6 +194,7 @@ impl Mesh {
             name: name.to_string(),
             version: 1,
             prev: None,
+            closed: false,
             owners,
             boundaries,
             settings: Settings::default(),
@@ -221,6 +226,7 @@ impl Mesh {
                 name: c.name,
                 version: c.version,
                 prev: None,
+                closed: false,
                 owners: c.owners,
                 boundaries: c.boundaries,
                 settings: Settings::default(),
@@ -282,6 +288,10 @@ impl Mesh {
                 "settings.lookup: unknown method {l:?} (n0-dns, mdns)"
             );
         }
+        ensure!(
+            !self.closed || (self.machines.is_empty() && self.grants.is_empty() && self.approvals.is_empty()),
+            "a dissolved mesh has no machines, grants or approvals"
+        );
         let (mut names, mut ids) = (BTreeSet::new(), BTreeSet::new());
         for m in &self.machines {
             ensure!(valid_name(&m.name), "bad machine name {:?}", m.name);
@@ -509,6 +519,8 @@ pub enum Change {
     Grant(Grant),
     /// Takes `allow` away from the exact `from → to` grant.
     Revoke(Grant),
+    /// Approves an offered server at this pin, replacing any earlier approval of it.
+    Approve(Approval),
     AddBoundary(String),
     /// Replaces the boundaries `machine` hosts; drops its approvals in any it stops hosting.
     SetHosts { machine: String, boundaries: Vec<String> },
@@ -518,6 +530,8 @@ pub enum Change {
     OwnerRemove(String),
     /// `tools-sharing`, `relays` or `lookup`, with `mesh set`'s values.
     Set { setting: String, value: String },
+    /// The last version: every machine leaves and nothing can follow.
+    Dissolve,
 }
 
 impl std::fmt::Display for Change {
@@ -534,11 +548,13 @@ impl std::fmt::Display for Change {
             Change::RemoveMachine(n) => write!(f, "remove machine {n}"),
             Change::Grant(g) => write!(f, "grant {} -> {}: {}", g.from, g.to, cats(g)),
             Change::Revoke(g) => write!(f, "revoke {} -> {}: {}", g.from, g.to, cats(g)),
+            Change::Approve(a) => write!(f, "approve {}/{} in {}", a.machine, a.server, a.boundary),
             Change::AddBoundary(b) => write!(f, "add boundary {b}"),
             Change::SetHosts { machine, boundaries } => write!(f, "{machine} hosts {}", boundaries.join(", ")),
             Change::OwnerAdd(k) => write!(f, "add owner key {}", k.split_whitespace().take(2).last().unwrap_or(k)),
             Change::OwnerRemove(fp) => write!(f, "remove owner key {fp}"),
             Change::Set { setting, value } => write!(f, "set {setting} = {value}"),
+            Change::Dissolve => write!(f, "dissolve the mesh (every machine leaves)"),
         }
     }
 }
@@ -574,6 +590,11 @@ impl Mesh {
                         g.from, g.to
                     )));
                 }
+            }
+            Change::Approve(a) => {
+                self.approvals
+                    .retain(|x| !(x.machine == a.machine && x.boundary == a.boundary && x.server == a.server));
+                self.approvals.push(a.clone());
             }
             Change::AddBoundary(b) => {
                 ensure!(valid_name(b), "bad boundary name {b:?}");
@@ -621,7 +642,16 @@ impl Mesh {
                 "relays" => {
                     self.settings.relays = match value.as_str() {
                         "n0" | "none" => Relay::Preset(value.clone()),
-                        urls => Relay::Urls(urls.split(',').map(String::from).collect()),
+                        urls => {
+                            let urls: Vec<String> = urls.split(',').map(String::from).collect();
+                            for u in &urls {
+                                ensure!(
+                                    u.parse::<iroh::RelayUrl>().is_ok_and(|r| matches!(r.scheme(), "http" | "https")),
+                                    "relays is n0, none or http(s) URLs separated by commas; {u:?} isn't one"
+                                );
+                            }
+                            Relay::Urls(urls)
+                        }
                     }
                 }
                 "lookup" => {
@@ -633,6 +663,12 @@ impl Mesh {
                 }
                 _ => bail!("unknown setting {setting} (tools-sharing, relays, lookup)"),
             },
+            Change::Dissolve => {
+                self.machines.clear();
+                self.grants.clear();
+                self.approvals.clear();
+                self.closed = true;
+            }
         }
         Ok(None)
     }
@@ -685,8 +721,15 @@ impl SignedMesh {
     }
 
     /// The version right after `prev`: signed by one of *its* owners (checked before anything a
-    /// peer sent is parsed), same id, version + 1, and naming `prev`'s hash.
+    /// peer sent is parsed), same id, version + 1, and naming `prev`'s hash. Nothing follows a
+    /// closed (dissolved) version.
     pub fn verify_next(toml: &str, sig: &str, prev: &SignedMesh) -> Result<Self> {
+        ensure!(
+            !prev.mesh.closed,
+            "mesh {} was dissolved at version {}; nothing follows it",
+            prev.mesh.name,
+            prev.mesh.version
+        );
         let sshsig = parse_sig(toml, sig)?;
         check_sig(&prev.mesh, SIG_NAMESPACE, toml, &sshsig)?;
         let mesh = Mesh::parse(toml)?;
@@ -833,6 +876,11 @@ pub(crate) mod tests {
         assert!(no(Change::AddMachine { machine: machine("beta", &["lab"]), replace: false }), "unknown boundary");
         assert!(no(Change::AddBoundary("work".into())));
         assert!(no(Change::Set { setting: "tools-sharing".into(), value: "x".into() }));
+        let relays = |v: &str| Change::Set { setting: "relays".into(), value: v.into() };
+        for bad in ["N0", "", "not a url", "ftp://relay.example.com", "https://relay.example.com,"] {
+            assert!(no(relays(bad)), "{bad:?}");
+        }
+        assert!(!no(relays("https://a.example.com,http://b.example.com:3340")));
         let fp = PublicKey::from_openssh(&b).unwrap().fingerprint(Default::default()).to_string();
         assert!(no(Change::OwnerRemove(fp)), "keeps two owner keys");
         assert!("a:b".parse::<Grant>().is_err() && "a:b:fly".parse::<Grant>().is_err());
@@ -1005,6 +1053,72 @@ pub(crate) mod tests {
         m.grant("b", "*", &[Category::Tools]);
         m.add_machine(machine("b", &["work"]), true).unwrap();
         assert!(m.allows("b", "x", Category::Tools));
+    }
+
+    #[test]
+    fn a_dissolved_mesh_is_the_last_version() {
+        let d = tempfile::tempdir().unwrap();
+        let (k1, p1) = keygen(d.path(), "one");
+        let (_k2, p2) = keygen(d.path(), "two");
+        let mut m = Mesh::new("home", vec![p1, p2], vec!["work".into()], None).unwrap();
+        m.add_machine(machine("ws", &["work"]), false).unwrap();
+        m.grant("ws", "*", &[Category::Tools]);
+        let t1 = m.to_toml().unwrap();
+        let v1 = SignedMesh::verify_first(&t1, &sign(d.path(), &k1, &t1)).unwrap();
+
+        let (m2, t2, _) = next_version(&t1, &[Change::Dissolve]).unwrap();
+        assert!(m2.closed && m2.machines.is_empty() && m2.grants.is_empty());
+        assert!(t2.contains("closed = true"));
+        let v2 = SignedMesh::verify_next(&t2, &sign(d.path(), &k1, &t2), &v1).unwrap();
+        assert!(v2.mesh.closed, "a closed version is an ordinary owner-signed next version");
+
+        let mut bad = m2.clone();
+        bad.machines.push(machine("ws", &["work"]));
+        assert!(bad.validate().is_err(), "a closed mesh lists no machines");
+
+        // Nothing follows it: not a reopened version, not another closed one.
+        for closed in [false, true] {
+            let mut m3 = m2.clone();
+            m3.closed = closed;
+            m3.bump(&t2).unwrap();
+            let t3 = m3.to_toml().unwrap();
+            assert!(SignedMesh::verify_next(&t3, &sign(d.path(), &k1, &t3), &v2).is_err());
+        }
+    }
+
+    /// A normal version's bytes, and so every stored hash and signature, must not change when
+    /// fields are added for other kinds of version.
+    #[test]
+    fn open_versions_serialize_as_before() {
+        let owners = vec![
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEh1s2NuBoKhxcvWTjGSNaub4y0oVf2jVMCY6/Vte2+7 a".into(),
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHbEX1BV4qNsFeEx/SwLH8TpPC0RDcmOCYdkRWTe/boC b".into(),
+        ];
+        let mut m = Mesh::new("home", owners, vec!["work".into()], Some("abc123".into())).unwrap();
+        m.add_machine(
+            Machine {
+                name: "ws".into(),
+                id: iroh::SecretKey::from_bytes(&[7; 32]).public(),
+                boundaries: vec!["work".into()],
+            },
+            false,
+        )
+        .unwrap();
+        m.grant("ws", "*", &[Category::Tools]);
+        m.approvals.push(Approval {
+            machine: "ws".into(),
+            boundary: "work".into(),
+            server: "cad".into(),
+            pin: "0".repeat(64),
+            tools: None,
+        });
+        let v1 = m.to_toml().unwrap();
+        m.bump(&v1).unwrap();
+        let t = m.to_toml().unwrap();
+        // Hashes taken before `closed` existed.
+        assert_eq!(hash(&v1), "8509d7648538f9fe84c906b59ce2bd0666ecfbf7a70258886e9a4c6b9e0bd0e1");
+        assert_eq!(hash(&t), "1be54a85fec03cf19f7e17d189f467a729c1b673752a9a7a3578b15244ef9e37");
+        assert!(!t.contains("closed"));
     }
 
     #[test]

@@ -1,0 +1,35 @@
+# Written by `tearmesh gateway setup` (spec 18.4), which fills in the user: the gateway's own OS user,
+# tm-<boundary>-gw, which the daemon's config lists under [guests] and holds to a guest's requests.
+# The one tear-mesh process that faces the internet, so it gets the least the system can give it.
+[Unit]
+Description=tear-mesh gateway (Claude connector) for @USER@
+After=network-online.target tearmesh.service
+Wants=network-online.target
+
+[Service]
+User=@USER@
+ExecStart=/usr/local/bin/tearmesh gateway serve
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/tearmesh-gateway
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+LockPersonality=yes
+CapabilityBoundingSet=
+SystemCallArchitectures=native
+MemoryMax=512M
+TasksMax=256
+# Up to 512 connections, each a socket, besides the daemon sessions and the database.
+LimitNOFILE=4096
+
+[Install]
+WantedBy=multi-user.target

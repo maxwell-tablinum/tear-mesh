@@ -3,7 +3,7 @@
 # Run as Administrator. `tearmesh install` runs a copy of this script built into the binary;
 # running it from a clone works too. Running it again upgrades the binary and adds new users.
 #
-#   deploy\setup-windows.ps1 -Machine <name> -Boundaries work,vault [-Exe tearmesh.exe] [-Stewards]
+#   deploy\setup-windows.ps1 -Machine <name> [-Boundaries work,vault] [-Exe tearmesh.exe] [-Stewards]
 #   deploy\setup-windows.ps1 -Uninstall [-Boundaries work,vault]
 #
 # New users get random passwords, stored in C:\ProgramData\tearmesh\passwords.txt, which only SYSTEM
@@ -80,7 +80,18 @@ if ($Uninstall) {
     Stop-Service $Service -Force -ErrorAction SilentlyContinue
     sc.exe delete $Service | Out-Null
   }
-  Get-ScheduledTask -TaskName 'tearmesh-steward-*' -ErrorAction SilentlyContinue | Unregister-ScheduledTask -Confirm:$false
+  Get-ScheduledTask -TaskName 'tearmesh-steward-*' -ErrorAction SilentlyContinue | ForEach-Object {
+    Stop-ScheduledTask -InputObject $_ -ErrorAction SilentlyContinue
+    Unregister-ScheduledTask -InputObject $_ -Confirm:$false
+  }
+  # Hubs, stewards, menus and mail screens started by hand run as people and boundary users, not
+  # as the service. Not this script's ancestors: a menu that ran this uninstall waits for it.
+  $procs = @(Get-CimInstance Win32_Process)
+  $keep = @(); $p = $PID
+  while ($p -and $keep -notcontains $p) { $keep += $p; $p = ($procs | Where-Object ProcessId -eq $p).ParentProcessId }
+  $procs | Where-Object { $_.Name -eq 'tearmesh.exe' -and $keep -notcontains $_.ProcessId } |
+    Where-Object { $_.CommandLine -match 'tearmesh(\.exe)?"?(\s+(mcp|steward|waker|menu|tui)(\s|$)|\s*$)' } |
+    ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
   Remove-NetFirewallRule -Name tearmesh-udp -ErrorAction SilentlyContinue
   $sids = @(foreach ($b in $Boundaries) { (Get-LocalUser "tm-$b" -ErrorAction SilentlyContinue).SID.Value })
   if ($sids) { Set-BatchLogon -Remove $sids }
@@ -94,7 +105,7 @@ if ($Uninstall) {
   exit
 }
 
-if (-not $Machine -or -not $Boundaries) { throw 'usage: setup-windows.ps1 -Machine <name> -Boundaries <b>,<b>... [-Exe path] [-Stewards]' }
+if (-not $Machine) { throw 'usage: setup-windows.ps1 -Machine <name> [-Boundaries <b>,<b>...] [-Exe path] [-Stewards]' }
 if (-not (Test-Path $Exe)) { throw "no binary at $Exe (pass -Exe)" }
 
 if (Get-Service $Service -ErrorAction SilentlyContinue) { Stop-Service $Service -Force }

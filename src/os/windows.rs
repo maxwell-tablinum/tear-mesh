@@ -314,6 +314,11 @@ pub fn home_dir() -> PathBuf {
         .unwrap_or_default()
 }
 
+/// This machine's name, or "" if it can't be read.
+pub fn hostname() -> String {
+    std::env::var("COMPUTERNAME").unwrap_or_default()
+}
+
 /// Write-then-rename with fsync, so a crash leaves the old file or the new one. The file takes
 /// its directory's ACL, which `secure_dir` makes private.
 pub fn write_private(path: &Path, data: &[u8]) -> Result<()> {

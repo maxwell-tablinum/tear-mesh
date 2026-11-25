@@ -37,6 +37,10 @@ pub struct Config {
     /// on the socket, so nothing a session says can change it.
     #[serde(default)]
     pub users: BTreeMap<String, String>,
+    /// OS user → its fixed boundary and mailbox: sessions held to a guest's requests (the gateway's
+    /// user, spec 18.4 point 1).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub guests: BTreeMap<String, Guest>,
     /// OS users, besides root/Administrators and the daemon's own user, that may run admin
     /// commands (status, invites, applying membership files).
     #[serde(default)]
@@ -57,6 +61,17 @@ pub struct Config {
     /// Where shell streams go: this machine's sshd on 127.0.0.1.
     #[serde(default = "default_shell_port")]
     pub shell_port: u16,
+    /// Boundaries whose inbound letters wait for the steward's screener before any session sees
+    /// them. Here, root-owned, so a session in the boundary can't switch it off.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub screen: Vec<String>,
+}
+
+#[derive(Deserialize, Serialize, Clone, Debug, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct Guest {
+    pub boundary: String,
+    pub mailbox: String,
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, Default)]
@@ -116,6 +131,7 @@ impl Config {
             state_dir: default_state_dir(),
             socket: default_socket(),
             users: BTreeMap::new(),
+            guests: BTreeMap::new(),
             admins: vec![],
             network: Network::default(),
             sync_interval_secs: default_sync_secs(),
@@ -123,6 +139,7 @@ impl Config {
             max_posts_per_hour: default_max_posts(),
             max_log_mb: default_max_log_mb(),
             shell_port: default_shell_port(),
+            screen: vec![],
         }
     }
 
@@ -143,6 +160,18 @@ impl Config {
         );
         for (user, b) in &self.users {
             ensure!(valid_name(b), "user {user}: bad boundary name {b:?}");
+        }
+        for (user, g) in &self.guests {
+            ensure!(valid_name(&g.boundary), "guest {user}: bad boundary name {:?}", g.boundary);
+            ensure!(valid_name(&g.mailbox), "guest {user}: bad mailbox name {:?}", g.mailbox);
+            ensure!(g.mailbox != "admin", "guest {user}: the mailbox can't be admin, every session's default");
+            ensure!(
+                !self.users.contains_key(user) && !self.admins.contains(user) && user != "root",
+                "{user} is under [guests], so it can't be root, under [users] or an admin"
+            );
+        }
+        for b in &self.screen {
+            ensure!(valid_name(b), "screen: bad boundary name {b:?}");
         }
         if let Some(Relay::Preset(p)) = &self.network.relay {
             ensure!(
@@ -173,6 +202,9 @@ impl Config {
             self.sync_interval_secs >= 1,
             "sync_interval_secs must be at least 1"
         );
+        ensure!(self.max_thread_len >= 1, "max_thread_len must be at least 1");
+        ensure!(self.max_posts_per_hour >= 1, "max_posts_per_hour must be at least 1");
+        ensure!(self.max_log_mb >= 1, "max_log_mb must be at least 1");
         Ok(())
     }
 
@@ -188,6 +220,17 @@ impl Config {
         Ok(map)
     }
 
+    /// Resolves `guests` to the OS's caller identities, as `identity_map` does `users`.
+    pub fn guest_map(&self) -> Result<HashMap<String, Guest>> {
+        let mut map = HashMap::new();
+        for (user, g) in &self.guests {
+            let id = crate::os::user_identity(user)
+                .with_context(|| format!("config maps unknown OS user {user}"))?;
+            map.insert(id, g.clone());
+        }
+        Ok(map)
+    }
+
     /// Identities of the configured `admins`.
     pub fn admin_identities(&self) -> Result<Vec<String>> {
         self.admins
@@ -199,10 +242,63 @@ impl Config {
             .collect()
     }
 
+    /// The OS user that runs as the boundary: `tm-<boundary>` when it is mapped there, since a
+    /// person's own login can be mapped to the boundary too (`install --me`) and must not be
+    /// picked for launches and services.
     pub fn boundary_user(&self, boundary: &str) -> Option<&str> {
-        self.users
-            .iter()
-            .find(|(_, b)| *b == boundary)
-            .map(|(u, _)| u.as_str())
+        let own = format!("tm-{boundary}");
+        match self.users.get_key_value(&own) {
+            Some((u, b)) if b == boundary => Some(u.as_str()),
+            _ => self.users.iter().find(|(_, b)| *b == boundary).map(|(u, _)| u.as_str()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn limits_are_at_least_one() {
+        assert!(Config::new("ws").validate().is_ok());
+        for key in ["max_thread_len", "max_posts_per_hour", "max_log_mb"] {
+            let mut c = Config::new("ws");
+            match key {
+                "max_thread_len" => c.max_thread_len = 0,
+                "max_posts_per_hour" => c.max_posts_per_hour = 0,
+                _ => c.max_log_mb = 0,
+            }
+            let e = c.validate().unwrap_err().to_string();
+            assert_eq!(e, format!("{key} must be at least 1"));
+        }
+    }
+
+    #[test]
+    fn a_guest_user_is_nothing_else() {
+        let base = "machine = \"ws\"\nadmins = [\"bob\"]\n[users]\nalice = \"work\"\n[guests]\n";
+        let c: Config = toml::from_str(&format!("{base}tm-work-gw = {{ boundary = \"work\", mailbox = \"claude\" }}\n")).unwrap();
+        c.validate().unwrap();
+        assert_eq!(c.guests["tm-work-gw"], Guest { boundary: "work".into(), mailbox: "claude".into() });
+        for (entry, why) in [
+            ("alice = { boundary = \"work\", mailbox = \"claude\" }", "under [users]"),
+            ("bob = { boundary = \"work\", mailbox = \"claude\" }", "an admin"),
+            ("root = { boundary = \"work\", mailbox = \"claude\" }", "root"),
+            ("gw = { boundary = \"Work\", mailbox = \"claude\" }", "bad boundary"),
+            ("gw = { boundary = \"work\", mailbox = \"a b\" }", "bad mailbox"),
+        ] {
+            let c: Config = toml::from_str(&format!("{base}{entry}\n")).unwrap();
+            assert!(c.validate().is_err(), "{why}");
+        }
+        assert!(toml::from_str::<Config>(&format!("{base}gw = {{ boundary = \"work\", mailbox = \"c\", trust = \"member\" }}\n")).is_err(), "unknown key");
+        let c: Config = toml::from_str(&format!("{base}no-such-user-tm = {{ boundary = \"work\", mailbox = \"c\" }}\n")).unwrap();
+        assert!(c.guest_map().unwrap_err().to_string().contains("config maps unknown OS user no-such-user-tm"));
+    }
+
+    #[test]
+    fn a_boundary_runs_as_its_own_user_even_with_a_person_mapped() {
+        let c: Config = toml::from_str("machine = \"ws\"\n[users]\nalice = \"work\"\ntm-work = \"work\"\nbob = \"lab\"\n").unwrap();
+        assert_eq!(c.boundary_user("work"), Some("tm-work"));
+        assert_eq!(c.boundary_user("lab"), Some("bob"), "no tm-lab: the one mapped");
+        assert_eq!(c.boundary_user("vault"), None);
     }
 }

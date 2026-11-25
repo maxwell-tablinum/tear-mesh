@@ -160,6 +160,12 @@ fn proof(secret: &[u8; 16], joiner: &EndpointId, owner: &EndpointId) -> blake3::
     h.finalize()
 }
 
+/// A short name for a ticket, shown with its join request so the owner can tell which ticket was
+/// used. Derived one way from the secret, so it gives nothing away.
+pub fn invite_id(secret: &[u8; 16]) -> String {
+    blake3::derive_key("tear-mesh invite id", secret)[..6].iter().map(|b| format!("{b:02x}")).collect()
+}
+
 /// The 6-digit code both screens show.
 pub fn code(secret: &[u8; 16], joiner: &EndpointId, owner: &EndpointId) -> String {
     let mut h = blake3::Hasher::new_keyed(&key(secret));
@@ -242,31 +248,31 @@ pub struct PendingInfo {
     /// Another machine also tried this ticket: read the code off the right machine's own screen.
     #[serde(default)]
     pub contested: bool,
+    /// Which ticket was used: `invite_id` of its secret.
+    #[serde(default)]
+    pub invite: String,
 }
 
 impl PendingInfo {
-    /// Approval as one version: `add` boundaries (only ones the machine asked for), the machine
-    /// hosting what it asked for that the mesh then has, then `grants`.
-    pub fn changes(&self, mesh: &Mesh, add: &[String], grants: &[Grant]) -> Result<Vec<Change>> {
+    /// What the machine asked to host that the mesh has.
+    pub fn default_hosts(&self, mesh: &Mesh) -> Vec<String> {
+        self.boundaries.iter().filter(|b| mesh.boundaries.contains(b)).cloned().collect()
+    }
+
+
+    /// Approval as one version: the machine hosting exactly `hosts` (empty means `default_hosts`),
+    /// a boundary the mesh lacks added first (only one the machine asked for), then `grants`.
+    pub fn changes(&self, mesh: &Mesh, hosts: &[String], grants: &[Grant]) -> Result<Vec<Change>> {
+        let hosts = if hosts.is_empty() { self.default_hosts(mesh) } else { hosts.to_vec() };
+        ensure!(!hosts.is_empty(), "pick at least one boundary for {} to host", self.name);
         let mut out = vec![];
-        for b in add {
-            ensure!(self.boundaries.contains(b), "{} didn't ask to host {b}", self.name);
+        for (n, b) in hosts.iter().enumerate() {
+            ensure!(!hosts[..n].contains(b), "boundary {b} listed twice");
             if !mesh.boundaries.contains(b) {
+                ensure!(self.boundaries.contains(b), "{} didn't ask to host {b}, and the mesh has no such boundary", self.name);
                 out.push(Change::AddBoundary(b.clone()));
             }
         }
-        let hosts: Vec<String> = self
-            .boundaries
-            .iter()
-            .filter(|b| mesh.boundaries.contains(b) || add.contains(b))
-            .cloned()
-            .collect();
-        ensure!(
-            !hosts.is_empty(),
-            "{} would host no boundary the mesh has; add one of {}",
-            self.name,
-            self.boundaries.join(", ")
-        );
         out.push(Change::AddMachine {
             machine: Machine {
                 name: self.name.clone(),
@@ -374,27 +380,45 @@ impl Joins {
                     expires_ms: inv.expires_ms,
                     waiting: c.tx.as_ref().is_some_and(|t| !t.is_closed()),
                     contested: c.contested,
+                    invite: invite_id(&inv.secret),
                 })
             })
             .collect()
     }
 
-    /// Hands a newly adopted file to every waiting joiner it lists by node id. One that is away
-    /// gets it when it comes back with the same ticket.
+    /// Hands a newly adopted file to every waiting joiner it lists by node id. The invite stays,
+    /// approved, until the file is written to the machine (`delivered`), so one that is away, or
+    /// whose last frame was lost, gets it when it comes back with the same ticket.
     pub fn on_adopt(&self, cur: &SignedMesh) {
         let mut i = self.inner.lock().unwrap();
         let mut changed = false;
-        i.invites.retain_mut(|inv| {
-            let Some(c) = inv.claim.as_mut().filter(|c| cur.mesh.machine_by_id(&c.id).is_some()) else {
-                return true;
+        for inv in &mut i.invites {
+            let Some(c) = inv
+                .claim
+                .as_mut()
+                .filter(|c| !c.approved && cur.mesh.machine_by_id(&c.id).is_some())
+            else {
+                continue;
             };
             info!(machine = %c.name, "approved join");
             changed = true;
-            let sent = c.tx.take().is_some_and(|tx| tx.send(Ok(cur.clone())).is_ok());
-            c.approved = !sent;
-            !sent
-        });
+            c.approved = true;
+            if let Some(tx) = c.tx.take() {
+                let _ = tx.send(Ok(cur.clone()));
+            }
+        }
         if changed {
+            self.save_or_warn(&i);
+        }
+    }
+
+    /// The approved file was written to `joiner`: its invite is used up.
+    fn delivered(&self, joiner: &EndpointId) {
+        let mut i = self.inner.lock().unwrap();
+        let before = i.invites.len();
+        i.invites
+            .retain(|inv| !inv.claim.as_ref().is_some_and(|c| c.approved && c.id == *joiner));
+        if i.invites.len() < before {
             self.save_or_warn(&i);
         }
     }
@@ -456,10 +480,7 @@ fn admit(inv: &Invite, name: &str, boundaries: &[String]) -> Result<(String, Vec
         );
         inv.boundaries.clone()
     };
-    ensure!(
-        !b.is_empty(),
-        "this machine's config maps no OS users to boundaries ([users]); add them and restart the daemon, or ask for a ticket that names them"
-    );
+    // An empty proposal is fine: the owner picks what the machine hosts when approving.
     Ok((name.to_string(), b))
 }
 
@@ -474,6 +495,7 @@ impl Node {
         ttl: Duration,
     ) -> Result<String> {
         let mesh = self.mesh()?;
+        ensure!(!mesh.closed, "mesh {} was dissolved; no machine can join it", mesh.name);
         match name {
             Some(n) => {
                 ensure!(valid_name(n), "bad machine name {n:?}");
@@ -494,6 +516,7 @@ impl Node {
             ttl <= Duration::from_secs(7 * 24 * 3600),
             "tickets last at most 7 days"
         );
+        ensure!(ttl >= Duration::from_secs(1), "a ticket must last at least a second");
         let mut secret = [0u8; 16];
         getrandom::fill(&mut secret).map_err(|e| anyhow::anyhow!("random: {e}"))?;
         let expires_ms = now_ms() + ttl.as_millis() as u64;
@@ -623,6 +646,7 @@ async fn owner_side(
     let (code, rx, deadline) = match answer {
         Answer::Approved(s) => {
             send_json(send, &Frame::Approved { toml: s.toml, sig: s.sig }).await?;
+            node.joins.delivered(joiner);
             return Ok(());
         }
         Answer::Wait(c, rx, d) => (c, rx, d),
@@ -631,7 +655,10 @@ async fn owner_side(
     let wait = Duration::from_millis(deadline.saturating_sub(now_ms()));
     tokio::select! {
         r = rx => match r {
-            Ok(Ok(s)) => send_json(send, &Frame::Approved { toml: s.toml, sig: s.sig }).await?,
+            Ok(Ok(s)) => {
+                send_json(send, &Frame::Approved { toml: s.toml, sig: s.sig }).await?;
+                node.joins.delivered(joiner);
+            }
             Ok(Err(reason)) => send_json(send, &Frame::Refused { reason }).await?,
             // Replaced by the same machine's newer attempt.
             Err(_) => {}
@@ -684,10 +711,13 @@ fn claim(
     if let Some(m) = cur.mesh.machine_by_id(joiner) {
         ensure!(
             i.invites[pos].claim.is_some(),
-            "this node is already in the mesh as {}",
+            "this node is already in the mesh as {0}: if it left, on the owner node run `tearmesh mesh remove {0}` and join again, or apply the current membership file on it with `tearmesh mesh apply`",
             m.name
         );
-        i.invites.remove(pos);
+        // Removed once the file is written (`Joins::delivered`).
+        if let Some(c) = i.invites[pos].claim.as_mut() {
+            c.approved = true;
+        }
         node.joins.save_or_warn(&i);
         return Ok(Answer::Approved(cur.clone()));
     }
@@ -740,21 +770,30 @@ pub async fn start(node: &Arc<Node>, ticket: &str) -> Result<Joining> {
     dial(node, t).await
 }
 
-/// What this machine can check about a ticket before dialing.
+/// What this machine can check about a ticket before dialing. A dissolved mesh counts as none,
+/// but its ticket, or one for any mesh dissolved here before, is refused.
 fn check(node: &Node, t: &Ticket) -> Result<()> {
+    let dissolved = node.dissolved().is_some();
     ensure!(
-        node.state().is_err(),
-        "this machine already belongs to a mesh (run `tearmesh mesh reset` first to leave it)"
+        !node.tombstoned(&t.mesh) && !(dissolved && node.signed()?.mesh.id == t.mesh),
+        "mesh {} was dissolved; ask for a ticket to another mesh",
+        t.mesh
+    );
+    ensure!(
+        dissolved || node.state().is_err(),
+        "this machine already belongs to a mesh (run `tearmesh mesh leave` first to leave it)"
     );
     // An hour's grace: a machine that proved in time may come back for an approval.
     ensure!(
         t.expires + 3600 > now_ms() / 1000,
         "the ticket has expired; ask for a new one"
     );
-    if let Ok(old) = std::fs::read_to_string(node.cfg.state_dir.join("mesh-id")) {
+    if let Ok(old) = std::fs::read_to_string(node.cfg.state_dir.join("mesh-id"))
+        && !dissolved
+    {
         ensure!(
             old.trim() == t.mesh,
-            "this machine was reset from mesh {}, and the ticket is for {}",
+            "this machine was reset from mesh {}, and the ticket is for {} (to leave that mesh for good: tearmesh mesh leave)",
             old.trim(),
             t.mesh
         );
@@ -835,9 +874,10 @@ impl Joining {
                 );
                 ensure!(
                     s.mesh.owner_set_hash()? == self.ticket.owners,
-                    "the file's owner keys aren't the ones the ticket named"
+                    "the file's owner keys aren't the ones the ticket named: the mesh's owner keys changed after this ticket was made; ask the owner node for a new ticket"
                 );
-                let v = node.adopt_first(&toml, &sig)?;
+                // A dissolved mesh here is forgotten only now, once the file passes every check.
+                let v = node.adopt_new(&toml, &sig)?;
                 node.learn_addr(self.ticket.owner_node.clone());
                 Ok(v)
             }
@@ -889,5 +929,51 @@ mod tests {
             proof(&t.secret, &owner, &joiner),
             "proof is bound to who is joining whom"
         );
+    }
+
+    #[test]
+    fn an_approved_invite_stays_until_the_file_is_delivered() {
+        let keys = [
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEh1s2NuBoKhxcvWTjGSNaub4y0oVf2jVMCY6/Vte2+7 a",
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHbEX1BV4qNsFeEx/SwLH8TpPC0RDcmOCYdkRWTe/boC b",
+        ];
+        let joiner = iroh::SecretKey::generate().public();
+        let mut m = Mesh::new("home", keys.map(String::from).to_vec(), vec!["work".into()], None).unwrap();
+        m.add_machine(Machine { name: "laptop".into(), id: joiner, boundaries: vec!["work".into()] }, false)
+            .unwrap();
+        let toml = m.to_toml().unwrap();
+        let cur = SignedMesh {
+            mesh: m,
+            hash: crate::mesh::hash(&toml),
+            toml,
+            sig: String::new(),
+            signer: ssh_key::PublicKey::from_openssh(keys[0]).unwrap().key_data().clone(),
+        };
+        let joins = Joins::default();
+        let (tx, rx) = oneshot::channel();
+        joins.inner.lock().unwrap().invites.push(Invite {
+            secret: [1; 16],
+            name: None,
+            boundaries: vec![],
+            replace: false,
+            expires_ms: u64::MAX,
+            claim: Some(Claim {
+                id: joiner,
+                name: "laptop".into(),
+                boundaries: vec![],
+                code: "123456".into(),
+                contested: false,
+                approved: false,
+                tx: Some(tx),
+            }),
+        });
+        joins.on_adopt(&cur);
+        // The owner side got the file but never wrote it (the machine's connection dropped).
+        assert!(rx.blocking_recv().unwrap().is_ok());
+        let kept = |j: &Joins| j.inner.lock().unwrap().invites.iter().filter(|i| i.claim.as_ref().is_some_and(|c| c.approved)).count();
+        assert_eq!(kept(&joins), 1, "kept, approved, for the machine to come back");
+        assert!(joins.pending().is_empty() && joins.open());
+        joins.delivered(&joiner);
+        assert!(!joins.open(), "used up once written");
     }
 }

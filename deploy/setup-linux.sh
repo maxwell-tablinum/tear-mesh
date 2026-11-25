@@ -5,17 +5,62 @@
 # `status` work without sudo.
 # `sudo tearmesh install` runs a copy of this script built into the binary; running it from a
 # clone works too. Running it again upgrades the binary, adds new boundary users and restarts.
-# Usage: sudo deploy/setup-linux.sh <machine-name> <boundary>...
+# Usage: sudo deploy/setup-linux.sh <machine-name> [<boundary>...]   (none: an owner picks them at join)
 #        TEARMESH_BIN=/path/to/tearmesh sudo -E deploy/setup-linux.sh ...   (a prebuilt binary)
 #        sudo deploy/setup-linux.sh --uninstall [<boundary>...]   (also deletes those users)
 set -eu
 [ "$(id -u)" = 0 ] || { echo "run as root" >&2; exit 1; }
 here=$(cd "$(dirname "$0")" && pwd)
 
+# Ends every process of a user and waits for them to go: userdel refuses a user that still
+# has one, and a login's user manager (systemd --user) outlives its session by seconds.
+end_user() {
+  pkill -u "$1" >/dev/null 2>&1 || true
+  n=0
+  while [ $n -lt 10 ] && pgrep -u "$1" >/dev/null 2>&1; do
+    if [ $n -eq 5 ]; then pkill -KILL -u "$1" >/dev/null 2>&1 || true; fi
+    sleep 1
+    n=$((n + 1))
+  done
+}
+
+# `tearmesh gateway setup` and `gateway remove`: the gateway's own system user, with no login and
+# no home. Listed (before it is made, so a run cut short still lists it) where uninstall lists
+# boundary users, and deleted only when listed there.
+if [ "${1:-}" = --gateway-user ]; then
+  u=$2
+  if ! id "$u" >/dev/null 2>&1; then
+    mkdir -p /etc/tearmesh
+    grep -qx "$u" /etc/tearmesh/created-users 2>/dev/null || echo "$u" >> /etc/tearmesh/created-users
+    chmod 0644 /etc/tearmesh/created-users
+    nologin=$(command -v nologin || echo /sbin/nologin)
+    if command -v useradd >/dev/null; then useradd --system --no-create-home --home-dir /nonexistent --shell "$nologin" "$u"
+    else adduser -S -D -H -h /nonexistent -s "$nologin" "$u"; fi
+  fi
+  exit 0
+fi
+if [ "${1:-}" = --gateway-user-remove ]; then
+  u=$2
+  if grep -qx "$u" /etc/tearmesh/created-users 2>/dev/null; then
+    if id "$u" >/dev/null 2>&1; then
+      end_user "$u"
+      if command -v userdel >/dev/null; then userdel "$u"; else deluser "$u"; fi
+    fi
+    grep -vx "$u" /etc/tearmesh/created-users > /etc/tearmesh/created-users.new || true
+    chmod 0644 /etc/tearmesh/created-users.new
+    mv -f /etc/tearmesh/created-users.new /etc/tearmesh/created-users
+  fi
+  exit 0
+fi
+
 if [ "${1:-}" = --uninstall ]; then
   shift
   if [ -d /run/systemd/system ]; then
-    systemctl disable --now tearmesh 'tearmesh-steward@*' >/dev/null 2>&1 || true
+    systemctl disable --now tearmesh >/dev/null 2>&1 || true
+    # disable takes no globs: stop's glob stops the loaded instances, and the template's name
+    # removes every instance's link.
+    systemctl stop 'tearmesh-steward@*' >/dev/null 2>&1 || true
+    systemctl disable tearmesh-steward@.service >/dev/null 2>&1 || true
     rm -f /etc/systemd/system/tearmesh.service /etc/systemd/system/tearmesh-steward@.service
     systemctl daemon-reload
   elif command -v rc-service >/dev/null; then
@@ -23,11 +68,23 @@ if [ "${1:-}" = --uninstall ]; then
     rc-update del tearmesh default >/dev/null 2>&1 || true
     rm -f /etc/init.d/tearmesh
   fi
-  pkill -u tearmesh >/dev/null 2>&1 || true
+  end_user tearmesh
+  # Hubs, stewards, menus and mail screens run as people and boundary users, not as the service;
+  # only tearmesh itself (not `ssh host tearmesh steward`), and not this script's ancestors: a
+  # menu that ran this uninstall waits for it. No bare `tearmesh` (the menu): BusyBox pgrep also
+  # matches the process name alone, which every tearmesh process has.
+  keep=" " p=$$
+  while [ "${p:-0}" -gt 1 ]; do
+    keep="$keep$p "
+    p=$(sed 's/.*) //' "/proc/$p/stat" 2>/dev/null | cut -d' ' -f2)
+  done
+  for p in $(pgrep -f '^([^ ]*/)?tearmesh (mcp|steward|waker|menu|tui|gateway)( |$)' 2>/dev/null); do
+    case $keep in *" $p "*) ;; *) kill "$p" 2>/dev/null || true ;; esac
+  done
   for b in "$@"; do
     u="tm-$b"
     id "$u" >/dev/null 2>&1 || continue
-    pkill -u "$u" >/dev/null 2>&1 || true
+    end_user "$u"
     if command -v userdel >/dev/null; then userdel -r "$u" 2>/dev/null || userdel "$u"; else deluser --remove-home "$u"; fi
   done
   if id tearmesh >/dev/null 2>&1; then
@@ -38,7 +95,7 @@ if [ "${1:-}" = --uninstall ]; then
   exit 0
 fi
 
-[ $# -ge 2 ] || { echo "usage: $0 <machine-name> <boundary>..." >&2; exit 1; }
+[ $# -ge 1 ] || { echo "usage: $0 <machine-name> [<boundary>...]" >&2; exit 1; }
 machine=$1; shift
 bin=${TEARMESH_BIN:-}
 if [ -z "$bin" ]; then
@@ -65,10 +122,16 @@ cp "$bin" /usr/local/bin/.tearmesh.new && chmod 0755 /usr/local/bin/.tearmesh.ne
 mv -f /usr/local/bin/.tearmesh.new /usr/local/bin/tearmesh
 id tearmesh >/dev/null 2>&1 || add_system_user tearmesh
 
+mkdir -p /etc/tearmesh
 users=""
 for b in "$@"; do
   u="tm-$b"
-  id "$u" >/dev/null 2>&1 || add_user "$u"
+  if ! id "$u" >/dev/null 2>&1; then
+    add_user "$u"
+    # Uninstall deletes only the users listed here, never an account that was already there.
+    echo "$u" >> /etc/tearmesh/created-users
+    chmod 0644 /etc/tearmesh/created-users
+  fi
   # Boundaries can't read each other's files, transcripts or agent logins.
   chmod 0700 "$(getent passwd "$u" | cut -d: -f6)"
   users="$users$u = \"$b\"
@@ -78,7 +141,6 @@ done
 admins=""
 if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != root ]; then admins="admins = [\"$SUDO_USER\"]
 "; fi
-mkdir -p /etc/tearmesh
 if [ ! -e /etc/tearmesh/config.toml ]; then
   printf 'machine = "%s"\n%s\n[users]\n%s' "$machine" "$admins" "$users" > /etc/tearmesh/config.toml
   chmod 0644 /etc/tearmesh/config.toml

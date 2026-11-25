@@ -115,7 +115,8 @@ check "a killed setup leaves nothing behind (keys live in memory until the end)"
   bash -c "test ! -e $T/h-mem/.ssh/tearmesh-owner-halfway && test \$(find /tmp -maxdepth 1 -name 'tearmesh-setup-*' -user $(id -un) | wc -l) = 0"
 # Rerun and join this time, giving a bad and a cut ticket first. The ticket names no machine.
 TICKET=$(on own mesh invite 2>"$T/invite.err")
-check "invite's hint points at the menu and setup" grep -q 'tearmesh menu' "$T/invite.err"
+check "invite's hint gives the install one-liner" grep -q 'install.sh | sudo sh -s -- --join tm2-' "$T/invite.err"
+check "  and the menu" grep -q 'tearmesh menu' "$T/invite.err"
 env HOME="$T/h-mem" TEARMESH_SOCKET="$T/mem.sock" "$TM" setup --config "$T/mem.toml" <"$T/in" >"$T/join.out" 2>&1 &
 JOIN=$!
 printf '2\nhello\ntm2-cut\n%s\n' "$TICKET" >&7
@@ -212,7 +213,7 @@ kill $SQUAT 2>/dev/null
 OUT=$(stdio mem 2 "$LIST")
 check "connect starts the hub and lists the shell tools" has 'shell_exec' "$OUT"
 check "  the tools-channel tools" has 'call_tool' "$OUT"
-check "  and the conversation tools" has 'wait_for_mail' "$OUT"
+check "  and the conversation tools" has 'inbox_fetch' "$OUT"
 sleep 1
 check "the hub keeps running after the client exits" test "$(hubs mem)" = 1
 check "a second hub exits and says one is running" has 'already running' "$(sudo -u tme3-mem env TEARMESH_SOCKET=$T/mem.sock $TM mcp serve 2>&1)"
@@ -225,7 +226,7 @@ sleep 1
 check "six clients starting it at once leave one hub" test "$(hubs mem)" = 1
 check "  and all six got answers" test "$(grep -l shell_exec "$T"/race*.out | wc -l)" = 6
 OUT=$(printf '%s\n' "$INIT" "$INITED" "$LIST" | (cat; sleep 2) | sudo -u tme3-mem env TEARMESH_SOCKET=$T/mem.sock $TM mcp 2>&1)
-check "a harness's own stdio copy runs beside the hub" has '"name":"post"' "$OUT"
+check "a harness's own stdio copy runs beside the hub" has '"name":"send_message"' "$OUT"
 check "  and the hub is untouched" test "$(hubs mem)" = 1
 check "the hub's directory is private" test "$(sudo stat -c %a /home/tme3-mem/.local/state/tearmesh/hub)" = 700
 check "the token file is private" test "$(sudo stat -c %a /home/tme3-mem/.local/state/tearmesh/hub/token)" = 600
@@ -246,18 +247,22 @@ hpost -H "Authorization: Bearer $TOKEN" -H "mcp-session-id: $SID" -d "$INITED" >
 hcall() { hpost -H "Authorization: Bearer $TOKEN" -H "mcp-session-id: $SID" -d "$(call "$@")"; }
 
 echo "== conversation, both ways"
-check "the hub posts a letter over HTTP" has '\\"id\\"' "$(hcall 2 post '{"to":["agent@own"],"subject":"from mem hub","body":"hi"}')"
+# send_message refuses an agent nobody has heard of: agent@own writes a status record first.
+sudo -u tme3-own env TEARMESH_SOCKET="$T/own.sock" TEARMESH_MAILBOX=agent "$TM" agent status --about "e2e agent" >/dev/null
+knows_agent() { hcall 8 list_nodes '{}' | grep -q 'agent@own'; }
+wait_for knows_agent
+check "the hub posts a letter over HTTP" has '\\"id\\"' "$(hcall 2 send_message '{"to":"agent@own","subject":"from mem hub","body":"hi"}')"
 inbox_has() { sudo -u tme3-$1 env TEARMESH_SOCKET="$T/$1.sock" TEARMESH_MAILBOX=agent "$TM" inbox --all 2>/dev/null | grep -c -- "$2"; }
 once_in() { [ "$(inbox_has "$1" "$2")" = 1 ]; }
 check "it arrives on the owner node" wait_for once_in own "from mem hub"
-# A session that stays open, to see the reply both pushed and returned by wait_for_mail.
-(printf '%s\n' "$INIT" "$INITED"; sleep 1; call 3 wait_for_mail '{"timeout_secs":40}'; echo; sleep 14) \
+# A session that stays open, to see the reply both pushed and returned by inbox_list's wait_secs.
+(printf '%s\n' "$INIT" "$INITED"; sleep 1; call 3 inbox_list '{"wait_secs":30}'; echo; sleep 14) \
   | sudo -u tme3-mem env TEARMESH_SOCKET="$T/mem.sock" "$TM" mcp connect >"$T/push.out" 2>&1 &
 PUSH=$!
 sleep 3
 sudo -u tme3-own env TEARMESH_SOCKET="$T/own.sock" TEARMESH_MAILBOX=agent "$TM" post --to agent@mem --subject "back to mem" --body "reply" >/dev/null
 wait $PUSH
-check "wait_for_mail returns the reply" grep -q 'back to mem' "$T/push.out"
+check "inbox_list with wait_secs returns the reply" grep -q 'back to mem' "$T/push.out"
 check "new mail is pushed to the open session" grep -q 'notifications/message.*new_mail' "$T/push.out"
 
 echo "== tools, both ways"
@@ -404,32 +409,36 @@ $TMX kill-session -t m
 cp "$T/new-owner" "$T/h-own/.ssh/" && cp "$T/new-owner.pub" "$T/h-own/.ssh/"
 $TMX new-session -d -s m -x 140 -y 40 "env HOME=$T/h-own TEARMESH_SOCKET=$T/own.sock $TM menu"
 check "with the new key in ~/.ssh it's the owner node again" wait_for pane_has "OWNER NODE"
-check "menu has the Owner tab" wait_for pane_has "│ Owner │"
-$TMX send-keys -t m Right
-check "the map draws far with its ping" wait_for pane_has "far [0-9]*ms"
-$TMX send-keys -t m Right
-check "nodes lists the machines" wait_for pane_has "this machine"
-check "the shortcut bar changed with the screen" pane_has "Disconnect"
-$TMX send-keys -t m c
-check "C opens the invite form" wait_for pane_has "Invite a machine"
-$TMX send-keys -t m Enter
-check "an empty form makes a ticket, shown in the menu" wait_for pane_has "Ticket for a new machine"
+check "the menu has three tabs" pane_has "Mesh │ Mail │ Settings"
+check "the map on the Mesh screen draws far with its ping" wait_for pane_has "far [0-9]*ms"
+check "  above the machines" pane_has "this machine"
+check "the shortcut bar has the owner's keys" pane_has "Add node"
+$TMX send-keys -t m a
+check "A makes a ticket at once, shown in the menu" wait_for pane_has "Add a node"
 check "  with the ticket itself" pane_has "^tm2-"
-$TMX send-keys -t m Enter Escape
-# Ctrl-C in a program the menu runs stops that program, not the menu.
-$TMX send-keys -t m S
-check "S runs status in the plain terminal" wait_for pane_has "Press Enter to return"
+check "  and both install one-liners, from column 0" bash -c "$TMX capture-pane -p -t m | grep -q '^curl -fsSL ' && $TMX capture-pane -p -t m | grep -qF '& ([scriptblock]'"
+check "  waiting for the new machine" pane_has "Waiting for the new machine"
+$TMX send-keys -t m Escape
+# Ctrl-C in a program the menu runs (ssh to far) stops that program, not the menu. The rows are
+# the join requests, then the machines in the mesh's order.
+row_of() { local p; p=$(on own status | python3 -c 'import json,sys;print(len(json.load(sys.stdin)["pending_joins"]))'); on own mesh show | python3 -c "import sys,tomllib;print($p+[m['name'] for m in tomllib.load(sys.stdin.buffer)['machine']].index('$1'))"; }
+for _ in $(seq 1 "$(row_of far)"); do $TMX send-keys -t m Down; done
+$TMX send-keys -t m x
+check "X runs ssh to far in the plain terminal" wait_for pane_has "ssh .*@far over the mesh"
 $TMX send-keys -t m C-c
-sleep 1
-check "Ctrl-C there leaves the menu running" $TMX has-session -t m
+check "  Ctrl-C stops it" wait_for pane_has "Press Enter to return"
+check "  and leaves the menu running" $TMX has-session -t m
 $TMX send-keys -t m Enter
 check "  and Enter comes back to it" wait_for pane_has "OWNER NODE"
-$TMX send-keys -t m q
+$TMX send-keys -t m S
+check "S shows the status JSON in the menu" wait_for pane_has '"node_id"'
+$TMX send-keys -t m Escape q
 sleep 1
 $TMX new-session -d -s f -x 140 -y 40 "env HOME=$T/h-far TEARMESH_SOCKET=$T/far.sock $TM menu"
 pane_f() { $TMX capture-pane -p -t f 2>/dev/null | grep -q -- "$1"; }
 check "on a machine without an owner key, menu says member" wait_for pane_f "MEMBER"
-check "  and has no Owner tab" bash -c "! $TMX capture-pane -p -t f | grep -q '│ Owner │'"
+check "  and offers no owner actions" bash -c "! $TMX capture-pane -p -t f | grep -q 'Add node'"
+check "  but Leave" pane_f "Leave mesh"
 $TMX send-keys -t f q
 
 echo "== a mesh made, joined and approved without leaving the menu"
@@ -458,7 +467,8 @@ check "  to a file only this user can read" test "$(stat -c %a "$T/h-nw/tearmesh
 check "  that opens with the generated passphrase" bash -c "ssh-keygen -y -P '$MPASS' -f $T/h-nw/tearmesh-recovery-menumesh.key >/dev/null"
 $TMX send-keys -t nw y; $TMX send-keys -t nw -l wrong; $TMX send-keys -t nw Enter
 check "a wrong word 3 is caught" wait_for in_pane nw "isn't word 3"
-$TMX send-keys -t nw -l "$(cut -d- -f3 <<<"$MPASS")"; $TMX send-keys -t nw Enter
+# A wrong word closes the question and shows the key again: Y asks once more.
+$TMX send-keys -t nw y; $TMX send-keys -t nw -l "$(cut -d- -f3 <<<"$MPASS")"; $TMX send-keys -t nw Enter
 wait_for in_pane nw "Create mesh menumesh now"
 $TMX send-keys -t nw y
 check "the mesh is created in the menu" wait_for in_pane nw "is ready"
@@ -466,13 +476,11 @@ check "  the everyday key is in ~/.ssh, private" test "$(stat -c %a "$T/h-nw/.ss
 check "  locked with the passphrase typed" bash -c "ssh-keygen -y -P menu-passphrase -f $T/h-nw/.ssh/tearmesh-owner-menumesh >/dev/null"
 $TMX send-keys -t nw Enter
 check "  and the menu is the owner node's" wait_for in_pane nw "OWNER NODE"
-$TMX send-keys -t nw Right Right c
-wait_for in_pane nw "Invite a machine"
-$TMX send-keys -t nw Enter
-wait_for in_pane nw "Ticket for a new machine"
+$TMX send-keys -t nw a
+wait_for in_pane nw "Add a node"
 $TMX send-keys -t nw w Enter
 check "the ticket saves to a file" wait_for test -s "$T/h-nw/tearmesh-ticket.txt"
-$TMX send-keys -t nw Enter
+# The ticket screen stays open: the request on its ticket replaces it.
 menu jn
 wait_for in_pane jn "NOT SET UP"
 $TMX send-keys -t jn j
@@ -482,12 +490,16 @@ $TMX load-buffer -b t "$T/h-nw/tearmesh-ticket.txt"
 $TMX paste-buffer -p -b t -t jn
 $TMX send-keys -t jn Enter
 check "the joining menu shows a code" wait_for in_pane jn "Code  [0-9]\{3\} [0-9]\{3\}"
-check "the owner's menu pops up the request" wait_for in_pane nw "jn wants to join with boundaries lab, work"
+check "the request replaces the owner's ticket screen" wait_for in_pane nw "jn wants to join with boundaries lab, work"
 JCODE=$($TMX capture-pane -p -t jn | grep -o 'Code  [0-9]\{3\} [0-9]\{3\}' | cut -c7-)
 check "  with the same code" in_pane nw "Code $JCODE"
 V0=$(version nw)
-# Tick "Add boundary lab" and "jn may use nw's tools", then the passphrase (past the note).
-$TMX send-keys -t nw Space Tab Space Tab Tab Tab Tab
+check "  work is ticked, lab offered as new" bash -c "$TMX capture-pane -p -t nw | grep -q '\[x\] jn hosts work' && $TMX capture-pane -p -t nw | grep -q '\[ \] jn hosts lab (new'"
+# The focus starts on "jn hosts work" (ticked). Tick "jn hosts lab" and "jn may use nw's tools",
+# then on to the passphrase (past jn's shell and nw's two grants). The form opened by itself, so
+# Enter is ignored for a moment (the menu's settle guard): wait it out.
+sleep 1
+$TMX send-keys -t nw Tab Space Tab Space Tab Tab Tab Tab
 $TMX send-keys -t nw -l not-the-passphrase; $TMX send-keys -t nw Enter
 check "a wrong passphrase is refused in the form" wait_for in_pane nw "doesn't open"
 $TMX send-keys -t nw -l menu-passphrase; $TMX send-keys -t nw Enter
@@ -495,19 +507,34 @@ check "approving signs and applies" wait_for in_pane nw "Signed and applied mesh
 check "jn joins" wait_for in_pane jn "Joined"
 check "  one new version for the machine, its boundary and the grant" test "$(version nw)" = $((V0 + 1))
 SHOW=$(env TEARMESH_SOCKET=$T/nw.sock $TM mesh show)
-check "  jn hosts lab and work" test "$(hosts_of nw jn)" = "lab,work"
+check "  jn hosts work and lab" test "$(hosts_of nw jn)" = "work,lab"
 check "  and may use nw's tools" has 'from = "jn"' "$SHOW"
 check "jn has the same version" wait_for bash -c "test \"\$(env TEARMESH_SOCKET=$T/jn.sock $TM status | python3 -c 'import json,sys;print(json.load(sys.stdin)[\"mesh\"][\"version\"])')\" = $((V0 + 1))"
 $TMX send-keys -t nw Enter
-# A grant from the Nodes screen, signed in the menu.
+# A switch from the Mesh screen, signed in the menu. Once the request is gone, jn is row 1.
+wait_for bash -c "! $TMX capture-pane -p -t nw | grep -q 'join request'"
 $TMX send-keys -t nw Down g
-wait_for in_pane nw "To machine"
-$TMX send-keys -t nw Enter
+check "G shows the switches between this machine and the selected one" wait_for in_pane nw "Permissions: nw and jn"
+$TMX send-keys -t nw Space Enter
 wait_for in_pane nw "Passphrase for"
 $TMX send-keys -t nw -l menu-passphrase; $TMX send-keys -t nw Enter
 check "a grant signed in the menu" wait_for in_pane nw "Signed and applied mesh version $((V0 + 2))"
 $TMX send-keys -t nw Enter q
 $TMX send-keys -t jn Enter q
+check "a reset tells the others it is leaving" has 'told nw' "$(on jn mesh reset --yes 2>&1)"
+check "  and nw lists jn as leaving" test "$(on nw status | python3 -c 'import json,sys;print(json.load(sys.stdin)["leaving"])')" = "['jn']"
+check "after a reset, leave frees the machine" has 'left the mesh' "$(on jn mesh leave --yes 2>&1)"
+check "  and nothing ties jn to the mesh any more" bash -c "! test -e $T/jn/mesh-id"
+wait_for bash -c "! $TMX has-session -t nw 2>/dev/null"
+menu nw
+check "nw's menu offers to remove it" wait_for in_pane nw "jn says it left"
+$TMX send-keys -t nw Escape
+check "  Esc keeps it, marked on its row" wait_for in_pane nw "jn (says it left)"
+$TMX send-keys -t nw q
+
+echo "== dissolving the mesh"
+check "dissolve signs, applies and hands the last version on" has 'Reached [1-9][0-9]* of' "$(on own mesh dissolve --key "$T/new-owner" --yes 2>&1)"
+check "far shows the mesh as dissolved" wait_for bash -c "env TEARMESH_SOCKET=$T/far.sock $TM status | grep -q '\"dissolved\": \"'"
 
 echo
 if [ "$FAILED" = 0 ]; then echo "ALL PASSED"; else echo "SOME FAILED"; exit 1; fi

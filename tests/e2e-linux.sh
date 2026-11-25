@@ -3,7 +3,7 @@
 # "ws" hosts boundaries work and vault, "laptop" hosts work. They use the default network (n0
 # relays and DNS, plus mDNS). Covers the membership file and ticket join, OS-user boundaries,
 # grants, MCP over stdio, a tool call to another machine's offered server through the steward,
-# shell forwarding, bios, the hook, the steward waking a mailbox, the connector and the TUI.
+# shell forwarding, bios, the hook, the steward waking a mailbox and the menu's Mail tab.
 # Needs passwordless sudo, python3 and curl. Creates and removes the users tme-work, tme-vault
 # tme-lap and tme-none (mapped to no boundary).
 # Usage: cargo build --release && tests/e2e-linux.sh
@@ -180,9 +180,9 @@ check "a bio set on ws shows on laptop" wait_for lap_sees_bio
 MCP_OUT=$(printf '%s\n' "$MCP_INIT" \
   '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
   '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' \
-  '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"inbox","arguments":{"all":true}}}' \
+  '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"inbox_list","arguments":{"unread_only":false}}}' \
   | (cat; sleep 2) | sudo -u tme-lap env TEARMESH_SOCKET="$T/laptop.sock" TEARMESH_MAILBOX=admin "$TM" mcp 2>/dev/null)
-mcp_ok() { grep -q '"name":"post"' <<<"$MCP_OUT" && grep -q 'work note' <<<"$MCP_OUT"; }
+mcp_ok() { grep -q '"name":"send_message"' <<<"$MCP_OUT" && grep -q 'work note' <<<"$MCP_OUT"; }
 check "MCP server lists tools and reads the inbox over stdio" mcp_ok
 
 run tme-work "$T/ws.sock" builder post --to admin@laptop --subject "hook test" --body x >/dev/null
@@ -214,46 +214,16 @@ check "the reply is on the same thread" bash -c "sudo -u tme-work env TEARMESH_S
 sleep 3
 check "one letter wakes once" test "$(grep -c 'waking helper@laptop' "$T/waker.log")" = 1
 
-# The connector: HTTP MCP on a Unix socket only tme-lap can open; its letters are guest.
-sudo -u tme-lap mkdir -p /home/tme-lap/notes
-sudo -u tme-lap sh -c 'echo "meeting at noon" > /home/tme-lap/notes/today.md'
-cat > "$T/connector.toml" <<EOF
-listen = "/home/tme-lap/.local/state/tearmesh/connector/mcp.sock"
-mailbox = "phone"
-roots = ["/home/tme-lap/notes"]
-EOF
-chmod 0644 "$T/connector.toml"
-sudo -u tme-lap env TEARMESH_SOCKET="$T/laptop.sock" "$TM" mcp --http "$T/connector.toml" 2>"$T/connector.log" &
-CSOCK=/home/tme-lap/.local/state/tearmesh/connector/mcp.sock
-wait_for sudo -u tme-lap test -S "$CSOCK"
-# curl as USER: JSON-RPC over the connector's socket, with the session id after initialize.
-cpost() { local u=$1 body=$2 sid=${3:-}; sudo -u "$u" curl -s -m 10 --unix-socket "$CSOCK" -D - \
-  -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
-  ${sid:+-H "mcp-session-id: $sid"} -d "$body" http://localhost/mcp; }
-cpost tme-lap "$MCP_INIT" >"$T/c-init.out"
-SID=$(grep -i '^mcp-session-id:' "$T/c-init.out" | cut -d' ' -f2 | tr -d '\r')
-check "the connector answers initialize" grep -q tearmesh-connector "$T/c-init.out"
-cpost tme-lap '{"jsonrpc":"2.0","method":"notifications/initialized"}' "$SID" >/dev/null
-C_FILE=$(cpost tme-lap '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"read_file","arguments":{"path":"today.md"}}}' "$SID")
-check "the connector reads a file under its roots" grep -q 'meeting at noon' <<<"$C_FILE"
-C_OUT=$(cpost tme-lap '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"read_file","arguments":{"path":"../.bashrc"}}}' "$SID")
-check "the connector refuses a path outside its roots" grep -q "can't open" <<<"$C_OUT"
-cpost tme-lap '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"post","arguments":{"to":["helper@laptop","builder@ws"],"subject":"from the phone","body":"hi","kind":"task"}}}' "$SID" >/dev/null
-ws_has_phone() { run tme-work "$T/ws.sock" builder inbox 2>/dev/null | grep -q "from the phone"; }
-check "a letter posted through the connector arrives" wait_for ws_has_phone
-PHONE_ID=$(run tme-work "$T/ws.sock" builder inbox | grep "from the phone" | cut -c1-12)
-check "it carries guest trust and its kind" bash -c "sudo -u tme-work env TEARMESH_SOCKET=$T/ws.sock TEARMESH_MAILBOX=builder $TM read $PHONE_ID | grep -q 'trust:   guest' && sudo -u tme-work env TEARMESH_SOCKET=$T/ws.sock TEARMESH_MAILBOX=builder $TM read $PHONE_ID | grep -q 'kind:    task'"
-sleep 3
-check "a guest letter doesn't wake a default mailbox" test "$(grep -c 'waking helper@laptop' "$T/waker.log")" = 1
-check "another local user can't reach the connector" refused "" cpost tme-work "$MCP_INIT"
-
-# The terminal UI, driven through tmux as the laptop's boundary user.
+# Mail in the menu, driven through tmux as the laptop's boundary user.
 if command -v tmux >/dev/null; then
   export TMUX_TMPDIR=$T
   TS="tme2e-$$"
-  tmux new-session -d -s "$TS" -x 140 -y 30 "sudo -u tme-lap env TEARMESH_SOCKET=$T/laptop.sock TEARMESH_MAILBOX=admin $TM tui"
+  tmux new-session -d -s "$TS" -x 140 -y 30 "sudo -u tme-lap env TEARMESH_SOCKET=$T/laptop.sock TEARMESH_MAILBOX=admin $TM menu"
   pane_has() { tmux capture-pane -p -t "$TS" 2>/dev/null | grep -q "$1"; }
-  check "tui shows the address and inbox" wait_for pane_has "admin@laptop · boundary work"
+  # Past the splash. A boundary user's menu opens on the Mail tab.
+  wait_for pane_has "Mesh │ Mail │ Settings"
+  check "the menu knows a boundary user" wait_for pane_has "BOUNDARY USER"
+  check "the Mail tab shows the address and inbox" wait_for pane_has "admin@laptop · boundary work"
   check "tui lists letters newest first" bash -c "tmux capture-pane -p -t $TS | grep -n 'hook test\|work note' | head -1 | grep -q 'hook test'"
   tmux send-keys -t "$TS" j Enter
   check "tui opens a letter" wait_for pane_has "hello laptop"
@@ -269,13 +239,14 @@ if command -v tmux >/dev/null; then
   check "tui reply body and thread are right" tui_body
   tmux send-keys -t "$TS" q
   tui_gone() { ! tmux has-session -t "$TS" 2>/dev/null; }
-  check "tui quits cleanly" wait_for tui_gone
+  check "the menu quits cleanly" wait_for tui_gone
   tmux kill-session -t "$TS" 2>/dev/null
 else
-  echo "SKIP tui checks (no tmux)"
+  echo "SKIP menu mail checks (no tmux)"
 fi
 
 if [ $FAILED = 0 ]; then echo "ALL PASSED"; else
-  for f in ws.log laptop.log steward-ws.log waker.log connector.log join.out; do echo "--- $f"; tail -15 "$T/$f"; done
+  for f in ws.log laptop.log steward-ws.log waker.log join.out; do echo "--- $f"; tail -15 "$T/$f"; done
   exit 1
 fi
+

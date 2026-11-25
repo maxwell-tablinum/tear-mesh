@@ -1,5 +1,7 @@
 # tear-mesh 0.2.0: Spec
 
+> **History, no longer updated (2026-11-19).** The specification of tear-mesh is [spec.md](spec.md). Where this document disagrees with it, spec.md is right.
+
 2026-10-18 · builds on [design.md](design.md) rev 3 and a design review held 2026-10-16/17. The decisions in §15 were settled on 2026-10-18 after an adversarial review; §15 lists what changed. Implemented in 0.2.0.
 
 Status markers: 🟩 settled · 🟨 proposed, needs a maintainer decision · 🟥 open, check before building
@@ -460,9 +462,11 @@ Injection can still steer the reader to an *allowed* action with chosen argument
 - The reader gets decoy tools (delete, shell, send file) that only raise an alarm.
 - A note that makes the reader reach for one is quarantined, and its sender can be blocked.
 
-🟨 Proposed build:
-- A screening mailbox, run by the steward, with a cheap model and a tear-mesh decoy MCP server.
-- Letters are held from other mailboxes until screened. If the screener is down, letters wait.
+🟩 Built (2026-11-12), as `screen = ["<boundary>"]` in the daemon's config:
+- The steward runs the screener with a cheap model and three decoy tools in the request itself (no decoy MCP server).
+- Letters from other machines and from guests are held from every session, hook and wake until screened. If the screener is down, letters wait.
+- Flagged letters go to `tearmesh quarantine`; listing, reading or releasing them takes an admin.
+- Screening covers mail that arrives after it is turned on. Bios and offer text aren't screened (open).
 
 README caveats:
 - It catches clumsy attacks better than careful ones.

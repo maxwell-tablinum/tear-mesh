@@ -1,0 +1,39 @@
+{
+  "manifest_version": "0.3",
+  "name": "tearmesh",
+  "display_name": "tear-mesh",
+  "version": "0.4.0",
+  "description": "Gives Claude Desktop the tools of your tear-mesh hub by running the tear-mesh already installed on this PC. It holds no copy of tear-mesh.",
+  "author": {
+    "name": "tear-mesh contributors"
+  },
+  "license": "MIT OR Apache-2.0",
+  "server": {
+    "type": "node",
+    "entry_point": "server/index.js",
+    "mcp_config": {
+      "command": "node",
+      "args": [
+        "${__dirname}/server/index.js",
+        "${user_config.tearmesh_path}"
+      ]
+    }
+  },
+  "user_config": {
+    "tearmesh_path": {
+      "type": "string",
+      "title": "Path to tearmesh.exe",
+      "description": "Only if the extension cannot find tear-mesh by itself. Leave empty otherwise.",
+      "required": false,
+      "default": ""
+    }
+  },
+  "compatibility": {
+    "platforms": [
+      "win32"
+    ],
+    "runtimes": {
+      "node": ">=18"
+    }
+  }
+}

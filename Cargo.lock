@@ -3626,6 +3626,8 @@ dependencies = [
  "rustls",
  "rustls-pki-types",
  "rustls-platform-verifier",
+ "serde",
+ "serde_json",
  "sync_wrapper",
  "tokio",
  "tokio-rustls",
@@ -4489,7 +4491,7 @@ dependencies = [
 
 [[package]]
 name = "tearmesh"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -4504,10 +4506,13 @@ dependencies = [
  "iroh-mdns-address-lookup",
  "nix 0.31.3",
  "ratatui",
+ "reqwest",
  "rmcp",
  "rusqlite",
+ "rustls",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "ssh-key",
  "tempfile",
  "tokio",

@@ -101,7 +101,11 @@ async fn session(
     mut recv: RecvStream,
 ) -> Result<()> {
     let peer = conn.remote_id();
+    let started = crate::now_ms();
     let me = node.signed()?;
+    // Otherwise a removed machine here under the farewell rule (`node::Members`): it gets no heads
+    // (it shares no boundary), no address, and versions only up to its removal.
+    let member = me.mesh.machine_by_id(&peer).is_some();
     let mut heads = BTreeMap::new();
     for b in node.shared_with(&peer) {
         heads.insert(b.clone(), node.heads(&b)?);
@@ -110,7 +114,7 @@ async fn session(
         mesh: me.mesh.id.clone(),
         version: me.mesh.version,
         hash: me.hash.clone(),
-        addr: node.endpoint.addr(),
+        addr: if member { node.endpoint.addr() } else { EndpointAddr::new(node.id()) },
         heads,
     };
     write(&mut send, &hello).await?;
@@ -129,18 +133,25 @@ async fn session(
         node.learn_addr(addr);
     }
 
-    let versions = node.versions_for(version, &hash);
+    let versions = node.versions_for(version, &hash, &peer);
     write(&mut send, &Frame::Mesh { versions }).await?;
     let Frame::Mesh { versions } = read(&mut recv).await? else {
         bail!("expected mesh versions")
     };
-    if !versions.is_empty()
-        && let Err(e) = node.adopt(&versions)
-    {
-        warn!(
-            "peer {} offered membership versions we refused: {e:#}",
-            peer.fmt_short()
-        );
+    if !versions.is_empty() {
+        let (tip, r) = node.adopt_tip(&versions);
+        if let Err(e) = r {
+            warn!(
+                "peer {} offered membership versions we refused: {e:#}",
+                peer.fmt_short()
+            );
+        }
+        // A new tip from a member that drops this machine means it was removed.
+        if let Some(tip) = tip
+            && member
+        {
+            node.settle(&tip)?;
+        }
     }
 
     // Placement uses the membership file as it stands now, possibly just updated.
@@ -186,6 +197,6 @@ async fn session(
         anyhow::Ok(())
     };
     tokio::try_join!(send_side, recv_side)?;
-    node.saw(&peer);
+    node.synced(&peer, started);
     Ok(())
 }
