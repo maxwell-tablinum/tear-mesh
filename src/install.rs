@@ -229,9 +229,18 @@ pub fn restart_service() -> Result<()> {
         return Ok(());
     };
     #[cfg(windows)]
-    let st = Command::new("powershell.exe").args(["-NoProfile", "-Command", "Restart-Service tearmesh"]).status();
+    let st = powershell().args(["-NoProfile", "-Command", "Restart-Service tearmesh"]).status();
     ensure!(st.context("restarting the service")?.success(), "couldn't restart the tearmesh service");
     Ok(())
+}
+
+/// Windows PowerShell 5.1, without the caller's PSModulePath: inherited from PowerShell 7 it makes
+/// 5.1 load 7's modules, which fail there (`ConvertTo-SecureString` "could not be loaded").
+#[cfg(windows)]
+fn powershell() -> Command {
+    let mut c = Command::new("powershell.exe");
+    c.env_remove("PSModulePath");
+    c
 }
 
 /// Writes the deploy script (and what it installs) to a private directory; returns the script.
@@ -254,7 +263,7 @@ pub(crate) fn run_script(args: &[String]) -> Result<()> {
         #[cfg(not(windows))]
         let st = Command::new("sh").arg(&script).args(args).env("TEARMESH_BIN", &exe).status();
         #[cfg(windows)]
-        let st = Command::new("powershell.exe")
+        let st = powershell()
             .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
             .arg(&script)
             .args(args)
@@ -410,7 +419,7 @@ pub fn elevated(args: &[&str]) -> Result<()> {
     };
     // shortcut: the elevated window closes when done, so its output is lost; show it if needed
     #[cfg(windows)]
-    let st = Command::new("powershell.exe")
+    let st = powershell()
         .args([
             "-NoProfile",
             "-Command",
