@@ -16,8 +16,9 @@ param(
 $ErrorActionPreference = 'Stop'
 $Version = '@VERSION@'
 $Sha = '@SHA_X86_64_WINDOWS@'
-$me = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
-if (-not $me.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'run PowerShell as Administrator' }
+# Not $me: PowerShell names ignore case, so that is the -Me parameter.
+$principal = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
+if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'run PowerShell as Administrator' }
 $Boundaries = @($Boundaries | ForEach-Object { $_ -split ',' } | Where-Object { $_ })
 if ($Boundaries -and -not $Machine) { throw '-Boundaries needs -Machine' }
 $dir = Join-Path ([IO.Path]::GetTempPath()) ('tearmesh-' + [guid]::NewGuid())
