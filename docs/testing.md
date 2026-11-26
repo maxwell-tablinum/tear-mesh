@@ -523,13 +523,18 @@ On three throwaway containers with systemd, on 2026-11-26, starting from the pub
 - `mesh set release 0.5.1`: a 0.5.0 machine took the file and its updater's timer installed 0.5.1 by itself at its next run, after which the daemon, the steward and a stand-in unit named `tearmesh-gateway` ran from the new program; a 0.4.0 machine refused the file, stayed at the version before and kept exchanging mail, and after its upgrade by hand took the file and updated the same way;
 - `uninstall` after an update left none of the installed files, the updater's units, the lock or the work folder.
 
+On the owner's own mesh, on 2026-11-26, with the published 0.5.0:
+- the published install line upgraded two Linux machines from 0.4.0 in place, one of them the gateway's while it ran: the node id and the mesh kept, the gateway restarted from the new program with its sign-ins, the updater's timer enabled and its first run clean (`This machine is up to date`), and `status --ping` showed the other machine's version;
+- a task mailbox, a table with `from = ["claude@gw"]` and `wake_on = ["guest"]` whose agent may type into running sessions and start new ones through one script: a question was answered in 10 s; a task started a session in a new worktree, which committed; a follow-up posted on the gateway machine from its `claude` mailbox crossed the mesh and was typed into that session, which committed; a letter from another sender did not wake it;
+- an old board post woke the new mailbox once, when the steward started (`fix/board-wake-at-check` in `docs/spec.md`).
+
 ### Never tested
 
 - Claude on the web against the gateway.
 - Whether Claude calls a tool again by itself during a call, or only when you speak. The gateway is built for either answer (`inbox_list` can wait).
 - A real Windows machine (see Windows below), Claude Desktop with the unsigned `.mcpb` bundle, and aarch64.
 - Anything 0.5.0 added on Windows: the updater's scheduled task, the swap of a running program, the restart of steward tasks. It compiles for Windows and has not run there.
-- `update` from GitHub to a release newer than the installed one (0.4.0 is the only release), the updater under a gateway that is really running, and the menu's new Permissions box with a person at a terminal.
+- `update` from GitHub to a release newer than the installed one (0.5.0 is the newest), the updater under a gateway that is really running, and the menu's new Permissions box with a person at a terminal.
 
 `docs/research/x2-spike/README.md` is a five-minute test for both, with a throwaway server and no tear-mesh. Write the answers into `docs/spec.md` at `open/voice-polling`.
 
@@ -655,4 +660,4 @@ On an owner node it warns first: afterwards only the other owner keys (the recov
 1. Bump the version in `Cargo.toml` and `adapters/claude-code/.claude-plugin/plugin.json` (a unit test checks they match), and commit.
 2. `git tag -a v<version> -m "<notes>"` and push the tag. The `release` workflow builds the Linux (x86_64 and aarch64, musl) and Windows (MSVC) binaries, smoke-tests each through the install script served from a local folder (a corrupted binary refused, install, re-run, uninstall), fills `install.sh` and `install.ps1` with the version and the binaries' SHA-256 (failing if any `@…@` placeholder is left), and creates a **draft** release with the binaries, the two scripts and `SHA256SUMS` (which lists the scripts too). If no run starts within a minute, delete the tag on the remote and push it again (needed twice on 2026-11-25; the first run started only once the workflow file was on the default branch).
 3. On the Windows test VM, download the Windows binary from the draft and run `tests\e2e-windows.ps1 -Exe <it>`. On a Linux and the Windows test VM, run both one-liners that `tearmesh mesh invite` prints against the draft's assets, and check on Windows that `irm` returns `install.ps1` as text.
-4. Publish the draft.
+4. Give the draft its title (`tear-mesh <version>`), take that line out of the top of its notes, and publish it: `gh release edit v<version> --title "tear-mesh <version>" --notes-file <notes> --draft=false`.
