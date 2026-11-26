@@ -50,7 +50,7 @@ run_one() {
       tearmesh uninstall --yes 2>&1 | tail -4 | tee /tmp/un
       grep -q 'kept (not created by install): tm-pre' /tmp/un && id tm-pre >/dev/null \
         && ! getent passwd | grep -v '^tm-pre:' | grep -q '^tm-' && ! id tearmesh 2>/dev/null && test ! -e /etc/tearmesh \
-        && test ! -e /etc/init.d/tearmesh && test ! -e /etc/systemd/system/tearmesh.service && test ! -e /usr/local/bin/tearmesh \
+        && test ! -e /etc/init.d/tearmesh && test ! -e /etc/systemd/system/tearmesh.service && test ! -e /etc/systemd/system/tearmesh-update.timer && test ! -e /usr/local/bin/tearmesh \
         && echo 'UNINSTALL OK' || echo 'UNINSTALL FAILED'" >"$log" 2>&1
   local e2e setup
   e2e=$(grep -E '^(ALL PASSED|FAIL )' "$log" | head -3 | tr '\n' ' ')

@@ -619,6 +619,8 @@ pub async fn serve(node: &Arc<Node>, conn: Connection) -> Result<()> {
     r
 }
 
+// One per join attempt and gone in a moment: not worth a Box.
+#[allow(clippy::large_enum_variant)]
 enum Answer {
     /// Approved while away: here is the file.
     Approved(SignedMesh),

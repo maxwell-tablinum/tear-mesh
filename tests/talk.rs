@@ -226,7 +226,9 @@ async fn sending_and_its_errors() {
     // agent@node, and a bare node name reaching admin.
     let r = ok(&alice, "send_message", json!({"to": "bob@laptop", "body": "First line\nsecond", "kind": "question"})).await;
     assert_eq!(r["state"], "sent");
+    assert!(r.get("note").is_none(), "bob has a status record: {r}");
     let r2 = ok(&alice, "send_message", json!({"to": "laptop", "body": "hello admin", "subject": "hi"})).await;
+    assert_eq!(r2["note"], "admin@laptop has no status record: a person may read this later, in the menu. Agents on laptop with one: bob");
     sync(&[&ws, &laptop]).await;
     let got = ok(&bob, "inbox_list", json!({})).await;
     assert_eq!(subjects(&got), ["First line"], "the default subject is the first line");
@@ -320,6 +322,18 @@ async fn follow_ups_to_ones_own_letter_and_keys() {
     let e = t(&alice, "send_message", json!({"reply_to": &qid[..8], "body": "more", "idempotency_key": "k"})).await.unwrap_err();
     assert_eq!(e, "node laptop is offline (no answer in 4 s); nothing was sent now. If an earlier call with this idempotency_key returned an id, that message was already sent. Pass if_offline=\"queue\" to leave the message waiting for it");
     ws.stop().await;
+}
+
+#[tokio::test]
+async fn pings_carry_versions() {
+    let (_w, ws, laptop, _alice, _bob) = pair().await;
+    let p = tearmesh::ping::all(&ws.node).await.unwrap();
+    assert_eq!((p.len(), p[0].name.as_str(), p[0].version.as_deref()), (1, "laptop", Some(env!("CARGO_PKG_VERSION"))), "{p:?}");
+    let s = serde_json::to_value(ws.node.status()).unwrap();
+    assert_eq!(s["version"], env!("CARGO_PKG_VERSION"));
+    assert!(s["mesh"]["release"].is_null(), "{s}");
+    ws.stop().await;
+    laptop.stop().await;
 }
 
 #[tokio::test]
@@ -556,10 +570,17 @@ async fn the_steward_registers_mailboxes_and_a_claim_does_not_wake() {
     let (w, ws, laptop, alice, _bob) = pair().await;
     ok(&alice, "set_status", json!({"about": "asker"})).await;
     let dir = w.dir.path();
-    let woke = dir.join("woke");
+    let (woke, star) = (dir.join("woke"), dir.join("star"));
+    // "*" answers every other mailbox, one wake an hour between them; it prints a session id that
+    // must not be kept, since it has no resume.
     std::fs::write(
         dir.join("mailboxes.toml"),
-        format!("[helper]\ndir = {:?}\ncommand = [\"sh\", \"-c\", \"echo woke >> {}\", \"sh\"]\nabout = \"Answers questions about the docs.\"\n", dir, woke.display()),
+        format!(
+            "[helper]\ndir = {dir:?}\ncommand = [\"sh\", \"-c\", \"echo woke >> {}\", \"sh\"]\nabout = \"Answers questions about the docs.\"\nfrom = [\"alice@*\"]\n\
+             [\"*\"]\ndir = {dir:?}\ncommand = [\"sh\", \"-c\", \"echo $1 >> {}; echo '{{\\\"session_id\\\": \\\"s1\\\"}}'\", \"sh\", \"{{mailbox}}\"]\nmax_wakes_per_hour = 1\n",
+            woke.display(),
+            star.display()
+        ),
     )
     .unwrap();
     // The steward reads the socket and its state home from the environment.
@@ -586,14 +607,16 @@ async fn the_steward_registers_mailboxes_and_a_claim_does_not_wake() {
     let l = ok(&alice, "node_status", json!({"node": "laptop", "agent": "helper"})).await;
     assert_eq!(l["agents"][0]["about"], "Answers questions about the docs.", "known to other machines");
 
-    // helper asks alice something; alice's claim goes to helper and wakes nothing.
+    // helper asks alice something; alice's claim goes to helper and wakes nothing, nor does a
+    // letter from carol, whom helper's `from` leaves out.
     let helper = w.talk("laptop", "helper");
     let q = ok(&helper, "send_message", json!({"to": "alice@ws", "body": "which repo?", "kind": "question"})).await;
     sync(&[&ws, &laptop]).await;
     ok(&alice, "claim", json!({"reply_to": q["id"], "expect_secs": 5})).await;
+    ok(&w.talk("ws", "carol"), "send_message", json!({"to": "helper@laptop", "body": "hi from carol"})).await;
     sync(&[&ws, &laptop]).await;
     tokio::time::sleep(Duration::from_secs(3)).await;
-    assert!(!woke.exists(), "a claim woke the mailbox");
+    assert!(!woke.exists(), "a claim or carol woke the mailbox");
     let v = ok(&helper, "inbox_list", json!({})).await;
     assert_eq!(v["letters"][0]["kind"], "claim");
 
@@ -607,6 +630,25 @@ async fn the_steward_registers_mailboxes_and_a_claim_does_not_wake() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     assert!(woke.exists(), "a letter did not wake the mailbox");
+
+    // admin has no table: "*" answers it, with {mailbox} filled.
+    let star_text = || std::fs::read_to_string(&star).unwrap_or_default();
+    ok(&w.talk("laptop", "zed"), "send_message", json!({"to": "alice@ws", "body": "zed is here"})).await;
+    ok(&alice, "send_message", json!({"to": "laptop", "body": "for admin"})).await;
+    sync(&[&ws, &laptop]).await;
+    for _ in 0..100 {
+        if !star_text().is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(star_text(), "admin\n");
+    assert!(!dir.join(".local/state/tearmesh/sessions.json").exists(), "sessions.json without resume");
+    // zed is answered by "*" too, whose one wake this hour is spent.
+    ok(&alice, "send_message", json!({"to": "zed@laptop", "body": "for zed"})).await;
+    sync(&[&ws, &laptop]).await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(star_text(), "admin\n", "the budget of \"*\" is shared, and helper has its own table");
     steward.abort();
     ws.stop().await;
     laptop.stop().await;

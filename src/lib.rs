@@ -30,6 +30,7 @@ pub mod store;
 pub mod sync;
 pub mod talk;
 pub mod tui;
+pub mod update;
 
 /// Machine, boundary and mailbox names: 1–32 of `a-z`, `0-9`, `-`, not starting with `-`.
 pub fn valid_name(s: &str) -> bool {

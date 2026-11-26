@@ -38,10 +38,11 @@ impl std::str::FromStr for Category {
     type Err = anyhow::Error;
     fn from_str(s: &str) -> Result<Self> {
         Ok(match s {
-            "converse" => Category::Converse,
+            // `mail` is the channel's name in the menu; the file keeps `converse`.
+            "converse" | "mail" => Category::Converse,
             "tools" => Category::Tools,
             "shell" => Category::Shell,
-            _ => bail!("unknown category {s:?} (converse, tools, shell)"),
+            _ => bail!("unknown category {s:?} (converse or mail, tools, shell)"),
         })
     }
 }
@@ -67,6 +68,9 @@ pub struct Settings {
     pub lookup: Vec<String>,
     #[serde(default)]
     pub tools_sharing: Sharing,
+    /// The version every machine should run (`0.5.1`); each machine's updater installs it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release: Option<String>,
 }
 
 pub fn default_lookup() -> Vec<String> {
@@ -79,6 +83,7 @@ impl Default for Settings {
             relays: Relay::default(),
             lookup: default_lookup(),
             tools_sharing: Sharing::default(),
+            release: None,
         }
     }
 }
@@ -154,6 +159,18 @@ struct CircleV1 {
     boundaries: Vec<String>,
     #[serde(default, rename = "machine")]
     machines: Vec<Machine>,
+}
+
+/// A release version: three numbers separated by dots (`0.5.1`).
+pub fn release_version(s: &str) -> Option<(u64, u64, u64)> {
+    let n: Vec<u64> = s
+        .split('.')
+        .map(|p| (!p.is_empty() && p.bytes().all(|b| b.is_ascii_digit())).then(|| p.parse().ok()).flatten())
+        .collect::<Option<_>>()?;
+    match n[..] {
+        [a, b, c] => Some((a, b, c)),
+        _ => None,
+    }
 }
 
 pub fn hash(toml: &str) -> String {
@@ -287,6 +304,9 @@ impl Mesh {
                 l == "n0-dns" || l == "mdns",
                 "settings.lookup: unknown method {l:?} (n0-dns, mdns)"
             );
+        }
+        if let Some(r) = &self.settings.release {
+            ensure!(release_version(r).is_some(), "settings.release must be a version like 0.5.1, not {r:?}");
         }
         ensure!(
             !self.closed || (self.machines.is_empty() && self.grants.is_empty() && self.approvals.is_empty()),
@@ -528,7 +548,7 @@ pub enum Change {
     OwnerAdd(String),
     /// A SHA256 fingerprint.
     OwnerRemove(String),
-    /// `tools-sharing`, `relays` or `lookup`, with `mesh set`'s values.
+    /// `tools-sharing`, `relays`, `lookup` or `release`, with `mesh set`'s values.
     Set { setting: String, value: String },
     /// The last version: every machine leaves and nothing can follow.
     Dissolve,
@@ -536,7 +556,8 @@ pub enum Change {
 
 impl std::fmt::Display for Change {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        let cats = |g: &Grant| g.allow.iter().map(|c| format!("{c:?}").to_lowercase()).collect::<Vec<_>>().join(",");
+        // People read this before they sign: the first channel is "mail" to them, `converse` only in the file.
+        let cats = |g: &Grant| g.allow.iter().map(|c| if *c == Category::Converse { "mail".into() } else { format!("{c:?}").to_lowercase() }).collect::<Vec<_>>().join(",");
         match self {
             Change::AddMachine { machine: m, replace } => write!(
                 f,
@@ -581,7 +602,11 @@ impl Mesh {
         match c {
             Change::AddMachine { machine, replace } => self.add_machine(machine.clone(), *replace)?,
             Change::RemoveMachine(n) => self.remove_machine(n)?,
-            Change::Grant(g) => self.grant(&g.from, &g.to, &g.allow),
+            Change::Grant(g) => {
+                // Not in validate(): files 0.4.0 signed with such a grant must still load.
+                ensure!(g.from == "*" || g.from != g.to, "a machine needs no grant to itself");
+                self.grant(&g.from, &g.to, &g.allow)
+            }
             Change::Revoke(g) => {
                 let still = self.revoke(&g.from, &g.to, &g.allow)?;
                 if !still.is_empty() {
@@ -661,7 +686,18 @@ impl Mesh {
                         .map(String::from)
                         .collect()
                 }
-                _ => bail!("unknown setting {setting} (tools-sharing, relays, lookup)"),
+                "release" => {
+                    if value == "none" {
+                        self.settings.release = None;
+                    } else {
+                        ensure!(release_version(value).is_some(), "release is a version like 0.5.1, or none");
+                        self.settings.release = Some(value.clone());
+                        return Ok(Some(
+                            "machines that run 0.4 can't read a membership file that names a release: update them by hand first".into(),
+                        ));
+                    }
+                }
+                _ => bail!("unknown setting {setting} (tools-sharing, relays, lookup, release)"),
             },
             Change::Dissolve => {
                 self.machines.clear();
@@ -1118,7 +1154,49 @@ pub(crate) mod tests {
         // Hashes taken before `closed` existed.
         assert_eq!(hash(&v1), "8509d7648538f9fe84c906b59ce2bd0666ecfbf7a70258886e9a4c6b9e0bd0e1");
         assert_eq!(hash(&t), "1be54a85fec03cf19f7e17d189f467a729c1b673752a9a7a3578b15244ef9e37");
-        assert!(!t.contains("closed"));
+        assert!(!t.contains("closed") && !t.contains("release"));
+    }
+
+    #[test]
+    fn a_release_is_three_numbers_and_round_trips() {
+        let d = tempfile::tempdir().unwrap();
+        let (_, a) = keygen(d.path(), "a");
+        let (_, b) = keygen(d.path(), "b");
+        let v1 = Mesh::new("home", vec![a, b], vec!["work".into()], None).unwrap().to_toml().unwrap();
+        let set = |v: &str| Change::Set { setting: "release".into(), value: v.into() };
+        let (m, t, notes) = next_version(&v1, &[set("0.10.2")]).unwrap();
+        assert_eq!(m.settings.release.as_deref(), Some("0.10.2"));
+        assert!(notes[0].contains("machines that run 0.4 can't read"), "{notes:?}");
+        assert!(t.contains("release = \"0.10.2\""), "{t}");
+        assert_eq!(Mesh::parse(&t).unwrap(), m);
+        let (m, t2, notes) = next_version(&t, &[set("none")]).unwrap();
+        assert!(m.settings.release.is_none() && notes.is_empty() && !t2.contains("release"), "{t2}");
+        for bad in ["0.5", "0.5.1.2", "v0.5.1", "0.5.x", "", " 0.5.1", "0.-1.0", "+1.2.3", "0..1", "99999999999999999999.0.0"] {
+            assert!(next_version(&v1, &[set(bad)]).is_err(), "{bad:?}");
+            assert!(Mesh::parse(&t.replace("0.10.2", bad)).is_err(), "{bad:?} in a file");
+        }
+        assert_eq!(release_version("0.10.0"), Some((0, 10, 0)));
+    }
+
+    #[test]
+    fn no_grant_to_itself_but_an_old_one_loads_and_can_be_revoked() {
+        let d = tempfile::tempdir().unwrap();
+        let (_, a) = keygen(d.path(), "a");
+        let (_, b) = keygen(d.path(), "b");
+        let mut m = Mesh::new("home", vec![a, b], vec!["work".into()], None).unwrap();
+        m.add_machine(machine("ws", &["work"]), false).unwrap();
+        let v1 = m.to_toml().unwrap();
+        let grant = |s: &str| Change::Grant(s.parse().unwrap());
+        let e = next_version(&v1, &[grant("ws:ws:tools")]).unwrap_err().to_string();
+        assert!(e.contains("a machine needs no grant to itself"), "{e}");
+        assert!(next_version(&v1, &[grant("*:*:mail")]).is_ok(), "* -> * is no self-grant");
+        assert_eq!("mail".parse::<Category>().unwrap(), Category::Converse);
+        // One signed by 0.4.0.
+        m.grant("ws", "ws", &[Category::Tools]);
+        let old = m.to_toml().unwrap();
+        Mesh::parse(&old).unwrap();
+        let (n, _, _) = next_version(&old, &[Change::Revoke("ws:ws:tools".parse().unwrap())]).unwrap();
+        assert!(n.grants.iter().all(|g| g.from != g.to || g.from == "*"));
     }
 
     #[test]

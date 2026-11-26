@@ -1,8 +1,8 @@
 [package]
 name = "tearmesh"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.89"
 description = "A peer-to-peer mesh that connects apps and agents on your own machines, kept inside boundaries."
 license = "MIT OR Apache-2.0"
 

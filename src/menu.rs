@@ -103,6 +103,8 @@ pub enum Action {
     Mail(crate::tui::Cmd),
     /// Run `tearmesh <args>` with admin rights (sudo or UAC) in the plain terminal.
     Elevated(Vec<String>),
+    /// Run `tearmesh <args>` as this user in the plain terminal.
+    Run(Vec<String>),
 }
 
 /// Background work the runtime does while the menu stays on screen.
@@ -133,12 +135,10 @@ pub enum Msg {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum FormKind {
-    Grant,
-    Revoke,
     /// Offered servers waiting for the owner, as drawn: ticking one approves it at this pin.
     Offers(Vec<Approval>),
-    /// The switches between this machine and another, as drawn: each one's grant, and whether
-    /// it was on. One signature applies whatever changed.
+    /// The switches of a Permissions box, as drawn: each one's grant, and whether it was on. One
+    /// signature applies whatever changed; a switch on for all machines can't be ticked off.
     Permissions(Vec<(Grant, bool)>),
     Relays,
     OwnerAdd,
@@ -562,7 +562,7 @@ impl App {
 
     fn rows(&self) -> usize {
         match self.tab {
-            Tab::Mesh => self.pending().len() + self.machines().len(),
+            Tab::Mesh => self.pending().len() + usize::from(self.data.mesh.is_some()) + self.machines().len(),
             Tab::Settings => self.owners().len(),
             Tab::Mail => 0,
         }
@@ -598,7 +598,8 @@ impl App {
     }
 
     /// The boxes the approval offers: the boundaries the machine may host (the mesh's, then the
-    /// new ones it asked for; label, boundary, pre-ticked), then the grants.
+    /// new ones it asked for; label, boundary, pre-ticked), then the grants: what the machine may
+    /// do on this one, then what this one may do on it, as many of each.
     #[allow(clippy::type_complexity)]
     fn approve_options(&self, p: &PendingInfo) -> (Vec<(String, String, bool)>, Vec<(String, Grant)>) {
         let Some(mesh) = &self.data.mesh else { return (vec![], vec![]) };
@@ -612,16 +613,16 @@ impl App {
                 .filter(|b| !mesh.boundaries.contains(b))
                 .map(|b| (format!("{n} hosts {b} (new: adds it to the mesh)"), b.clone(), false)),
         );
+        // A channel the mesh already allows both ways (a grant for all machines) isn't offered again.
+        let offered = |c| !(mesh.allows(n, &me, c) && mesh.allows(&me, n, c));
         let mut v = vec![];
-        let g = |from: &str, to: &str, c: Category| Grant { from: from.into(), to: to.into(), allow: vec![c] };
-        if !mesh.allows(n, &me, Category::Converse) {
-            v.push((format!("{n} may mail {me}"), g(n, &me, Category::Converse)));
-            v.push((format!("{me} may mail {n}"), g(&me, n, Category::Converse)));
+        for (from, to) in [(n.as_str(), me.as_str()), (me.as_str(), n.as_str())] {
+            for c in [Category::Converse, Category::Tools, Category::Shell] {
+                if offered(c) {
+                    v.push((switch(c, to == me), Grant { from: from.into(), to: to.into(), allow: vec![c] }));
+                }
+            }
         }
-        v.push((format!("{n} may use {me}'s tools"), g(n, &me, Category::Tools)));
-        v.push((format!("{n} may open a shell on {me}"), g(n, &me, Category::Shell)));
-        v.push((format!("{me} may use {n}'s tools"), g(&me, n, Category::Tools)));
-        v.push((format!("{me} may open a shell on {n}"), g(&me, n, Category::Shell)));
         (hosts, v)
     }
 
@@ -649,8 +650,16 @@ impl App {
         }
         let (hosts, grants) = self.approve_options(&p);
         f.extend(hosts.iter().map(|(l, _, on)| if *on { check_on(l) } else { check(l) }));
-        f.extend(grants.iter().map(|(l, _)| check(l)));
-        let mail = self.data.mesh.as_ref().is_some_and(|m| m.allows(&p.name, &self.this_machine(), Category::Converse));
+        let me = self.this_machine();
+        for (i, (l, _)) in grants.iter().enumerate() {
+            if i == 0 {
+                f.push(Field::Note(format!("\nWhat {} may do on {me}", p.name)));
+            } else if i == grants.len() / 2 {
+                f.push(Field::Note(format!("\nWhat {me} may do on {}", p.name)));
+            }
+            f.push(check(l));
+        }
+        let mail = self.data.mesh.as_ref().is_some_and(|m| m.allows(&p.name, &me, Category::Converse) && m.allows(&me, &p.name, Category::Converse));
         if mail {
             f.push(Field::Note("Everyone may already mail everyone.".into()));
         }
@@ -670,7 +679,7 @@ impl App {
     /// its own offer, so the person decides what they expect it to share.
     fn review_offers(&mut self) {
         let mut f = vec![Field::Note(
-            "Tick what you expect each machine to share. Machines it listens to for tools may then call these.".into(),
+            "Tick what you expect each machine to share. Machines that may use its tools may then call these.".into(),
         )];
         for w in &self.data.offers {
             let a = &w.approval;
@@ -682,29 +691,43 @@ impl App {
         self.open(FormKind::Offers(offers), "Offered MCP servers", f);
     }
 
-    /// The six switches between this machine and `other`: each category, spoken and listened.
-    /// One a `*` grant already allows is only a note: this form edits the pair's own grants.
+    /// The Permissions box between this machine and `other`: what each may do on the other, one
+    /// switch per channel. A switch a `*` grant turns on is shown on and locked: unticking it
+    /// couldn't revoke that grant.
     fn permissions(&mut self, other: &str) {
         let Some(mesh) = &self.data.mesh else { return };
         let me = self.this_machine();
-        let mut f = vec![Field::Note(format!(
-            "Speak: what {me} may do to {other}. Listen: what {me} accepts from {other}. Both ends check."
-        ))];
-        let mut switches = vec![];
-        for c in [Category::Converse, Category::Tools, Category::Shell] {
-            for (from, to) in [(me.as_str(), other), (other, me.as_str())] {
-                let label = switch_label(c, from == me, &me, other);
-                let has = |g: &&Grant, f: &str, t: &str| g.from == f && g.to == t && g.allow.contains(&c);
-                if mesh.grants.iter().any(|g| has(&g, "*", to) || has(&g, from, "*") || has(&g, "*", "*")) {
-                    f.push(Field::Note(format!("  [x] {label} · mesh-wide (V revokes it)")));
-                } else {
-                    let on = mesh.grants.iter().any(|g| has(&g, from, to));
-                    f.push(Field::Check { label, on });
-                    switches.push((Grant { from: from.into(), to: to.into(), allow: vec![c] }, on));
-                }
+        let (mut f, mut switches) = (vec![], vec![]);
+        for (from, to) in [(me.as_str(), other), (other, me.as_str())] {
+            f.push(Field::Note(format!("\nWhat {from} may do on {to}")));
+            for c in [Category::Converse, Category::Tools, Category::Shell] {
+                let wild = mesh.grants.iter().any(|g| {
+                    (g.from == "*" || g.to == "*") && (g.from == "*" || g.from == from) && (g.to == "*" || g.to == to) && g.allow.contains(&c)
+                });
+                let on = wild || mesh.grants.iter().any(|g| g.from == from && g.to == to && g.allow.contains(&c));
+                let label = if wild { format!("{:<47}{ALL}", switch(c, to == me)) } else { switch(c, to == me) };
+                f.push(Field::Check { label, on });
+                switches.push((Grant { from: from.into(), to: to.into(), allow: vec![c] }, on));
             }
         }
         self.open(FormKind::Permissions(switches), &format!("Permissions: {me} and {other}"), f);
+    }
+
+    /// The box for the grant `* → *`: mail and tools for every pair, now and later.
+    fn permissions_all(&mut self) {
+        let Some(mesh) = &self.data.mesh else { return };
+        let mut f = vec![Field::Note("What every machine may do on every other, machines that join later included\n".into())];
+        let mut switches = vec![];
+        for (c, what) in [
+            (Category::Converse, "every machine may send letters to every other"),
+            (Category::Tools, "every machine may use the MCP servers every other shares"),
+        ] {
+            let on = mesh.grants.iter().any(|g| g.from == "*" && g.to == "*" && g.allow.contains(&c));
+            f.push(Field::Check { label: format!("{:<7}{what}", cat(c)), on });
+            switches.push((Grant { from: "*".into(), to: "*".into(), allow: vec![c] }, on));
+        }
+        f.push(Field::Note("\nshell is always set for one pair of machines".into()));
+        self.open(FormKind::Permissions(switches), "Permissions: all machines", f);
     }
 
     fn need_owner(&mut self) -> bool {
@@ -781,10 +804,12 @@ impl App {
             }
             Tab::Mesh => {
                 let pend = self.selected_pending().is_some();
+                v.push(("↑↓", "Select"));
+                // Neither does anything on the All machines row.
+                if !self.all_selected() {
+                    v.extend([("Enter", if pend { "Approve" } else { "Details" }), ("X", "Shell")]);
+                }
                 v.extend([
-                    ("↑↓", "Select"),
-                    ("Enter", if pend { "Approve" } else { "Details" }),
-                    ("X", "Shell"),
                     ("P", "Ping now"),
                     ("S", "Status JSON"),
                 ]);
@@ -792,7 +817,11 @@ impl App {
                     v.push(("U", "Add boundaries"));
                 }
                 if role == Role::Owner {
-                    v.extend([("A", "Add node"), ("D", if pend { "Refuse" } else { "Disconnect" }), ("G", "Permissions"), ("V", "Revoke grant")]);
+                    v.push(("A", "Add node"));
+                    if !self.all_selected() {
+                        v.push(("D", if pend { "Refuse" } else { "Disconnect" }));
+                    }
+                    v.push(("G", "Permissions"));
                     if !self.data.offers.is_empty() {
                         v.push(("O", "Offers"));
                     }
@@ -809,7 +838,7 @@ impl App {
                 return v;
             }
             Tab::Settings => {
-                v.extend([("Shift-H", "Start MCP hub"), ("U", "Hub info"), ("E", "Clear events")]);
+                v.extend([("Shift-H", "Start MCP hub"), ("U", "Hub info"), ("E", "Clear events"), ("V", "Check for updates")]);
                 if !self.not_installed() && role != Role::BoundaryUser {
                     v.push(("X", "Uninstall"));
                 }
@@ -918,8 +947,13 @@ impl App {
         None
     }
 
+    /// The All machines row, between the join requests and the machines.
+    fn all_selected(&self) -> bool {
+        self.data.mesh.is_some() && self.sel == self.pending().len()
+    }
+
     fn selected_machine(&self) -> Option<String> {
-        let i = self.sel.checked_sub(self.pending().len())?;
+        let i = self.sel.checked_sub(self.pending().len() + 1)?;
         self.machines().get(i).map(|m| m.name.clone())
     }
 
@@ -1013,18 +1047,17 @@ impl App {
                 )
             }
             (Tab::Mesh, KeyCode::Char('g')) => {
-                if self.need_owner() {
-                    // On another machine's row: the six switches. On this one's: any pair, or `*`.
-                    match self.selected_machine().filter(|o| *o != self.this_machine()) {
-                        Some(o) => self.permissions(&o),
-                        None => self.form(FormKind::Grant),
-                    }
+                if !self.need_owner() {
+                    return None;
                 }
-                None
-            }
-            (Tab::Mesh, KeyCode::Char('v')) => {
-                if self.need_owner() {
-                    self.form(FormKind::Revoke);
+                if self.all_selected() {
+                    self.permissions_all();
+                    return None;
+                }
+                match self.selected_machine() {
+                    Some(o) if o == self.this_machine() => self.note = "a machine needs no grant to itself".into(),
+                    Some(o) => self.permissions(&o),
+                    None => {}
                 }
                 None
             }
@@ -1044,6 +1077,7 @@ impl App {
                 None
             }
             (Tab::Settings, KeyCode::Char('h')) => Some(Action::StartHub),
+            (Tab::Settings, KeyCode::Char('v')) => Some(Action::Run(vec!["update".into(), "--check".into()])),
             (Tab::Settings, KeyCode::Char('x')) if !self.not_installed() && role != Role::BoundaryUser => {
                 self.modal = Some(Modal::Confirm {
                     text: self.uninstall_text(),
@@ -1130,8 +1164,8 @@ impl App {
         }
         let me = self.this_machine();
         if name != me {
-            s += &format!("\n{me} speaks to it     {}\n", allowed(mesh, &me, name));
-            s += &format!("{me} listens to it    {}\n", allowed(mesh, name, &me));
+            s += &format!("\nmay do there  {}  (what {me} may do on {name})\n", allowed(mesh, &me, name));
+            s += &format!("may do here   {}  (what {name} may do on {me})\n", allowed(mesh, name, &me));
         }
         s += "\ngrants in the file\n";
         for g in &mesh.grants {
@@ -1216,25 +1250,7 @@ impl App {
     }
 
     fn form(&mut self, kind: FormKind) {
-        let sel = self.selected_machine().unwrap_or_default();
-        let me = self.this_machine();
         let (title, fields) = match kind {
-            FormKind::Grant => (
-                "Grant",
-                vec![
-                    text("From machine", &me),
-                    text("To machine", &sel),
-                    text("Categories (converse,tools,shell)", "converse"),
-                ],
-            ),
-            FormKind::Revoke => (
-                "Revoke a grant",
-                vec![
-                    text("From machine", &me),
-                    text("To machine", &sel),
-                    text("Categories (converse,tools,shell)", "shell"),
-                ],
-            ),
             FormKind::Relays => ("Relays", vec![text("n0, none, or URL,URL", "n0")]),
             FormKind::OwnerAdd => ("Add an owner key", vec![text("Path to the new key's .pub file", "")]),
             FormKind::Dissolve => {
@@ -1338,7 +1354,7 @@ impl App {
                 _ => None,
             },
             Modal::Keep { .. } => self.keep_key(k),
-            Modal::Form { fields, focus, .. } => {
+            Modal::Form { kind, fields, focus, error, .. } => {
                 let note: Vec<bool> = fields.iter().map(|f| matches!(f, Field::Note(_))).collect();
                 let step = |from: usize, fwd: bool| {
                     let n = note.len();
@@ -1359,6 +1375,9 @@ impl App {
                     }
                     (KeyCode::Tab | KeyCode::Down, _) => *focus = step(*focus, true),
                     (KeyCode::BackTab | KeyCode::Up, _) => *focus = step(*focus, false),
+                    (KeyCode::Char(' '), Field::Check { label, .. }) if matches!(kind, FormKind::Permissions(_)) && label.ends_with(ALL) => {
+                        *error = Some(format!("{ALL}: change it on the All machines row (a grant that names one machine and *: tearmesh mesh revoke)"));
+                    }
                     (KeyCode::Char(' '), Field::Check { on, .. }) => *on = !*on,
                     (KeyCode::Char('u'), Field::Text { value, .. }) if ctrl => value.clear(),
                     (KeyCode::Char('u'), Field::Secret { value, .. }) if ctrl => value.clear(),
@@ -1583,34 +1602,7 @@ impl App {
                 .map(String::from)
                 .collect()
         };
-        let cats = |s: &str| -> Result<Vec<Category>, String> {
-            let c: Result<Vec<Category>, _> = list(s).iter().map(|x| x.parse()).collect();
-            match c {
-                Ok(c) if !c.is_empty() => Ok(c),
-                _ => {
-                    at(2);
-                    Err("categories: converse, tools and/or shell".into())
-                }
-            }
-        };
         match kind {
-            FormKind::Grant | FormKind::Revoke => {
-                let from = if v[0] == "*" { "*".into() } else { name(&v[0], "from", 0)? };
-                let to = if v[1] == "*" { "*".into() } else { name(&v[1], "to", 1)? };
-                let c = cats(&v[2])?;
-                if *kind == FormKind::Grant && c.contains(&Category::Shell) && (from == "*" || to == "*") {
-                    at(if from == "*" { 0 } else { 1 });
-                    return Err("shell grants name both machines (no *)".into());
-                }
-                let shown: Vec<&str> = c.iter().map(|x| cat(*x)).collect();
-                let g = Grant { from: from.clone(), to: to.clone(), allow: c.clone() };
-                let (verb, change) = if *kind == FormKind::Grant {
-                    ("Grant", Change::Grant(g))
-                } else {
-                    ("Revoke", Change::Revoke(g))
-                };
-                Ok(self.sign(verb, format!("{verb} {from} → {to}: {}.", shown.join(", ")), vec![change]))
-            }
             FormKind::Offers(offers) => {
                 let picked: Vec<&Approval> = offers.iter().zip(&ticks).filter(|(_, on)| **on).map(|(a, _)| a).collect();
                 if picked.is_empty() {
@@ -1627,15 +1619,21 @@ impl App {
                     if on == was {
                         continue;
                     }
-                    text += &format!("{} {} → {}: {}\n", if *on { "Allow" } else { "Stop" }, g.from, g.to, cat(g.allow[0]));
+                    let who = |m: &str, any: &'static str| if m == "*" { any.to_string() } else { m.to_string() };
+                    text += &format!(
+                        "{} {}: what {} may do on {}\n",
+                        if *on { "Allow" } else { "Stop" },
+                        cat(g.allow[0]),
+                        who(&g.from, "every machine"),
+                        who(&g.to, "every other")
+                    );
                     if *on && g.allow[0] == Category::Shell && g.to == me {
                         text += &format!("  Careful: {} will be able to drive this machine, which holds an owner key.\n", g.from);
                     }
                     changes.push(if *on { Change::Grant(g.clone()) } else { Change::Revoke(g.clone()) });
                 }
                 if changes.is_empty() {
-                    at(0);
-                    return Err("nothing changed: Space ticks a switch".into());
+                    return Ok(None);
                 }
                 Ok(self.sign("Permissions", text.trim_end().into(), changes))
             }
@@ -1981,10 +1979,10 @@ impl App {
                 .and_then(|s| s.peers.iter().find(|p| p.name == n))
                 .and_then(|p| p.last_sync_ms)
         };
-        // What this machine may do to `n` (speaks), and what it accepts from `n` (listens).
-        let grants = |n: &str, speak: bool| -> String {
+        // What this machine may do on `n` (there), and what `n` may do on this one (here).
+        let grants = |n: &str, there: bool| -> String {
             let Some(m) = &self.data.mesh else { return String::new() };
-            if speak { allowed(m, &me, n) } else { allowed(m, n, &me) }
+            if there { allowed(m, &me, n) } else { allowed(m, n, &me) }
         };
         let mut rows: Vec<Row> = self
             .pending()
@@ -1992,6 +1990,7 @@ impl App {
             .map(|p| {
                 Row::new(vec![
                     Cell::from(p.name.clone()),
+                    Cell::from(""),
                     Cell::from(format!("join · {}", spaced(&p.code))).fg(Color::Yellow).bold(),
                     Cell::from(p.boundaries.join(",")),
                     Cell::from(short(&p.node_id.to_string())),
@@ -2000,6 +1999,15 @@ impl App {
                 ])
             })
             .collect();
+        if let Some(mesh) = &self.data.mesh {
+            let all = [Category::Converse, Category::Tools, Category::Shell]
+                .into_iter()
+                .filter(|c| mesh.grants.iter().any(|g| g.from == "*" && g.to == "*" && g.allow.contains(c)))
+                .map(cat)
+                .collect::<Vec<_>>()
+                .join(" ");
+            rows.push(Row::new(vec![Cell::from("All machines").bold(), "".into(), "".into(), "".into(), all.clone().into(), all.into(), "".into()]));
+        }
         rows.extend(self.machines().iter().map(|m| {
             let (ping, c) = if m.name == me {
                 ("this machine".to_string(), TEAR)
@@ -2016,8 +2024,14 @@ impl App {
                 None => "never".into(),
             };
             let name = if self.leaving().contains(&m.name) { format!("{} (says it left)", m.name) } else { m.name.clone() };
+            let version = if m.name == me {
+                env!("CARGO_PKG_VERSION").to_string()
+            } else {
+                self.data.pings.iter().find(|p| p.name == m.name).and_then(|p| p.version.clone()).unwrap_or("?".into())
+            };
             Row::new(vec![
                 Cell::from(name),
+                Cell::from(version),
                 Cell::from(ping).fg(c),
                 Cell::from(m.boundaries.join(",")),
                 Cell::from(grants(&m.name, true)),
@@ -2034,14 +2048,18 @@ impl App {
             rows,
             [
                 Constraint::Min(12),
-                Constraint::Length(15),
+                Constraint::Length(7),
+                Constraint::Length(14),
+                Constraint::Length(12),
                 Constraint::Length(16),
-                Constraint::Length(21),
-                Constraint::Length(21),
-                Constraint::Length(8),
+                Constraint::Length(16),
+                Constraint::Length(9),
             ],
         )
-        .header(Row::new(vec!["machine", "ping", "boundaries", "speaks to it", "listens to it", "synced"]).style(Style::new().fg(DIM)))
+        .header(
+            Row::new(vec!["machine", "version", "ping", "boundaries", "may do there", "may do here", "last sync"])
+                .style(Style::new().fg(DIM)),
+        )
         .block(self.panel("Nodes"));
         f.render_widget(t, area);
     }
@@ -2091,6 +2109,7 @@ impl App {
                 },
             ));
             l.push(kv("lookup", m.settings.lookup.join(", ")));
+            l.push(kv("release", m.settings.release.clone().unwrap_or("none".into())));
             l.push(kv("boundaries", m.boundaries.join(", ")));
         } else if self.role() == Role::BoundaryUser {
             l.push(Line::raw("  (managed by an admin of this machine)"));
@@ -2105,6 +2124,7 @@ impl App {
         l.push(kv("URL", self.data.hub_url.clone()));
         l.push(kv("stdio command", "tearmesh mcp connect".into()));
         l.push(Line::styled(" This machine", Style::new().fg(ACCENT).bold()));
+        l.push(kv("version", format!("tear-mesh {} (V checks for an update)", env!("CARGO_PKG_VERSION"))));
         l.push(kv(
             "owner key",
             self.data.owner_key.as_ref().map_or("none here".into(), |k| k.display().to_string()),
@@ -2160,28 +2180,32 @@ impl Default for App {
     }
 }
 
-/// The categories `from` may use on `to`, e.g. "converse tools".
+/// The channels `from` may use on `to`, e.g. "mail tools".
 fn allowed(mesh: &Mesh, from: &str, to: &str) -> String {
     let c = [Category::Converse, Category::Tools, Category::Shell];
     c.into_iter().filter(|c| from != to && mesh.allows(from, to, *c)).map(cat).collect::<Vec<_>>().join(" ")
 }
 
-/// One switch, in the direction's word and in plain words, so "shell listen" can't read as harmless.
-fn switch_label(c: Category, speak: bool, me: &str, o: &str) -> String {
-    let what = match (c, speak) {
-        (Category::Converse, true) => format!("{me} posts notes to {o}"),
-        (Category::Converse, false) => format!("{me} accepts notes from {o}"),
-        (Category::Tools, true) => format!("{me} calls the tools {o} offers"),
-        (Category::Tools, false) => format!("{me} accepts tool calls from {o}"),
-        (Category::Shell, true) => format!("{me} can drive {o}"),
-        (Category::Shell, false) => format!("{me} can be driven by {o}"),
+/// What a switch locked by a `*` grant says.
+const ALL: &str = "on for all machines";
+
+/// One switch of a Permissions box, under "What X may do on Y"; `here`: Y is this machine.
+fn switch(c: Category, here: bool) -> String {
+    let what = match (c, here) {
+        (Category::Converse, false) => "send letters to its agents",
+        (Category::Converse, true) => "send letters to this machine's agents",
+        (Category::Tools, false) => "use the MCP servers it shares",
+        (Category::Tools, true) => "use the MCP servers shared here",
+        (Category::Shell, false) => "log in over SSH and run anything",
+        (Category::Shell, true) => "log in here over SSH and run anything",
     };
-    format!("{:<8} {:<6} {what}", cat(c), if speak { "speak" } else { "listen" })
+    format!("{:<8}{what}", cat(c))
 }
 
+/// A channel's name in the menu; the file's `converse` is shown as mail.
 fn cat(c: Category) -> &'static str {
     match c {
-        Category::Converse => "converse",
+        Category::Converse => "mail",
         Category::Tools => "tools",
         Category::Shell => "shell",
     }
@@ -2240,12 +2264,12 @@ fn draw_help(f: &mut Frame, keys: &[(&str, &str)]) {
         Line::raw(""),
         Line::styled(" Words", Style::new().bold()),
         h("mesh", "your machines, in a membership file the owner signs"),
-        h("owner node", "holds an owner key: it invites, approves and revokes"),
+        h("owner node", "holds an owner key: it invites, approves and grants"),
         h("boundary", "an OS user per boundary; data never leaves its boundary"),
-        h("speak / listen", "what a machine may do to another / what it accepts from it"),
-        h("converse", "speak: post notes to it · listen: accept its notes"),
-        h("tools", "speak: call the MCP servers it offers · listen: accept its calls"),
-        h("shell", "speak: drive it through its sshd · listen: be driven by it"),
+        h("may do there", "what this machine may do on that one; may do here: the other way"),
+        h("mail", "send letters to the other machine's agents"),
+        h("tools", "use the MCP servers the other machine shares"),
+        h("shell", "log in on the other machine over SSH and run anything"),
         h("MCP hub", "one MCP service per user for any agent harness"),
         Line::raw(""),
         Line::styled(" If a key leaks", Style::new().bold()),
@@ -2254,7 +2278,8 @@ fn draw_help(f: &mut Frame, keys: &[(&str, &str)]) {
         Line::raw(""),
         Line::styled(" On an owner node", Style::new().bold()),
         Line::raw("  Mesh → A shows a one-line install for a new machine; its join request opens by itself."),
-        Line::raw("  Mesh → G on a machine's row: what it and this machine may do to each other."),
+        Line::raw("  Mesh → G on a machine's row: what it and this machine may do on each other; untick to revoke."),
+        Line::raw("  Mesh → G on All machines: what every machine may do on every other."),
         Line::raw("  Mesh → O: MCP servers other machines offer, waiting for your approval."),
         Line::raw("  A machine that left (or was uninstalled) asks to be removed. Settings → Shift-K dissolves the mesh."),
     ];
@@ -2830,9 +2855,19 @@ async fn run_action(
                     .status()?;
                 Ok(format!("ssh ended ({st})"))
             });
-            app.say(format!("shell to {machine}: {}", r.map_or_else(|e| format!("{e:#}"), |s| s)));
+            app.say(format!("shell to {machine}: {}", r.unwrap_or_else(|e| format!("{e:#}"))));
         }
         Action::Mail(cmd) => mail_exec(app, mail, cmd).await,
+        Action::Run(args) => {
+            let r = suspended(terminal, || {
+                let st = std::process::Command::new(&exe).args(&args).status()?;
+                anyhow::ensure!(st.success(), "`tearmesh {}` stopped ({st})", args.join(" "));
+                Ok(String::new())
+            });
+            if let Err(e) = r {
+                app.say(format!("tearmesh {}: {e:#}", args.join(" ")));
+            }
+        }
         Action::Elevated(args) => {
             let r = suspended(terminal, || {
                 eprintln!("Running tearmesh {} with admin rights…\n", args.join(" "));
@@ -3077,8 +3112,8 @@ mod tests {
             status: Some(status),
             mesh: Some(mesh),
             pings: vec![
-                Ping { name: "beta".into(), node_id: id2.to_string(), rtt_ms: Some(12), dial_ms: Some(40), error: None },
-                Ping { name: "gamma".into(), node_id: id2.to_string(), rtt_ms: None, dial_ms: None, error: Some("no answer".into()) },
+                Ping { name: "beta".into(), node_id: id2.to_string(), rtt_ms: Some(12), dial_ms: Some(40), version: None, error: None },
+                Ping { name: "gamma".into(), node_id: id2.to_string(), rtt_ms: None, dial_ms: None, version: None, error: Some("no answer".into()) },
             ],
             pinged_at: Some(Instant::now()),
             owner_key: owner.then(|| PathBuf::from("/home/u/.ssh/tearmesh-owner-home")),
@@ -3113,9 +3148,10 @@ mod tests {
         a.on_key(key(KeyCode::Down));
         a.on_key(key(KeyCode::Char('2')));
         a.on_key(key(KeyCode::Down));
-        assert_eq!(a.sel, 2, "stops at the last row");
+        a.on_key(key(KeyCode::Down));
+        assert_eq!(a.sel, 3, "stops at the last row");
         a.on_key(key(KeyCode::Up));
-        assert_eq!(a.sel, 1);
+        assert_eq!(a.sel, 2);
         a.on_key(key(KeyCode::Left));
         assert_eq!(a.tab, Tab::Settings);
         a.on_key(key(KeyCode::Esc));
@@ -3158,7 +3194,12 @@ mod tests {
         assert!(keys.contains(&"Leave mesh") && keys.contains(&"Status JSON") && !keys.contains(&"Disconnect"));
         a.set_data(data(true));
         let keys: Vec<&str> = a.shortcuts().iter().map(|k| k.1).collect();
-        assert!(keys.contains(&"Add node") && keys.contains(&"Disconnect") && keys.contains(&"Permissions"));
+        assert!(keys.contains(&"Add node") && keys.contains(&"Permissions"));
+        assert!(!keys.contains(&"Disconnect") && !keys.contains(&"Details"), "nothing to open or disconnect on the All machines row");
+        a.sel = 1;
+        let keys: Vec<&str> = a.shortcuts().iter().map(|k| k.1).collect();
+        assert!(keys.contains(&"Disconnect") && keys.contains(&"Details") && keys.contains(&"Permissions"));
+        a.sel = 0;
         assert!(screen(&a).contains("Add node"));
         a.tab = Tab::Settings;
         let keys: Vec<&str> = a.shortcuts().iter().map(|k| k.1).collect();
@@ -3171,7 +3212,7 @@ mod tests {
     fn members_cant_sign() {
         let mut a = App::new();
         a.set_data(data(false));
-        a.sel = 1;
+        a.sel = 2;
         assert_eq!(a.on_key(key(KeyCode::Char('d'))), None);
         assert!(a.modal.is_none() && a.note.contains("only an owner node"));
         a.tab = Tab::Settings;
@@ -3333,10 +3374,10 @@ mod tests {
         let mut d = data(true);
         d.owner_key = Some(owner_key("hunter22"));
         a.set_data(d);
-        a.sel = 0;
+        a.sel = 1;
         assert_eq!(a.on_key(key(KeyCode::Char('d'))), None);
         assert!(a.note.contains("can't remove itself"));
-        a.sel = 1;
+        a.sel = 2;
         a.on_key(key(KeyCode::Char('d')));
         assert!(matches!(&a.modal, Some(Modal::Form { kind: FormKind::Sign(_), .. })));
         typed(&mut a, "hunter22");
@@ -3365,7 +3406,7 @@ mod tests {
     fn an_unreadable_owner_key_says_why() {
         let mut a = App::new();
         a.set_data(data(true));
-        a.sel = 1;
+        a.sel = 2;
         a.on_key(key(KeyCode::Char('d')));
         match &a.modal {
             Some(Modal::Info { title, text, .. }) => {
@@ -3382,7 +3423,7 @@ mod tests {
         let mut d = data(true);
         d.owner_key = Some(keys::tests::sk_file(&tempfile::tempdir().unwrap().keep(), 0x05));
         a.set_data(d);
-        a.sel = 1;
+        a.sel = 2;
         a.on_key(key(KeyCode::Char('d')));
         assert!(screen(&a).contains("PIN for the security key"), "{}", screen(&a));
         typed(&mut a, "123456");
@@ -3394,34 +3435,45 @@ mod tests {
     }
 
     #[test]
-    fn permissions_are_six_switches_and_one_signature() {
+    fn the_permissions_box_says_who_may_do_what_where() {
         let mut a = App::new();
         let mut d = data(true);
         d.owner_key = Some(owner_key("hunter22"));
         a.set_data(d);
-        // On this machine's own row G is still the any-pair form.
-        a.sel = 0;
-        a.on_key(key(KeyCode::Char('g')));
-        assert!(matches!(&a.modal, Some(Modal::Form { kind: FormKind::Grant, .. })));
-        a.on_key(key(KeyCode::Esc));
-        a.sel = 1;
+        a.sel = 2; // the All machines row, laptop (this machine), then beta
         a.on_key(key(KeyCode::Char('g')));
         let s = screen(&a);
+        let rows: Vec<&str> = s.lines().collect();
+        let row = |t: &str| rows.iter().position(|l| l.contains(t)).unwrap_or_else(|| panic!("no {t:?} in\n{s}"));
         assert!(s.contains("Permissions: laptop and beta"), "{s}");
-        assert!(s.contains("[x] shell    speak  laptop can drive beta"), "the grant in the file is ticked\n{s}");
-        assert!(s.contains("[ ] shell    listen laptop can be driven by beta"), "{s}");
-        assert!(s.contains("[ ] converse listen laptop accepts notes from beta"), "{s}");
-        // Nothing ticked or unticked: nothing to sign.
-        a.on_key(key(KeyCode::Enter));
-        assert!(screen(&a).contains("nothing changed"), "{}", screen(&a));
-        let Some(Modal::Form { fields, .. }) = &mut a.modal else { panic!() };
-        // Drawn order: converse, tools, shell; speak then listen. Turn tools speak on, shell
-        // speak off and shell listen on.
-        for (i, f) in fields.iter_mut().filter(|f| matches!(f, Field::Check { .. })).enumerate() {
-            if let Field::Check { on, .. } = f {
-                *on = matches!(i, 2 | 5);
-            }
+        let (there, here) = (row("What laptop may do on beta"), row("What beta may do on laptop"));
+        let want = [
+            (there + 1, "[ ] mail    send letters to its agents"),
+            (there + 2, "[ ] tools   use the MCP servers it shares"),
+            (there + 3, "[x] shell   log in over SSH and run anything"),
+            (here + 1, "[ ] mail    send letters to this machine's agents"),
+            (here + 2, "[ ] tools   use the MCP servers shared here"),
+            (here + 3, "[ ] shell   log in here over SSH and run anything"),
+        ];
+        let at = |i: usize, t: &str| rows[i].find(t).map(|b| rows[i][..b].chars().count());
+        let col = at(there + 1, "[ ]");
+        for (i, t) in want {
+            assert_eq!(at(i, t), col, "{t:?} aligned in\n{s}");
         }
+        // Nothing changed: Enter just closes.
+        assert_eq!(a.on_key(key(KeyCode::Enter)), None);
+        assert!(a.modal.is_none());
+        // Drawn order: laptop on beta (mail, tools, shell), then beta on laptop. Tick laptop's
+        // tools on beta, untick its shell there, tick beta's shell here.
+        a.on_key(key(KeyCode::Char('g')));
+        a.on_key(key(KeyCode::Tab));
+        a.on_key(key(KeyCode::Char(' ')));
+        a.on_key(key(KeyCode::Tab));
+        a.on_key(key(KeyCode::Char(' ')));
+        for _ in 0..3 {
+            a.on_key(key(KeyCode::Tab));
+        }
+        a.on_key(key(KeyCode::Char(' ')));
         a.on_key(key(KeyCode::Enter));
         let g = |f: &str, t: &str, c| Grant { from: f.into(), to: t.into(), allow: vec![c] };
         match &a.modal {
@@ -3436,18 +3488,92 @@ mod tests {
             other => panic!("{other:?}"),
         }
         let s = screen(&a);
-        assert!(s.contains("Stop laptop → beta: shell") && s.contains("Careful: beta will be able to drive this machine"), "{s}");
-        // A switch a `*` grant already allows is shown, not offered: unticking it couldn't revoke it.
+        assert!(s.contains("Stop shell: what laptop may do on beta") && s.contains("Allow shell: what beta may do on laptop"), "{s}");
+        assert!(s.contains("Careful: beta will be able to drive this machine"), "{s}");
+    }
+
+    #[test]
+    fn a_switch_a_wildcard_turns_on_is_locked_and_changes_nothing() {
+        let mut a = App::new();
+        let mut d = data(true);
+        d.owner_key = Some(owner_key("hunter22"));
+        d.mesh.as_mut().unwrap().grant("*", "*", &[Category::Converse]);
+        d.mesh.as_mut().unwrap().grant("beta", "*", &[Category::Tools]);
+        a.set_data(d);
+        a.sel = 2;
+        a.on_key(key(KeyCode::Char('g')));
+        let s = screen(&a);
+        assert!(s.contains("[x] mail    send letters to its agents             on for all machines"), "{s}");
+        assert!(s.contains("[x] mail    send letters to this machine's agents  on for all machines"), "{s}");
+        assert!(s.contains("[x] tools   use the MCP servers shared here        on for all machines"), "beta → * {s}");
+        assert!(s.lines().any(|l| l.contains("[ ] tools   use the MCP servers it shares") && !l.contains(ALL)), "laptop's tools on beta stay free\n{s}");
+        // Space on the locked mail switch says where to change it and leaves it on.
+        a.on_key(key(KeyCode::Char(' ')));
+        let s = screen(&a);
+        assert!(s.contains("change it on the All machines row"), "{s}");
+        assert!(matches!(&a.modal, Some(Modal::Form { fields, .. }) if fields.iter().any(|f| matches!(f, Field::Check { on: true, label } if label.contains("its agents")))));
+        assert_eq!(a.on_key(key(KeyCode::Enter)), None);
+        assert!(a.modal.is_none(), "nothing changed");
+    }
+
+    #[test]
+    fn g_on_this_machine_signs_nothing_and_all_machines_signs_star_to_star() {
+        let mut a = App::new();
+        let mut d = data(true);
+        d.owner_key = Some(owner_key("hunter22"));
+        a.set_data(d);
+        a.sel = 1;
+        assert_eq!(a.on_key(key(KeyCode::Char('g'))), None);
+        assert!(a.modal.is_none() && a.note == "a machine needs no grant to itself", "{}", a.note);
+        a.sel = 0;
+        a.on_key(key(KeyCode::Char('g')));
+        let s = screen(&a);
+        assert!(s.contains("Permissions: all machines") && s.contains("join later"), "{s}");
+        assert!(s.contains("[ ] mail   every machine may send letters to every other"), "{s}");
+        assert!(s.contains("[ ] tools  every machine may use the MCP servers every other shares"), "{s}");
+        assert!(s.contains("shell is always set for one pair of machines"), "{s}");
+        a.on_key(key(KeyCode::Char(' ')));
+        a.on_key(key(KeyCode::Enter));
+        let all = Grant { from: "*".into(), to: "*".into(), allow: vec![Category::Converse] };
+        assert!(matches!(&a.modal, Some(Modal::Form { kind: FormKind::Sign(c), .. }) if *c == [Change::Grant(all.clone())]), "{:?}", a.modal);
+        assert!(screen(&a).contains("Allow mail: what every machine may do on every other"));
+        // With mail for all on, unticking it revokes `* → *`.
         a.modal = None;
         a.data.mesh.as_mut().unwrap().grant("*", "*", &[Category::Converse]);
         a.on_key(key(KeyCode::Char('g')));
+        a.on_key(key(KeyCode::Char(' ')));
+        a.on_key(key(KeyCode::Enter));
+        assert!(matches!(&a.modal, Some(Modal::Form { kind: FormKind::Sign(c), .. }) if *c == [Change::Revoke(all)]), "{:?}", a.modal);
+    }
+
+    #[test]
+    fn the_table_shows_versions_and_what_each_may_do_where() {
+        let mut a = App::new();
+        let mut d = data(false);
+        d.mesh.as_mut().unwrap().grant("*", "*", &[Category::Converse]);
+        d.pings[0].version = Some("0.4.0".into());
+        a.set_data(d);
         let s = screen(&a);
-        assert!(s.contains("[x] converse speak  laptop posts notes to beta · mesh-wide"), "{s}");
-        assert!(matches!(&a.modal, Some(Modal::Form { kind: FormKind::Permissions(sw), .. }) if sw.len() == 4));
-        // The table says both directions.
-        a.modal = None;
+        let line = |t: &str| s.lines().find(|l| l.contains(t)).unwrap_or_else(|| panic!("no {t:?} in\n{s}")).to_string();
+        let head = line("may do there");
+        assert!(head.contains("machine") && head.contains("version") && head.contains("may do here") && head.contains("last sync"), "{s}");
+        assert!(line("All machines").contains("mail"), "{s}");
+        let beta = line("beta    ");
+        assert!(beta.contains("0.4.0") && beta.contains("mail shell") && !beta.contains("converse"), "{s}");
+        assert!(line("this machine").contains(env!("CARGO_PKG_VERSION")), "{s}");
+        assert!(line("○ no answer").contains("?"), "{s}");
+    }
+
+    #[test]
+    fn settings_show_the_version_and_release_and_v_runs_update_check() {
+        let mut a = App::new();
+        a.set_data(data(false));
+        a.tab = Tab::Settings;
         let s = screen(&a);
-        assert!(s.contains("speaks to it") && s.contains("listens to it"), "{s}");
+        assert!(s.contains("release") && s.contains("none") && s.contains(&format!("tear-mesh {}", env!("CARGO_PKG_VERSION"))), "{s}");
+        a.data.mesh.as_mut().unwrap().settings.release = Some("0.5.1".into());
+        assert!(screen(&a).contains("0.5.1"));
+        assert_eq!(a.on_key(key(KeyCode::Char('v'))), Some(Action::Run(vec!["update".into(), "--check".into()])));
     }
 
     #[test]
@@ -3507,9 +3633,6 @@ mod tests {
         let mut a = App::new();
         a.set_data(data(true));
         let t = |s: &[&str]| s.iter().map(|x| text("", x)).collect::<Vec<_>>();
-        assert!(a.submit(&FormKind::Grant, &t(&["*", "beta", "shell"])).is_err());
-        assert!(a.submit(&FormKind::Grant, &t(&["laptop", "beta", "telepathy"])).is_err());
-        assert!(a.submit(&FormKind::Grant, &t(&["laptop", "beta", "tools,shell"])).is_ok());
         assert!(a.submit(&FormKind::Relays, &t(&["ftp://x"])).is_err());
         assert!(a.submit(&FormKind::OwnerAdd, &t(&["/nonexistent.pub"])).is_err());
         assert!(a.submit(&FormKind::Join, &t(&["tm2-abc"])).is_err());
@@ -3573,13 +3696,17 @@ mod tests {
         a.on_key(key(KeyCode::Char('n')));
         a.on_key(key(KeyCode::Enter));
         // The boundary ticks come first: "delta hosts work" (asked for, so ticked) and "delta hosts
-        // lab (new…)". Tick lab, then the second grant (this mesh has no mail-for-all grant).
+        // lab (new…)". Tick lab, then mail in "What laptop may do on delta" (the fourth grant: this
+        // mesh has no mail-for-all grant, so each group has mail, tools, shell).
         let s = screen(&a);
         assert!(s.contains("[x] delta hosts work") && s.contains("[ ] delta hosts lab (new: adds it to the mesh)"), "{s}");
+        assert!(s.contains("What delta may do on laptop") && s.contains("What laptop may do on delta"), "{s}");
+        assert!(s.contains("[ ] shell   log in here over SSH and run anything") && s.contains("[ ] tools   use the MCP servers it shares"), "{s}");
         a.on_key(key(KeyCode::Tab));
         a.on_key(key(KeyCode::Char(' ')));
-        a.on_key(key(KeyCode::Tab));
-        a.on_key(key(KeyCode::Tab));
+        for _ in 0..4 {
+            a.on_key(key(KeyCode::Tab));
+        }
         a.on_key(key(KeyCode::Char(' ')));
         while !matches!(&a.modal, Some(Modal::Form { fields, focus, .. }) if matches!(fields[*focus], Field::Secret { .. })) {
             a.on_key(key(KeyCode::Tab));
@@ -3590,7 +3717,7 @@ mod tests {
                 let shown: Vec<String> = changes.iter().map(|c| c.to_string()).collect();
                 assert_eq!(
                     shown,
-                    ["add boundary lab", "add machine delta hosting work, lab", "grant laptop -> delta: converse"],
+                    ["add boundary lab", "add machine delta hosting work, lab", "grant laptop -> delta: mail"],
                     "{shown:?}"
                 );
             }
@@ -3607,9 +3734,9 @@ mod tests {
         a.set_data(d.clone());
         a.on_key(key(KeyCode::Esc));
         a.on_key(key(KeyCode::Enter));
-        // "delta hosts work" (ticked), then the first grant: "delta may mail laptop".
+        // "delta hosts work" (ticked), then the first grant: delta's mail on laptop.
         a.on_key(key(KeyCode::Tab));
-        assert!(screen(&a).contains("[ ] delta may mail laptop"));
+        assert!(screen(&a).contains("▸ [ ] mail    send letters to this machine's agents"), "{}", screen(&a));
         a.on_key(key(KeyCode::Char(' ')));
         // A refresh adds mail for everyone, so a list made now would have no mail lines.
         d.mesh.as_mut().unwrap().grants.push(Grant { from: "*".into(), to: "*".into(), allow: vec![Category::Converse] });
@@ -3621,7 +3748,7 @@ mod tests {
         match a.on_key(key(KeyCode::Enter)) {
             Some(Action::Job(Task::Sign { changes, .. })) => {
                 let shown: Vec<String> = changes.iter().map(|c| c.to_string()).collect();
-                assert_eq!(shown, ["add machine delta hosting work", "grant delta -> laptop: converse"], "{shown:?}");
+                assert_eq!(shown, ["add machine delta hosting work", "grant delta -> laptop: mail"], "{shown:?}");
             }
             other => panic!("{other:?}"),
         }
@@ -4105,7 +4232,7 @@ mod tests {
         a.set_data(data(false));
         assert_eq!(a.shared_boundary("beta").as_deref(), Some("work"));
         assert_eq!(a.shared_boundary("nobody"), None);
-        a.sel = 1;
+        a.sel = 2;
         assert_eq!(a.selected_machine().as_deref(), Some("beta"));
         a.on_key(key(KeyCode::Char('x')));
         // (the Action carries it; run_action decides by Hello whether the daemon maps this user)
@@ -4116,15 +4243,13 @@ mod tests {
     fn a_form_error_puts_the_cursor_on_its_field() {
         let mut a = App::new();
         a.set_data(data(true));
-        a.form(FormKind::Grant);
-        a.on_key(key(KeyCode::Tab));
+        a.install_form();
         a.on_key(key(KeyCode::Tab));
         a.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
-        typed(&mut a, "telepathy");
-        a.on_key(key(KeyCode::Up));
+        typed(&mut a, "work,$(x)");
         a.on_key(key(KeyCode::Up));
         a.on_key(key(KeyCode::Enter));
         assert!(matches!(&a.modal, Some(Modal::Form { error: Some(e), focus, fields, .. })
-            if e.contains("categories") && matches!(&fields[*focus], Field::Text { label, .. } if label.starts_with("Categories"))), "{:?}", a.modal);
+            if e.contains("boundary") && matches!(&fields[*focus], Field::Text { label, .. } if label.starts_with("Boundaries"))), "{:?}", a.modal);
     }
 }

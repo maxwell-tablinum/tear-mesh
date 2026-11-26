@@ -1,6 +1,6 @@
 # tear-mesh specification
 
-This is the one specification of tear-mesh: what it is, how every part behaves, and what is still undecided. It describes version 0.4.0 (tag `v0.4.0`, 2026-11-25), the first version released with binaries. 0.4.0 adds the conversation tools, status records, claims, the gateway for Claude's apps and the Claude Desktop extension. All of it is built; what has not been tried yet (a real Claude client, voice, a real Windows machine, Claude Desktop) is listed in section 26.
+This is the one specification of tear-mesh: what it is, how every part behaves, and what is still undecided. It describes version 0.5.0 (tag `v0.5.0`, 2026-11-26). 0.4.0 (tag `v0.4.0`, 2026-11-25) was the first release with binaries. 0.5.0 names three channels (mail, tools, shell) and leaves what each causes to configuration, adds mailbox rules, the Permissions box, versions in a ping and `tearmesh update` with a release the owner names for the whole mesh. All of it is built; what has not been tried yet (Windows, Claude on the web, a real Windows machine) is listed in section 26.
 
 Older documents are history and are no longer updated: `docs/spec-0.2.md` (the 0.2 specification), `docs/design.md` (the 0.1 design and its questions) and the notes under `docs/research/`. Where they disagree with this file, this file is right. `README.md` is the short introduction and `docs/testing.md` is the hands-on test guide; both follow this file.
 
@@ -90,6 +90,8 @@ The binary is `tearmesh`. One Rust crate, about 19,000 lines. It runs on Linux (
 | `/run/tearmesh/tearmesh.sock` | tearmesh, 0666 | the local socket |
 | `/usr/local/share/tearmesh/` | root | the Claude Code plugin |
 | `/etc/systemd/system/tearmesh.service`, `tearmesh-steward@.service` | root | systemd units |
+| `/etc/systemd/system/tearmesh-update.service`, `tearmesh-update.timer` | root | the updater and its timer (section 22.3) |
+| `/usr/local/bin/.tearmesh-update/`, `/run/tearmesh-update.lock` | root, 0700 and 0600 | only while an update runs: the folder the download is checked in and run from, and the lock that keeps two updates apart (section 22.3) |
 | `/etc/tearmesh/gateway.toml` | root, 0644 | the gateway's config (no secrets). Its presence makes this machine a gateway. |
 | `/var/lib/tearmesh-gateway/` | the gateway's boundary user, 0700 | `gateway.db` (clients, sign-ins, token hashes, the passphrase hash), `audit.log` |
 | `/etc/systemd/system/tearmesh-gateway.service` | root | the gateway's unit, written by `gateway setup` |
@@ -114,7 +116,7 @@ The state directory holds:
 
 ### 3.3 Files on Windows
 
-Program: `%ProgramFiles%\tearmesh\tearmesh.exe` plus the plugin files. Data: `%ProgramData%\tearmesh\` with `config.toml`, `passwords.txt` (the generated passwords of the boundary users; SYSTEM and Administrators only) and `state\` (as above, plus `daemon.log`). The local socket is the named pipe `\\.\pipe\tearmesh`. Service `tearmesh` runs as `NT SERVICE\tearmesh`. Firewall rule `tearmesh-udp` (inbound UDP for the program, Private and Domain profiles). Stewards are scheduled tasks `tearmesh-steward-<boundary>`.
+Program: `%ProgramFiles%\tearmesh\tearmesh.exe` plus the plugin files. Data: `%ProgramData%\tearmesh\` with `config.toml`, `passwords.txt` (the generated passwords of the boundary users; SYSTEM and Administrators only) and `state\` (as above, plus `daemon.log`). The local socket is the named pipe `\\.\pipe\tearmesh`. Service `tearmesh` runs as `NT SERVICE\tearmesh`. Firewall rule `tearmesh-udp` (inbound UDP for the program, Private and Domain profiles). Stewards are scheduled tasks `tearmesh-steward-<boundary>`. The updater is the scheduled task `tearmesh-update` (section 22.3); while it works it uses the folder `%ProgramFiles%\tearmesh\.update` and the lock file `%ProgramData%\tearmesh\update.lock`.
 
 **LIMIT** (`limit/windows-log-rotation`): `daemon.log` is never rotated. It matters on a node that runs for months.
 
@@ -175,6 +177,7 @@ boundaries = ["vault", "work"]
 relays = "n0"           # "n0", "none" or a list of relay URLs
 lookup = ["n0-dns", "mdns"]
 tools_sharing = "approval"   # or "free"
+# release = "0.5.1"         # the version every machine should run (section 22.3); absent when none is named
 
 [[machine]]
 name = "alpha"
@@ -224,7 +227,7 @@ An owner changes the mesh by signing a new version. Any number of changes go und
 |---|---|
 | add machine | Adds a machine with its node id and boundaries. An existing name is refused unless it is a replacement, which gives the name a new node id, keeps its grants and drops its approvals. |
 | remove machine | Removes the machine and every grant and approval that names it. |
-| grant | Adds categories to the grant `from → to`, creating it if needed. |
+| grant | Adds categories to the grant `from → to`, creating it if needed. A grant from a machine to itself is refused (`a machine needs no grant to itself`). Only the change is refused: a file that already holds such a grant (0.4.0 signed them) still loads, and the grant can be revoked. |
 | revoke | Removes categories from the exact grant `from → to` (`no grant A -> B` if there is none). If a `*` grant still allows a category for the pair, a note says so. |
 | approve | Approves an offer at a pin, for all its tools or a named subset, replacing an earlier approval of the same server. |
 | unapprove | Removes an approval (`no such approval`). |
@@ -232,6 +235,7 @@ An owner changes the mesh by signing a new version. Any number of changes go und
 | set hosts | Replaces the list of boundaries a machine hosts. Approvals in boundaries it no longer hosts are dropped, with a note. |
 | add owner key, remove owner key | By public key line and by SHA256 fingerprint. Two distinct keys must remain. |
 | set | `tools-sharing` = `approval` or `free`; `relays` = `n0`, `none` or a comma list of http(s) URLs (anything else is refused when the version is made: `relays is n0, none or http(s) URLs separated by commas; "<part>" isn't one`); `lookup` = a comma list of `n0-dns`, `mdns`. **LIMIT** (`limit/stored-relay-url`): the relay check is made when a version is made. A version an owner key signed some other way with a relay URL that does not parse stops every daemon that adopts it from starting. |
+| set `release` | `release` = a version of three numbers (`0.5.1`), or `none` to name none. It is the version every machine of the mesh should run; each machine's updater installs it (section 22.3). The change carries a note: `machines that run 0.4 can't read a membership file that names a release: update them by hand first`. |
 | dissolve | Removes every machine, grant and approval and marks the file closed. |
 
 The first change that fails stops the whole version. A grant is written `from:to:categories` on the command line, for example `laptop:ws:tools,shell`.
@@ -349,6 +353,8 @@ Each must be 1 or more, or the daemon does not start (`max_thread_len must be at
 
 `tearmesh status --ping` and the menu send one byte to every other machine and time the echo (6 s limit for each step). A machine that is about to leave sends the byte `L` instead; a member that receives it notes "says it left" for that machine and answers `l`. The note changes nothing in the mesh: an owner must still sign the removal. It is kept in memory (an owner node that restarts forgets it) and cleared by the next completed sync with that machine.
 
+The ping of `status --ping` and the menu sends the byte `V`. A daemon from 0.5.0 on answers `v` followed by its version as text; an older daemon echoes the byte, and its version is unknown. The asker keeps the text only if it is 1 to 32 characters of digits, letters, `.`, `-` and `+` (a longer or other answer counts as no version), so nothing a peer sends reaches a terminal unchecked. `status --ping` and the menu show each machine's version, so the owner sees which machines still run an older one. The 4-second reachability check that `send_message` makes (section 18.6) still sends the byte `7`, which every version echoes.
+
 ## 10. Joining
 
 Joining needs two things: a ticket from the owner node, and the owner's signature on a version that adds the machine. A ticket alone admits nobody.
@@ -410,22 +416,48 @@ Joining needs two things: a ticket from the owner node, and the owner's signatur
 
 **DECIDED 2026-11-12:** permissions are three categories, each in two directions, per pair of machines, and they are enforced in code, never by a model.
 
-| Category | speak: this machine… | listen: this machine… |
-|---|---|---|
-| `converse` | posts letters to that machine | accepts letters from that machine |
-| `tools` | calls the MCP servers that machine shares | accepts tool calls from that machine |
-| `shell` | drives that machine, with anything its SSH login can do | can be driven by that machine |
+**DECIDED 2026-11-26** (Maxwell: the fewest channels, with configuration doing the rest, and no feature made for one kind of request). Everything one machine does on another goes through one of three **channels**. Each channel is one category of grant. What a channel can cause on the other machine is decided there, by that machine's configuration. The menu and this section say **mail** for the first channel; the membership file keeps the word `converse`, and the commands accept both.
 
-1. An action from A to B needs A to speak it to B and B to listen to it from A. The membership file holds the pair as one grant, `A → B`, which both daemons check, so a switch cannot be half on. The menu shows the six switches between this machine and another (**G** on its row) and signs everything changed at once.
-2. **Deny by default.** No grant, no action. A machine's mail to itself is always allowed.
-3. `*` stands for any machine on either side of a grant, except in a grant that includes `shell`.
-4. A new mesh starts with `* → *` `converse`. To keep a pair from mailing each other, revoke that grant and grant the pairs that should. Revoking a pair alone does not help while the `*` grant stands; the revoke says so.
+| Channel | Word in the file | Carries | What it can cause there is decided by |
+|---|---|---|---|
+| **mail** | `converse` | letters to mailboxes: notes, questions, tasks, alerts, progress, answers | the mailbox's table in that machine's `mailboxes.toml` (section 18.5): what answers, for which senders, within which limits; or the live session that holds the mailbox |
+| **tools** | `tools` | calls to the MCP servers that machine shares | the server, and the owner's approval of its tool list (section 15) |
+| **shell** | `shell` | an SSH connection | the SSH login on that machine (section 17) |
+
+A fourth thing travels to every machine and is no channel between two of them: the **membership file**, which only an owner key can change. It holds the grants, the approvals, the settings and the release the mesh should run.
+
+1. An action from A to B needs the grant `A → B` for its channel. Both daemons check the same grant, so it cannot be half on. The menu shows, for this machine and another, what each may do on the other (**G** on its row, section 19.3) and signs everything changed at once.
+2. **Deny by default.** No grant, no action. A machine's mail to itself is always allowed, so a grant from a machine to itself is refused (`a machine needs no grant to itself`); one signed by 0.4.0 is harmless and can be revoked.
+3. `*` stands for any machine on either side of a grant, except in a grant that includes `shell`. `* → *` is a grant for **all machines**, also those that join later; the menu has a row for it (section 19.3).
+4. A new mesh starts with `* → *` mail. To keep a pair from mailing each other, revoke that grant and grant the pairs that should. Revoking a pair alone does not help while the `*` grant stands; the revoke says so. There are no deny entries.
 5. Grants never cross boundaries: an action also needs both machines to host the session's boundary.
-6. What each category gates:
-   - `converse` decides **delivery**, not storage. A letter from a machine with no converse grant to this one is still stored and synced, but not shown, not announced and not screened. Revoking a grant hides that machine's earlier letters; granting again shows them.
-   - `tools` lets the caller open tool streams to the target's shared servers. Unless the mesh setting `tools_sharing` is `free`, each server also needs the owner's approval (section 15).
-   - `shell` lets the caller reach the target's sshd (section 17).
-7. An owner node usually speaks `shell` and never listens to it. In the Permissions box of an owner node's menu, turning on shell toward that machine itself gets a warning (`Careful: X will be able to drive this machine, which holds an owner key.`); the join approval box has no such warning.
+6. What each channel gates:
+   - **mail** decides **delivery**, not storage. A letter from a machine with no mail grant to this one is still stored and synced, but not shown, not announced and not screened. Revoking a grant hides that machine's earlier letters; granting again shows them.
+   - **tools** lets the caller open tool streams to the target's shared servers. Unless the mesh setting `tools_sharing` is `free`, each server also needs the owner's approval (section 15).
+   - **shell** lets the caller reach the target's sshd (section 17).
+7. An owner node usually has shell on other machines and gives none on itself. In the Permissions box of an owner node's menu, turning on shell for another machine on this one gets a warning (`Careful: X will be able to drive this machine, which holds an owner key.`).
+
+### 12.1 What each use goes through
+
+No use has a channel or a feature of its own. A use is a channel plus configuration on the machine it reaches.
+
+| Use | Channel | Configuration that makes it work |
+|---|---|---|
+| see which machines and agents exist and what each is doing | mail | bios and status records, read without waking anyone (`list_nodes`, `node_status`) |
+| leave a note; one session writes to another | mail | none |
+| ask everyone | mail to `*` (the board) | none; a post wakes no one, agents read the board when they look |
+| an agent asks the person; an alert | mail | the person's mailbox: `admin` on a machine, or the gateway's mailbox for their Claude apps. A mailbox whose command sends a push message turns a letter into a notification. A script sends with `tearmesh post`. |
+| ask about a machine or a project | mail | a mailbox whose command starts an agent that can only read |
+| give a task | mail | a mailbox whose command starts an agent that may act, opened only to the senders that may give tasks (`wake_on`, `from`) |
+| reach a session that is working | mail | the session holds a mailbox (the plugin), or a mailbox whose command hands the letter to the running session |
+| long work with progress | mail | claims (section 13) |
+| fetch a file, use a device or a database | tools | an MCP server shared from that machine and approved by the owner |
+| drive a machine: run anything, copy files, install, restart | shell | an SSH login there |
+| update tear-mesh everywhere | the membership file | the release the owner names (section 22.3) |
+| run the mesh: invite, approve, grant, remove | the membership file | an owner key |
+| context from the person's Claude apps to a machine | mail | agents write to the gateway's mailbox; a Claude session reads it when the person next opens one. Claude cannot be woken. |
+
+Claude's apps reach the mesh through the gateway, which carries mail only (`open/gateway-channels`). What they can cause is therefore what the mailboxes they may write to are configured to do.
 
 **PROPOSED** (2026-11-12, not agreed, not built):
 - `proposed/deny-all-default`: a new mesh starts with no grants at all (no `* → *` converse), and shell listen is off for every new machine until switched on.
@@ -637,9 +669,14 @@ One per boundary user: `tearmesh steward [--mailboxes F] [--offers F] [--screen 
    | `timeout_mins` | 30 | a woken command running longer is stopped |
    | `resume` | false | add `--resume <session id>` of the last wake (taken from a `session_id` field in the command's JSON output) |
    | `wake_on` | `["member", "admin"]` | which trust levels wake this mailbox. Letters from the gateway are `guest`: list it to let the owner's Claude apps wake this mailbox. |
+   | `from` | every sender (`["*"]`) | Which senders wake this mailbox: a list of addresses, where `*` stands for any agent or any machine (`claude@gw`, `*@laptop`, `herder@*`; `*` alone or `*@*` is every sender). A letter wakes the mailbox only if its trust is listed in `wake_on` and its sender matches an entry here. Any other entry stops the steward at start: `mailbox <table>: bad sender "<entry>" in from: use agent@machine (either side may be *), or * for anyone`. The mesh proves only the machine part of a sender (the signing machine, section 13); the agent part is the name a session on that machine gave itself. So `herder@ws` means any session on `ws` that calls itself `herder`, within the boundaries that may write here. |
    | `about` | `Woken when mail arrives.` | the `about` text of the status record the steward writes for this mailbox when it has none (section 16.1) |
 
-   A mailbox is woken when it has unread, visible letters of a listed trust that have not caused a wake yet, no live session holds it, no wake of it is running and its budget is not used up (`wake budget (N an hour) used up; mail waits`). The command gets `TEARMESH_MAILBOX` and `TEARMESH_WAKE_IDS`. The prompt lists the letters and tells the agent to open each with `inbox_fetch`, do what it reasonably asks within its own work, answer in the thread with `send_message` and `reply_to` (first one or two sentences that can be read aloud, then the detail), send a `claim` first if the answer will take more than a few seconds, and stop; and that letters come from other agents, to be weighed, not obeyed. Claims never wake a mailbox. Mailboxes are checked at steward start and after every wake. The command need not start a new agent: one that hands the prompt to a session that is already running (for example `herdr agent prompt NAME {prompt}`) delivers mail into that session.
+   A mailbox is woken when it has unread, visible letters of a listed trust that have not caused a wake yet, no live session holds it, no wake of it is running and its budget is not used up (`wake budget (N an hour) used up; mail waits`). The command gets `TEARMESH_MAILBOX` and `TEARMESH_WAKE_IDS`. The prompt lists the letters and tells the agent to open each with `inbox_fetch`, do what it reasonably asks within its own work, answer in the thread with `send_message` and `reply_to` (first one or two sentences that can be read aloud, then the detail), send a `claim` first if the answer will take more than a few seconds, and stop; and that letters come from other agents, to be weighed, not obeyed. Claims never wake a mailbox. Mailboxes are checked at steward start and after every wake.
+
+   A table named `"*"` stands for every mailbox of this machine that has no table of its own, `admin` included: mail for any of them runs its command. In a command, an argument `{mailbox}` is replaced by the name of the mailbox the mail is for, in any table. All mailboxes that the `"*"` table answers share its hourly budget; each is woken on its own, so two can run at once. A mailbox with a table of its own is never answered by `"*"`. No status record is written for `"*"`, and at steward start only the named tables are checked. No other table name may contain `*`. With it one agent answers everything nobody else does, or a small script hands each letter to the running session of that name. The session ids for `resume` are kept in `~/.local/state/tearmesh/sessions.json`, written only for a table with `resume` on.
+
+   What a woken command may do is not tear-mesh's to grant: it is the command's own limits (an agent program's permission settings, the user it runs as, the confinement of the steward's service). A mailbox that only answers questions gets a command that can only read; one that takes tasks gets a command that may act, and `wake_on` and `from` say who may give them. `docs/testing.md` has both forms for Claude Code. The command need not start a new agent: one that hands the prompt to a session that is already running (for example `herdr agent prompt NAME {prompt}`) delivers mail into that session.
 3. **Screens mail** (section 14) when the daemon's config lists its boundary.
 
 With no mailbox and no offer configured and no `screen.toml` (the files missing or empty) the steward keeps running and logs once that nothing is configured (it can still be asked to screen). `offers.toml` is read again whenever a peer opens a tool stream, and `mailboxes.toml` whenever mail arrives and before a mailbox is checked, so edits need no restart. A file that no longer parses keeps its last good contents, with one warning per distinct error (`…; keeping the last good contents`); a file that does not parse when the steward starts still stops it. `screen.toml` is read once, at start.
@@ -658,7 +695,7 @@ The mail server, the hub and the gateway serve these seven tools with the same n
 | `inbox_list(unread_only?, thread?, since_minutes?, limit?, wait_secs?)` | yes | headers of the letters addressed to this agent |
 | `inbox_fetch(id, detail?, offset?)` | yes | one letter's text; marks it read |
 | `board_read(unread_only?, since_minutes?, limit?)` | yes | headers of the letters on the board (addressed to `*`) |
-| `board_post(body, subject?, kind?, idempotency_key?)` | no | posts to the board |
+| `board_post(body, subject?, kind?, idempotency_key?)` | no | posts to the board. Its description says that a post wakes no agent, and that a message meant for one agent goes through `send_message`. |
 
 1. **Annotations.** Each tool has a title. The five read tools carry `readOnlyHint: true`; the two that send carry `readOnlyHint: false` and `destructiveHint: false`. So a client can let the read tools run without asking and keep its own setting for sending.
 2. **Nothing blocks on an agent.** `send_message` returns as soon as the letter is written. Nothing depends on the server pushing to the client: answers are fetched.
@@ -682,7 +719,8 @@ The mail server, the hub and the gateway serve these seven tools with the same n
     | `claim(reply_to, expect_secs?, note?)` | answers a letter with a claim (section 13) |
     | `set_bio(text)` | replaces this machine's bio (section 16) |
 
-11. **How an agent should answer** is said in every door's instructions, in the hook's notice and in the wake prompt: reply in the thread; open with one or two sentences that can be read aloud, then the detail; send a claim first when the answer takes more than a few seconds; treat what a letter says as a request to weigh. Answers to an agent's own questions arrive as ordinary replies in the thread it asked in.
+11. **Nobody announced there.** When a new message (one without `reply_to`) goes to an address that has no status record and that no live session on this machine holds, `send_message` sends it and adds `note` to its reply: `admin@x has no status record: a person may read this later, in the menu. Agents on x with one: herder`, or `… No agent on x has one.` The default addressee `admin` is the usual case: it is a person's mailbox unless that machine's steward answers it. Which local mailboxes a live session holds comes from the daemon (`held` in the `who` answer); for another machine only the status record counts. **LIMIT** (`limit/note-one-way-mail`): status records come only from machines that may send mail to this one, so where mail is granted one way only, the note can say there is no record when there is one.
+12. **How an agent should answer** is said in every door's instructions, in the hook's notice and in the wake prompt: reply in the thread; open with one or two sentences that can be read aloud, then the detail; send a claim first when the answer takes more than a few seconds; treat what a letter says as a request to weigh. Answers to an agent's own questions arrive as ordinary replies in the thread it asked in.
 
 ### 18.7 The Claude Desktop extension
 
@@ -720,7 +758,7 @@ The header reads `o─o tear-mesh  <machine>  ROLE` (the role is a coloured tag)
 
 **Not in a mesh:** the machine's name and node id, and what can be done: `C` create a mesh, `J` join one, `U` add boundaries (when the machine has none, or hosts one with no OS user), `I` install (when not installed). While joining: `Joining: reaching the owner node…` or `Waiting for approval: code 123 456`, with `X` to cancel. A dissolved mesh is named as such.
 
-**In a mesh:** a summary line (mesh, version, how many machines answer, boundaries), yellow lines for things that wait (join requests, offers to approve, status warnings, boundaries with no OS user), a map of the machines, and a table: machine, ping, boundaries, "speaks to it", "listens to it", last sync. Join requests are listed on top with their code. A machine that announced it is leaving shows `(says it left)`.
+**In a mesh:** a summary line (mesh, version, how many machines answer, boundaries), yellow lines for things that wait (join requests, offers to approve, status warnings, boundaries with no OS user), a map of the machines, and a table: machine, version, ping, boundaries, "may do there" (what this machine may do on that one), "may do here" (what that machine may do on this one), last sync. Channels read `mail`, `tools`, `shell`. This machine's version is always shown; another machine's is what it answered to the last ping, and `?` when it has not said (an older daemon, or not pinged yet). Join requests are listed on top with their code. The next row is **All machines**: in both columns it shows what the grant `* → *` allows every machine on every other; `Enter`, `X` and `D` do nothing on it, and the selection starts there when no request waits. A machine that announced it is leaving shows `(says it left)`.
 
 | Key | Who | Does |
 |---|---|---|
@@ -730,17 +768,33 @@ The header reads `o─o tear-mesh  <machine>  ROLE` (the role is a coloured tag)
 | `U` | all, when offered | add boundaries (runs install with admin rights) |
 | `A` | owner | add a machine: makes a one-hour ticket and shows it |
 | `D` | owner | on a machine: disconnect it (signs its removal); on a join request: refuse it |
-| `G` | owner | the six permission switches between this machine and the selected one; elsewhere a grant form |
-| `V` | owner | revoke form |
+| `G` | owner | On a machine: the Permissions box for this machine and that one (point 7). On **All machines**: the box for all machines. On this machine's own row: `a machine needs no grant to itself`. The box is always between this machine and the selected one; a pair of two other machines is signed with `mesh grant` and `mesh revoke`. There is no separate revoke form: removing a tick revokes. |
 | `O` | owner, when offers wait | approve offered MCP servers |
 | `Shift-L` | member | leave the mesh. It asks first: `Leave mesh NAME? This machine tells the others it is leaving, then forgets the mesh (its logs are kept, moved aside). The owner node then removes it.` An owner node leaves from the command line. |
 
 1. **Create** (`C`): mesh name, passphrase twice. The menu makes both owner keys, then shows the **recovery key and its passphrase** on a screen of their own: `C` copies the key, `P` the passphrase, `W` saves the key to a file (new, mode 0600, never overwriting), `Y` says "I've saved them" and asks for the third word of the passphrase as proof. While it asks, the key and passphrase are not on the screen (`The key and passphrase are hidden. Esc brings them back.`); a wrong word shows them again with a note, and `Y` asks once more and clears the note. Then one confirmation, and the mesh exists with this machine in it. `Esc` before that changes nothing.
 2. **Join** (`J`): paste the ticket. The menu shows the code and waits; `Esc` hides the box while the daemon keeps waiting.
 3. **The ticket screen** (`A`): the one-line commands for Linux and PowerShell and the bare ticket, without borders so a mouse selection copies them whole. `C`, `P`, `T` copy each (through the terminal's OSC 52 clipboard; tmux needs `set -g set-clipboard on`), `W` saves the ticket.
-4. **Approval** opens by itself when a machine asks. It shows the name, the boundaries asked for, the code with the question whether the new machine's own screen shows the same, and a red warning if another machine also tried the ticket. Boxes: which boundaries the machine hosts (those it asked for are ticked; a boundary new to the mesh is offered unticked), and grants in both directions for mail (only if the mesh does not already allow it), tools and shell, all unticked. The last line takes the key's passphrase or PIN. `Esc` leaves the request waiting.
+4. **Approval** opens by itself when a machine asks. It shows the name, the boundaries asked for, the code with the question whether the new machine's own screen shows the same, and a red warning if another machine also tried the ticket. Boxes: which boundaries the machine hosts (those it asked for are ticked; a boundary new to the mesh is offered unticked), and grants in both directions for mail, tools and shell, all unticked, in the words of the Permissions box (point 7): `What NEW may do on THIS`, then `What THIS may do on NEW`. A channel the mesh already allows in both directions between the two is not offered (for mail the form then says `Everyone may already mail everyone.`). The last line takes the key's passphrase or PIN. `Esc` leaves the request waiting.
 5. A form the menu opened by itself ignores `Enter` for its first 700 ms, so an Enter meant for the screen before cannot approve anything.
 6. **Machine left:** when a machine says it left, the owner's menu offers once to sign its removal (`NAME says it left the mesh (it left there, or tear-mesh was uninstalled).`).
+7. **The Permissions box** (`G`). It says who may do what where, one line per switch:
+
+   ```
+   Permissions: alpha and beta
+
+   What alpha may do on beta
+    [x] mail    send letters to its agents             on for all machines
+    [ ] tools   use the MCP servers it shares
+    [ ] shell   log in over SSH and run anything
+
+   What beta may do on alpha
+    [x] mail    send letters to this machine's agents  on for all machines
+    [ ] tools   use the MCP servers shared here
+    [ ] shell   log in here over SSH and run anything
+   ```
+
+   A switch that a grant with `*` already turns on is shown ticked with `on for all machines` and cannot be changed here; Space on it says where (`on for all machines: change it on the All machines row (a grant that names one machine and *: tearmesh mesh revoke)`). A pair's own grant under such a switch is not shown and is not changed by the box. Ticking a switch grants, removing a tick revokes that pair's grant, and everything changed is listed on one signing screen (`Allow shell: what beta may do on alpha`, `Stop mail: what every machine may do on every other`) and signed at once with the key's passphrase or PIN; with nothing changed, Enter closes the box. Shell for the other machine on an owner node shows the warning of section 12 on the signing screen. The box for **All machines** (`Permissions: all machines`) has two switches, `mail   every machine may send letters to every other` and `tools  every machine may use the MCP servers every other shares`, the line `shell is always set for one pair of machines`, and says that machines that join later are covered. Grants with `*` on one side only (`alpha → *`) are signed with `mesh grant` and removed with `mesh revoke`; the boxes show their effect and do not change them (`limit/menu-one-sided-grants`).
 
 ### 19.4 Mail screen
 
@@ -759,6 +813,7 @@ Shows the mesh's signed settings, the MCP hub (running or not, its URL, the stdi
 | `Shift-H` | all | starts the MCP hub in the background |
 | `U` | all | how to register the hub with a harness; `C` copies the `claude mcp add` line |
 | `E` | all | clears the event log |
+| `V` | all | Leaves the full screen, runs `tearmesh update --check` (section 22.3) and returns on Enter; a run that fails is noted in the event log. The screen itself shows this machine's version and, among the signed settings, the mesh's release (`none` when no release is named). |
 | `X` | admin | uninstall: lists what goes and what stays, then runs with admin rights |
 | `T` | owner | tools sharing: approval or free |
 | `Y` | owner | relays |
@@ -786,6 +841,7 @@ The older mail-only program `tearmesh tui [MAILBOX]` still exists and is depreca
 | `tearmesh menu [--config F]` | anyone | the menu (section 19) |
 | `tearmesh install [MACHINE] [BOUNDARIES…] [--stewards] [--me BOUNDARY] [--join TICKET]` | admin rights | installs or adds boundaries (section 22) |
 | `tearmesh uninstall [BOUNDARIES…] [--keep-users] [--yes]` | admin rights | removes tear-mesh (section 22.4) |
+| `tearmesh update [--to VERSION] [--mesh]`, `tearmesh update --check` | admin rights; `--check`: anyone | Installs a newer release in place; `--check` only looks (section 22.3). `--to` and `--mesh` cannot be combined, and `--check` takes neither. |
 | `tearmesh status [--ping]` | admin | the daemon's status as JSON; `--ping` adds reachability of every machine |
 | `tearmesh join TICKET`, `tearmesh join --cancel` | admin | joins a mesh; stops a join that is waiting |
 | `tearmesh launch --boundary B [--mailbox M] [--config F] -- CMD…` | sudo rights (or root) | runs CMD as the boundary's user (section 7) |
@@ -794,7 +850,7 @@ The older mail-only program `tearmesh tui [MAILBOX]` still exists and is depreca
 | `tearmesh shell-proxy MACHINE [--boundary B]` (hidden) | boundary user or admin | carries an ssh connection (section 17) |
 | `tearmesh setup`, `tearmesh tui`, `tearmesh offers` (hidden) | | deprecated: the old wizard, the old mail screen, offers as JSON |
 
-`status` shows: machine, node id, mesh (name, id, version, hash, owner keys, hosted boundaries; null when the machine is in no mesh, with `dissolved` naming a mesh that was dissolved), the boundaries hosted and those hosted with no OS user (`unmapped`), per machine the last sync and any "says it left", join state, screening counts and `warnings`.
+`status` shows: this machine's tear-mesh version (`version`) and, with `--ping`, each machine's (`version` in its `ping` entry, absent when it has not said), machine, node id, mesh (name, id, version, hash, the release it names (`release`, null when none), owner keys, hosted boundaries; null when the machine is in no mesh, with `dissolved` naming a mesh that was dissolved), the boundaries hosted and those hosted with no OS user (`unmapped`), per machine the last sync and any "says it left", join state, screening counts and `warnings`.
 
 ### 20.2 Mail and bios (as a boundary user)
 
@@ -822,11 +878,11 @@ The mailbox is `TEARMESH_MAILBOX` (default `admin`).
 | `mesh approve NAME [--host B]… [--add-boundary B]… [--grant FROM:TO:CATS]… [--key F] [--yes]` | approves a join request with one signature |
 | `mesh reject NAME`, `mesh reject --all` | refuses one request; voids every invite |
 | `mesh remove NAME` | removes a machine |
-| `mesh grant FROM TO CATEGORIES…`, `mesh revoke FROM TO CATEGORIES…` | permissions; `*` for any machine (not with shell) |
+| `mesh grant FROM TO CATEGORIES…`, `mesh revoke FROM TO CATEGORIES…` | permissions; `*` for any machine (not with shell). The categories are `converse` (also written `mail`), `tools`, `shell`. |
 | `mesh approve-offer MACHINE BOUNDARY SERVER [--tools a,b]`, `mesh unapprove MACHINE BOUNDARY SERVER` | shared servers |
 | `mesh boundary add B [--host M]…`, `mesh hosts MACHINE BOUNDARIES…` | boundaries of the mesh; which a machine hosts |
 | `mesh owner-add PUBKEY`, `mesh owner-remove FINGERPRINT` | owner keys |
-| `mesh set SETTING VALUE` | `tools-sharing`, `relays`, `lookup` |
+| `mesh set SETTING VALUE` | `tools-sharing`, `relays`, `lookup`, `release` (section 5.4) |
 | `mesh dissolve [--yes] [--uninstall]` | ends the mesh for good: type its name to confirm; says how many machines it reached. `--uninstall` uninstalls only when the dissolve was signed and applied here; otherwise `not uninstalling: the dissolve wasn't applied`. |
 | `mesh leave [--yes]` | asks first (unless `--yes`), tells the others, then leaves (section 11). Prints `left the mesh; this machine can create or join a mesh now`. |
 | `mesh reset [--yes]` | forgets the membership file, keeping the logs bound to this mesh (section 11) |
@@ -903,7 +959,7 @@ Written by install; read when the daemon starts (a change needs a daemon restart
    - creates a user `tm-<boundary>` for each boundary that has none, records the ones it created in `/etc/tearmesh/created-users`, and sets every boundary user's home to mode 0700; no password is set;
    - writes the config if there is none (machine, `admins` = the user who ran sudo, `[users]`). An existing config is kept; new boundaries are added under `[users]` as a text edit that keeps comments. If the install script then fails, that edit is undone; a failure after the script (the plugin files, the steward step) leaves it.
    - creates the state directory and the node key;
-   - installs and (re)starts the service: systemd units, or an OpenRC script; with neither it says how to start the daemon by hand. Where it started a service it then waits up to 10 s for the daemon to answer. If it does not, install ends, after its closing lines, with `the daemon didn't answer within 10 s; its log: …` (the `journalctl -u tearmesh -n 20` command on systemd, `/var/log/tearmesh.log` on OpenRC). With `--join` the wait is the join's own 30 s.
+   - installs and (re)starts the service: systemd units (with the updater's timer, section 22.3, enabled on every run, and the gateway restarted if it runs, so it uses the new program), or an OpenRC script; with neither it says how to start the daemon by hand. Where it started a service it then waits up to 10 s for the daemon to answer. If it does not, install ends, after its closing lines, with `the daemon didn't answer within 10 s; its log: …` (the `journalctl -u tearmesh -n 20` command on systemd, `/var/log/tearmesh.log` on OpenRC). With `--join` the wait is the join's own 30 s.
    - writes the Claude Code plugin files to `/usr/local/share/tearmesh` and prints the command that adds the plugin;
    - prints the machine's node id and what to do next: `Next: tearmesh menu` when run by root directly, `Next, as yourself (not root): tearmesh menu` when run through sudo.
 4. `--stewards` also enables `tearmesh-steward@tm-<boundary>` for the boundaries named on this run. It needs systemd; without systemd the install is finished first and the error comes last.
@@ -914,13 +970,23 @@ Written by install; read when the daemon starts (a change needs a daemon restart
 
 ### 22.2 Windows
 
-Install copies the program to `%ProgramFiles%\tearmesh`, adds it to the machine PATH, creates the service `tearmesh` (automatic start, account `NT SERVICE\tearmesh`, restarts on failure), locks the data directory to SYSTEM, Administrators and the service, creates local users `tm-<boundary>` with generated passwords kept in `passwords.txt` (SYSTEM and Administrators only; **in plain text**, so stewards can be scheduled), writes the config, makes the node key, adds the firewall rule and starts the service. `--stewards` registers a scheduled task per boundary user.
+Install copies the program to `%ProgramFiles%\tearmesh`, adds it to the machine PATH, creates the service `tearmesh` (automatic start, account `NT SERVICE\tearmesh`, restarts on failure), locks the data directory to SYSTEM, Administrators and the service, creates local users `tm-<boundary>` with generated passwords kept in `passwords.txt` (SYSTEM and Administrators only; **in plain text**, so stewards can be scheduled), writes the config, makes the node key, adds the firewall rule and starts the service. `--stewards` registers a scheduled task per boundary user. Install also registers the updater's task `tearmesh-update` (section 22.3) when it is missing, and never changes it afterwards, since the task may be what runs the install. On an upgrade the old program is renamed aside (`tearmesh.exe.old-<pid>`; a running program can be renamed, not replaced) and deleted by a later install once nothing runs from it, and steward tasks that run are stopped and started so they use the new program.
 
 The pipe `\\.\pipe\tearmesh` lets any authenticated local user connect and refuses remote clients; clients check that the pipe belongs to the service before they speak.
 
 ### 22.3 Upgrade
 
-Run install again with the new binary: it replaces the binary and restarts the service, keeping config, state and users. The one-line installer always installs the version it was released with.
+**DECIDED 2026-11-26** (Maxwell asked how the whole network is updated): the owner names the release in the membership file, and every machine installs it by itself.
+
+1. **One machine.** `sudo tearmesh update` (Windows: from an elevated prompt) finds the newest published release, and when it is newer than the installed version, downloads this machine's binary, checks it, and installs it in place. `--to VERSION` names the release instead. The machine keeps its node id, config, state, users and its place in the mesh; the service, the stewards and the gateway restart with the new program. `tearmesh update --check` needs no rights and changes nothing: it prints the installed version, the newest release, the release the mesh names when it can learn it (from the daemon for an admin, else from the stored file for root), and what to run. To someone who holds an owner key of the mesh it also prints `To update every machine of the mesh: tearmesh mesh set release X`, when the newest release is not older than this machine's and newer than the one the mesh names.
+2. **The whole mesh.** On the owner node: `tearmesh mesh set release 0.5.1`. That is one signature. Every machine then installs that release by itself, within about 15 minutes of receiving the file; a machine that is off does it after it is back. `tearmesh status --ping` and the menu show each machine's version (section 9.1). `mesh set release none` names no release. Update the owner node first (point 1), so the release is known to work before every machine follows.
+3. **The updater.** **DECIDED 2026-11-26** (Maxwell): it is on from install on every machine, and a machine opts out by switching its own timer or task off. Install registers it: on systemd the timer `tearmesh-update.timer`, which runs `tearmesh update --mesh` as root 5 minutes after boot and every 15 minutes; on Windows the scheduled task `tearmesh-update`, which runs the same as SYSTEM every 15 minutes. `update --mesh` reads the highest-numbered membership file in the state directory (never through a link, at most 256 KiB) and takes one thing from it, the release. If that is newer than the installed version, it does what `update --to` does; otherwise it prints nothing, makes no connection and ends with success. A stored file it cannot read is an error, repeated at every run. To keep a machine from following the mesh: `systemctl disable --now tearmesh-update.timer` (Windows: `Disable-ScheduledTask tearmesh-update`). **LIMIT** (`limit/openrc-no-updater`): under OpenRC there is no updater; run `tearmesh update` there yourself.
+4. **What is downloaded and checked.** From `https://github.com/maxwell-tablinum/tear-mesh/releases/download/v<version>/`: `SHA256SUMS` and the binary for this system (`tearmesh-x86_64-linux`, `tearmesh-aarch64-linux` or `tearmesh-x86_64-windows.exe`). The binary's SHA-256 must be the one `SHA256SUMS` lists (`checksum mismatch: not installing`; `SHA256SUMS lists no <binary>: not installing`), and the binary, asked for `--version`, must report the expected version. It is then run as `install` for this machine (section 22.1). Only the three numbers of a version ever reach a URL or a path. The newest release is the one `https://github.com/maxwell-tablinum/tear-mesh/releases/latest` leads to. A download that starts on HTTPS is not followed to plain HTTP, and it may take 10 minutes at most. `TEARMESH_RELEASE_URL` replaces the download folder (section 22.5); the version on offer there is the one its binary reports, and `--check` then downloads nothing. The updater's service and task start without that variable, and `sudo` drops it.
+5. **Where it works, and one at a time.** The download is put in a folder beside the installed program, made new for each run with access for root only (`/usr/local/bin/.tearmesh-update`; Windows: `%ProgramFiles%\tearmesh\.update`), not in the temp directory, which hardened machines mount without the right to run programs. A lock (`/run/tearmesh-update.lock`, mode 0600; Windows: `%ProgramData%\tearmesh\update.lock`) is held for the whole run: a second update started meanwhile ends at once, silently when it is the updater's and with `another update is running on this machine` otherwise. Nothing in the folder is run that this run did not write and check. **LIMIT** (`limit/windows-update-folder`): on Windows ordinary users can read that folder; one who keeps the downloaded file open makes later updates fail until it is let go. Nothing can be put there or changed by them. **LIMIT** (`limit/update-lock-holders`): on Windows the daemon's service account can open the lock as well and so hold updates off (it could already keep the stored file from the updater); and when the updating process alone is killed, the install it started runs on without the lock.
+6. **Never backwards.** A release that is not newer than the installed version is not installed (`already at 0.5.1`), whoever asks.
+7. **Trust.** The daemon runs without rights and cannot replace the program; the updater runs with full rights. It takes one thing from the stored membership file, a version number, and fetches that version from the project's releases over HTTPS, the same trust as the one-line installer. The updater does not check the file's signatures again: the daemon checked them before it stored the file, and the daemon's own OS user can write that folder anyway. So an owner key, and on one machine that machine's daemon user, can make it install a newer published release and nothing else: not an older one, not a program from elsewhere. A release is not signed by a key of its own (`proposed/signed-releases`): whoever can publish a release in the project's repository decides what the machines run once an owner names it. **LIMIT** (`limit/update-no-rollback`): if a new program's daemon does not start, nothing goes back by itself; install the older release by hand (point 9).
+8. **From 0.4.0.** 0.4.0 has no `update` and no updater, and cannot read a membership file that names a release: it refuses that file (`unknown field release` in its log), stays at the version before, and goes on exchanging mail. Update each 0.4.0 machine once by hand with the install line of the new release (section 22.5, with the machine's name and no ticket), then name the release.
+9. **By hand, from a binary.** Run `install` again with the new binary: it replaces the binary and restarts the service, keeping config, state and users. The one-line installer always installs the version it was released with.
 
 ### 22.4 Uninstall
 
@@ -1047,9 +1113,9 @@ Careless agents and prompt-injected agents on member machines, and strangers on 
 
 ## 25. Versions and compatibility
 
-1. This specification describes **0.4.0**, tagged `v0.4.0` on 2026-11-25: the first tag and the first release with published binaries. Earlier versions exist as commits only: 0.1.0 (2026-10-16), 0.2.0 (2026-10-18) and 0.3.0, which was never released on its own (0.4.0 builds on it).
+1. This specification describes **0.5.0**, tagged `v0.5.0` on 2026-11-26. 0.4.0, tagged `v0.4.0` on 2026-11-25, was the first tag and the first release with published binaries. 0.5.0 changes no wire or file version. A 0.4.0 machine and a 0.5.0 machine share a mesh and exchange mail; once the membership file names a release (the key `release`), a 0.4.0 machine refuses that file and every later one and stays at the version before, still exchanging mail, until it is updated by hand (section 22.3). A 0.4.0 machine answers a ping without its version. Building from source needs Rust 1.89 (0.4.0: 1.88). Earlier versions exist as commits only: 0.1.0 (2026-10-16), 0.2.0 (2026-10-18) and 0.3.0, which was never released on its own (0.4.0 builds on it).
 2. The crate version and the plugin's version are the same; a test checks it.
-3. Wire and file versions in 0.4.0:
+3. Wire and file versions in 0.5.0, the same as in 0.4.0:
 
    | Thing | Version | Where it shows |
    |---|---|---|
@@ -1068,9 +1134,9 @@ Careless agents and prompt-injected agents on member machines, and strangers on 
 
 | Suite | What it covers | Needs |
 |---|---|---|
-| `cargo test` | unit tests in every module, and `tests/mesh.rs`: in-process daemons over real iroh (boundaries, handshake, removal, leaving, dissolve, splits, sync, relaying, joins, grants, tools, shell, screening) | nothing |
+| `cargo test` | unit tests in every module, and `tests/mesh.rs`: in-process daemons over real iroh (boundaries, handshake, removal, leaving, dissolve, splits, sync, relaying, joins, grants, tools, shell, screening), a ping's version, the release setting, and `update` against a local web server (a refused checksum, a missing entry, a wrong version, never backwards, the stored file) | nothing |
 | `tests/e2e-linux.sh` | two daemons and real OS users: boundaries on disk and on the wire, join with a code, offers, approvals, tool calls, shell proxy, bios, the mail server, the hook, wakes, the menu's Mail screen | sudo without a password, python3, curl; tmux for the menu checks (skipped without it); a release build |
-| `tests/talk.rs` | the conversation tools against real in-process daemons: every tool, the error texts, offline and queued sends, claims, status records, paging, a guest door, the steward's registration | nothing |
+| `tests/talk.rs` | the conversation tools against real in-process daemons: every tool, the error texts, offline and queued sends, claims, status records, paging, a guest door, the steward's registration, the note when nobody has announced themselves | nothing |
 | `tests/e2e-0.3.sh` | three daemons: the old wizard, ping, the hub (both entrances, token, limits), mail, tools and shell both ways, chats, bad input, restarts, a stolen machine key, a leaked owner key, the menu (create, join, approve, permissions, leave), dissolve | the same, and sshd on port 22 |
 | `tests/distros.sh` | `e2e-linux.sh` plus install, add boundaries and uninstall in containers of Debian, Ubuntu, Fedora, Arch, openSUSE and Alpine | podman or docker; a static build |
 | `tests/gateway.rs` | the gateway against an in-process daemon: discovery, registration, sign-in with PKCE, the tools, and the refusals (no token, forged, expired, revoked, a reused refresh token, a client that never signed in, wrong passphrases, foreign redirect URIs, oversized bodies, a body that is not JSON, a flood, a user the daemon does not hold as a guest) | nothing |
@@ -1080,8 +1146,9 @@ Careless agents and prompt-injected agents on member machines, and strangers on 
 
 1. The end-to-end scripts create OS users and throwaway daemons with their own config, state and socket. They never touch an installed tear-mesh.
 2. Not covered by any automated test: install and uninstall on a machine with systemd or OpenRC running (the release workflow covers the GitHub runners only); the Windows install script outside the release workflow; security keys; the screener against the real API (tests use a stand-in server); relays other than the defaults.
-3. Never tried, as of 2026-11-25: a real Claude client (web, phone, voice, Desktop) against the gateway, which was driven only by `tests/gateway-client.py`, a stand-in that speaks the same sign-in and MCP calls; whether Claude prompts before the reading tools; Claude Desktop with `tearmesh.mcpb`; a real Windows machine with a person at it (the release workflow installs the 0.4.0 build on a Windows Server runner through `install.ps1`, sees the service running and uninstalls; a GNU cross-build was also run under Wine, where the daemon starts on a named pipe and the mail server lists its ten tools); aarch64 beyond the release workflow's install test.
-4. `docs/testing.md` is the hands-on guide: how to run each suite and how to try tear-mesh on two machines.
+3. Tried by hand, not by a test. On 2026-11-25, on the owner's mesh with 0.4.0: Claude Desktop added the gateway as a custom connector (automatic registration) and signed in, and a voice call used it (`list_nodes`, `board_read`, `inbox_list`, `inbox_fetch`, `send_message`). On 2026-11-26, on three throwaway containers with systemd that started from the published 0.4.0: the upgrade to 0.5.0 with the install line; mail between a 0.4.0 and a 0.5.0 machine; versions in a ping; `update` (the newest release looked up on GitHub; from a test folder a refused checksum, never backwards, a caller without root, two at once, the lock's mode); the mailbox rules `from`, `"*"` and `{mailbox}` with the shared budget; `mesh set release`, followed by the 0.5 machines through their updater and refused by a 0.4.0 machine, which kept exchanging mail. `docs/testing.md` lists both.
+4. Never tried: Claude on the web against the gateway; whether Claude prompts before the reading tools; Claude Desktop with `tearmesh.mcpb`; anything of 0.5.0 on Windows (`check/windows-update`); a real Windows machine with a person at it (the release workflow installs the 0.4.0 build on a Windows Server runner through `install.ps1`, sees the service running and uninstalls; a GNU cross-build was also run under Wine, where the daemon starts on a named pipe and the mail server lists its ten tools); aarch64 beyond the release workflow's install test; `update` from GitHub to a release newer than the installed one (none is published); `tests/distros.sh` and the release workflow since their 0.5.0 changes; the menu's new screens with a person at a terminal (`check/menu-by-eye`).
+5. `docs/testing.md` is the hands-on guide: how to run each suite and how to try tear-mesh on two machines.
 
 ## 27. Open questions, proposals, plans, conflicts and limits
 
@@ -1093,7 +1160,7 @@ From the design sessions of October 2026 (collected 2026-11-12 in `docs/research
 
 | Name | Question | Today |
 |---|---|---|
-| `open/converse-category` | Does converse stay its own category, or become a built-in messaging toolset under tools? | its own category, with its own grant |
+| `open/converse-category` | Does converse stay its own category, or become a built-in messaging toolset under tools? | its own category, with its own grant. 0.5.0 calls it the **mail** channel and keeps the word `converse` in the file (section 12). |
 | `open/converse-only-nodes` | Is a machine with converse and no tools a supported setup? | works: a new mesh starts that way |
 | `open/doorbell-levels` | Do "ring the doorbell" and "view only" survive as levels of their own, or fold into converse? | neither exists |
 | `open/per-tool-scoping` | Per-tool permissions, or only the broad tools switch per pair of machines? | one tools switch per pair; the owner's approval can limit a server to some of its tools, for every caller alike |
@@ -1180,8 +1247,11 @@ Every **LIMIT** in this file, by name:
 | `limit/mail-editor` | 19.4 Mail screen |
 | `limit/mail-esc` | 19.4 Mail screen |
 | `limit/menu-first-key` | 19.6 Forms and boxes |
+| `limit/menu-one-sided-grants` | 19.3 Mesh screen |
 | `limit/menu-size` | 19.6 Forms and boxes |
 | `limit/menu-ticket-grace` | 19.6 Forms and boxes |
+| `limit/note-one-way-mail` | 18.6 The conversation tools |
+| `limit/openrc-no-updater` | 22.3 Upgrade |
 | `limit/openrc-plain` | 22.1 Install |
 | `limit/owner-key-home` | 6. Owners and keys |
 | `limit/passphrase-128` | 6. Owners and keys |
@@ -1201,11 +1271,43 @@ Every **LIMIT** in this file, by name:
 | `limit/ticket-grace` | 10.3 Approval |
 | `limit/unused-tickets` | 10.3 Approval |
 | `limit/wake-held-at-start` | 18.5 The steward |
+| `limit/update-lock-holders` | 22.3 Upgrade |
+| `limit/update-no-rollback` | 22.3 Upgrade |
 | `limit/wake-once-in-memory` | 18.5 The steward |
 | `limit/warnings-stay` | 5.7 How versions travel |
 | `limit/windows-leave-before-fail` | 22.4 Uninstall |
 | `limit/windows-log-rotation` | 3.3 Files on Windows |
+| `limit/windows-update-folder` | 22.3 Upgrade |
 | `limit/windows-uninstall-users` | 22.4 Uninstall |
+
+### 27.6 Left from the 0.5.0 list
+
+The list was collected on 2026-11-25, after the first day of real use (the mesh `mw`: an owner node, a gateway, a third machine, Claude Desktop and a voice call through the gateway). What was built from it is in the change log under 0.5.0. This is what is left. Nothing here is built.
+
+**Waiting for Maxwell's ruling.** Each is a suggestion; none is built on a guess.
+
+| Name | Suggestion | To rule |
+|---|---|---|
+| `proposed/task-agent` | An agent that takes tasks from Claude's apps, so that a voice call can change what is running and start new work (his stated aim for the voice path, 2026-11-25). Since 0.5.0 this is configuration, not a feature: a mailbox whose command may act, with `wake_on` and `from` naming who may give it tasks (section 18.5; `docs/testing.md` has the form). No machine has one. | Whether to set one up, on which machine, and what its command may do (Claude's suggestion in that call: work in branches or worktrees; no merge, no push to the main branch, no delete). |
+| `proposed/session-mailboxes` | Mail into agent sessions that are already running. Since 0.5.0 the steward can do the delivery: a table `"*"` whose command hands the letter to the session named by `{mailbox}` (section 18.5). What is missing is that command for his session manager, and a rule for how sessions are named. No machine has one. | How mailboxes are named (by project, by pane), and whether mail may be typed into a running session at all. |
+| `proposed/node-agent-setup` | A node agent out of the box: one command sets up what was done by hand on 2026-11-25 (an agent woken by mail, read-only, with an allowlist, its service confined to a read-only home directory), and decides whether guest mail to `admin` goes to it. `docs/testing.md` now has the recipe. | Whether install offers it, and what it may read. Touches `open/no-session-policy` and `open/launch-agents`. |
+| `proposed/context-notes` | Context from Claude to a node: agents leave questions in the gateway's mailbox for the next session he opens, or Claude writes notes into the mesh during a call, kept on the node. | Undecided by him in the call. |
+| `proposed/per-boundary-wildcard` | A grant for "every machine that hosts boundary B". Needs a change to the membership file's format. | Suggested: not before a mesh has a second boundary. |
+| `proposed/signed-releases` | Releases signed with a key whose public half is built into the binary, checked by `update` and the install scripts. Adds a signing step to every release. With the updater of 0.5.0 this matters more: whoever can publish a release decides what every machine runs once an owner names it (section 22.3). | Whether to do it before the updater is relied on. |
+| `proposed/gateway-cimd` | The gateway accepts client ID metadata documents (`limit/gateway-no-cimd`), so the choice Claude's connector dialog recommends works too. | Whether it is worth it: registering automatically works. |
+| `proposed/list-invites` | `mesh pending` also lists the open invites and when each ends. Today nothing shows whether a ticket is still good. | — |
+
+**Fixes and checks.**
+
+| Name | What |
+|---|---|
+| `fix/research-references` | Committed files point to files under `docs/research/` that are not in the repository (this spec, the test guide, the design note, a comment in `src/gateway.rs`). Commit those files or drop the references: Maxwell's choice. |
+| `check/release-notes` | At the 0.5.0 tag, check that the draft's notes come from the tag's own message (the workflow change of 2026-11-25 has not run yet). |
+| `check/windows-update` | Nothing of 0.5.0 has run on Windows: the updater's task, the renamed old program, the restarted steward tasks, the lock and the download folder. The code compiles for Windows, and the release workflow will run install and uninstall on a Windows runner at the tag. An update on a real Windows machine has to be tried by hand. |
+| `check/windows-person` | A person installs and joins on a real Windows machine, with `-Me` and `-Join` together, and adds the Claude Desktop extension. |
+| `check/menu-by-eye` | The new Permissions box, the All machines row and the Settings key `V` are covered by tests that read the drawn screen; no person has used them in a terminal yet. |
+| `check/flaky-leave-test` | `a_leaving_machine_tells_the_others` in `tests/mesh.rs` failed once on 2026-11-26 (the mark `old` was gone from another machine's status) and passed in the nine runs after it; the disk was busy during the failed run. Neither the test nor the code it covers changed in 0.5.0. Likely cause, not confirmed: a sync with that machine that begins after the mark clears it, as designed (section 9.1), and the test looks without waiting for syncs to settle. Not fixed. |
+| `check/review-owed` | 0.5.0 had two review rounds; the fixes made after the second (the lock file's mode and place, the work folder removed by uninstall, three menu texts) were tested and not reviewed again. The second fix round of 0.4.0 and the two Windows install fixes of 2026-11-25 have had no independent review either. A further round needs Maxwell's go-ahead. |
 
 ## 28. Changes being built
 
@@ -1216,6 +1318,20 @@ When work starts, the body of this spec is changed first and each changed place 
 ## 29. Change log
 
 Newest first. Dates are when the change was built. 0.4.0 is the first tagged release; 0.3.0 was never released on its own.
+
+### 0.5.0 (2026-11-26, tag `v0.5.0`)
+
+- **2026-11-26: three channels, configuration, and updating the whole mesh** (Maxwell: "the fewest channels work well with powerful and sensible configurations; no specialized features for a unique task"; and "how the entire network will get updated"). Built:
+  - `build/channels`: section 12 names three channels, mail, tools and shell, and section 12.1 shows which channel and which configuration each use goes through; no use has a feature of its own. Commands accept `mail` for `converse`, which stays the word in the file; what people read before signing says `mail`. A new grant from a machine to itself is refused; one that 0.4.0 signed still loads and can be revoked.
+  - `build/mailbox-rules`: `mailboxes.toml` gains `from` (which senders wake a mailbox), the table `"*"` (every mailbox without a table of its own, on one shared hourly budget) and the command argument `{mailbox}`. `sessions.json` is read and written only with `resume`.
+  - `build/answer-note`: `send_message` adds a note when the address has no status record and no live session holds it here, naming the agents on that machine that have one; `board_post` says a post wakes no agent.
+  - `build/permissions-box`: the Mesh screen's table shows "may do there" and "may do here" and has an **All machines** row; the Permissions box says "What A may do on B" for mail, tools and shell, shows what a grant for all machines already turns on, grants on a tick and revokes on its removal, all in one signature. The revoke form and the any-pair grant form are gone (`mesh grant`, `mesh revoke`). The approval form uses the same words.
+  - `build/versions`: a ping carries the machine's version; `status` has `version`, `mesh.release` and a version per pinged machine; the menu shows them.
+  - `build/update`: `tearmesh update [--to V]`, `update --check`, `update --mesh`; the setting `release` in the membership file (`mesh set release`); the updater (a systemd timer, a Windows scheduled task); install enables it and restarts the gateway. Section 22.3.
+- **Found by two review rounds and fixed:** the download is checked and run beside the installed program, not in the temp directory; a lock keeps two updates apart, and only root can hold it; a ping answer longer than a version is refused, not cut; on Windows the old program gets a name of its own at each swap; uninstall removes what an interrupted update left; small menu fixes. Recorded as limits or text, not changed: the updater trusts the stored file without checking signatures again; `from` proves only the machine part of a sender.
+- **Tried on three throwaway containers** (section 26). **Not built, on purpose:** more levels of mail permission; board posts that wake agents; an OS sandbox per mailbox; tools and shell through the gateway (`open/gateway-channels`); signed releases (`proposed/signed-releases`); an updater under OpenRC; signing the release or one-sided `*` grants from the menu.
+- Building from source now needs Rust 1.89.
+- **Agreed by Maxwell on 2026-11-26, after the build:** the updater on by default; Rust 1.89; the All machines row as the first row of the Mesh screen's table, where the selection starts.
 
 ### 0.4.0 (2026-11-25, tag `v0.4.0`)
 

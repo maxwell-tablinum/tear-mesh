@@ -114,6 +114,9 @@ pub struct Who {
     pub machines: Vec<PeerInfo>,
     /// Addresses that have sent mail in this boundary, plus mailboxes held here now.
     pub addresses: Vec<String>,
+    /// The mailboxes of this machine a live session holds now, as addresses.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub held: Vec<String>,
     /// The newest status record of each agent whose machine may mail this one, by address.
     #[serde(default)]
     pub status: Vec<AgentStatus>,
@@ -151,6 +154,9 @@ pub struct ScreenCounts {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Status {
+    /// This daemon's tear-mesh version.
+    #[serde(default)]
+    pub version: String,
     pub machine: String,
     pub node_id: EndpointId,
     pub mesh: Option<MeshInfo>,
@@ -184,6 +190,9 @@ pub struct MeshInfo {
     pub hash: String,
     pub owners: Vec<String>,
     pub hosts: Vec<String>,
+    /// The release the membership file names (`[settings] release`), if any.
+    #[serde(default)]
+    pub release: Option<String>,
 }
 
 /// The adopted membership file and the versions before it, oldest first, contiguous.
@@ -1652,18 +1661,24 @@ impl Node {
                 parse_address(a).is_some_and(|(_, host)| mesh.allows(host, me, Category::Converse))
             })
             .collect();
-        for (b, mb) in self.holders.lock().unwrap().keys() {
+        let mut held = vec![];
+        for ((b, mb), n) in self.holders.lock().unwrap().iter() {
             let a = format!("{mb}@{me}");
+            if b == boundary && *n > 0 {
+                held.push(a.clone());
+            }
             if b == boundary && !addresses.contains(&a) {
                 addresses.push(a);
             }
         }
         addresses.sort();
+        held.sort();
         Ok(Who {
             you: format!("{mailbox}@{me}"),
             boundary: boundary.into(),
             machines,
             addresses,
+            held,
             // Like a bio: shown only where its machine may mail this one.
             status: self
                 .statuses(boundary)?
@@ -1755,6 +1770,7 @@ impl Node {
                         })
                         .unwrap_or_default(),
                     hosts: hosts.clone(),
+                    release: c.mesh.settings.release.clone(),
                 };
                 (Some(info), peers, hosts)
             }
@@ -1799,6 +1815,7 @@ impl Node {
             warnings.push(format!("config: screen names boundary {b}, which this machine doesn't host"));
         }
         Status {
+            version: env!("CARGO_PKG_VERSION").into(),
             machine: self.cfg.machine.clone(),
             node_id: self.id(),
             mesh,

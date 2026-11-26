@@ -61,7 +61,10 @@ if [ "${1:-}" = --uninstall ]; then
     # removes every instance's link.
     systemctl stop 'tearmesh-steward@*' >/dev/null 2>&1 || true
     systemctl disable tearmesh-steward@.service >/dev/null 2>&1 || true
-    rm -f /etc/systemd/system/tearmesh.service /etc/systemd/system/tearmesh-steward@.service
+    # Not the updater's service: an uninstall it ran must not stop itself; it is a oneshot that ends.
+    systemctl disable --now tearmesh-update.timer >/dev/null 2>&1 || true
+    rm -f /etc/systemd/system/tearmesh.service /etc/systemd/system/tearmesh-steward@.service \
+      /etc/systemd/system/tearmesh-update.service /etc/systemd/system/tearmesh-update.timer
     systemctl daemon-reload
   elif command -v rc-service >/dev/null; then
     rc-service tearmesh stop >/dev/null 2>&1 || true
@@ -90,7 +93,8 @@ if [ "${1:-}" = --uninstall ]; then
   if id tearmesh >/dev/null 2>&1; then
     if command -v userdel >/dev/null; then userdel tearmesh; else deluser tearmesh; fi
   fi
-  rm -rf /usr/local/bin/tearmesh /usr/local/share/tearmesh /etc/tearmesh /var/lib/tearmesh /var/log/tearmesh.log
+  rm -rf /usr/local/bin/tearmesh /usr/local/bin/.tearmesh.new /usr/local/bin/.tearmesh-update /run/tearmesh-update.lock \
+    /usr/local/share/tearmesh /etc/tearmesh /var/lib/tearmesh /var/log/tearmesh.log
   echo "tear-mesh removed${1:+, with users $(printf 'tm-%s ' "$@")}"
   exit 0
 fi
@@ -155,10 +159,17 @@ id=$(su -s /bin/sh tearmesh -c "/usr/local/bin/tearmesh id --config /etc/tearmes
 if [ -d /run/systemd/system ]; then
   install -m 0644 "$here/tearmesh.service" /etc/systemd/system/tearmesh.service
   install -m 0644 "$here/tearmesh-steward@.service" /etc/systemd/system/tearmesh-steward@.service
+  install -m 0644 "$here/tearmesh-update.service" /etc/systemd/system/tearmesh-update.service
+  install -m 0644 "$here/tearmesh-update.timer" /etc/systemd/system/tearmesh-update.timer
   systemctl daemon-reload
   systemctl enable tearmesh >/dev/null 2>&1
-  # A restart picks up a new binary or config on a re-run.
+  # A restart picks up a new binary or config on a re-run. The stewards restart with it (Requires=);
+  # the gateway doesn't, so it is restarted if it runs. Never tearmesh-update.service: it may be
+  # the update running this script.
   systemctl restart tearmesh
+  systemctl try-restart tearmesh-gateway >/dev/null 2>&1 || true
+  # Every run, so a machine upgraded from 0.4.0 gets the updater too.
+  systemctl enable --now tearmesh-update.timer >/dev/null 2>&1
   started="systemd: tearmesh.service (stewards: systemctl enable --now tearmesh-steward@tm-<boundary>)"
 elif command -v rc-service >/dev/null; then
   install -m 0755 "$here/openrc/tearmesh" /etc/init.d/tearmesh

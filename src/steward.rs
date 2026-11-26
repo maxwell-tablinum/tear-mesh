@@ -44,6 +44,9 @@ pub struct Mailbox {
     /// only if `guest` is listed.
     #[serde(default = "default_wake_on")]
     pub wake_on: Vec<Trust>,
+    /// Senders that wake the mailbox: `agent@machine`, where either side may be `*`, or `*` alone.
+    #[serde(default = "anyone")]
+    pub from: Vec<String>,
     /// The `about` of the status record written for this mailbox when it has none, so agents
     /// the steward can wake are known before they have ever written.
     #[serde(default)]
@@ -93,6 +96,25 @@ fn default_wake_on() -> Vec<Trust> {
 }
 fn default_timeout() -> u64 {
     30
+}
+fn anyone() -> Vec<String> {
+    vec!["*".into()]
+}
+
+/// A `from` entry: `*`, or `agent@machine` with either side `*`.
+fn sender_pattern_ok(p: &str) -> bool {
+    p == "*" || p.split_once('@').is_some_and(|(a, m)| [a, m].iter().all(|s| *s == "*" || valid_name(s)))
+}
+
+fn sender_matches(p: &str, from: &str) -> bool {
+    p == "*"
+        || matches!((p.split_once('@'), from.split_once('@')),
+            (Some((pa, pm)), Some((a, m))) if (pa == "*" || pa == a) && (pm == "*" || pm == m))
+}
+
+/// The table that answers `mailbox`: its own, else `"*"`.
+fn table_for<'a>(boxes: &'a BTreeMap<String, Mailbox>, mailbox: &str) -> Option<&'a str> {
+    boxes.get_key_value(mailbox).or_else(|| boxes.get_key_value("*")).map(|(k, _)| k.as_str())
 }
 
 fn config_dir() -> PathBuf {
@@ -166,8 +188,11 @@ pub fn load(path: &Path) -> Result<BTreeMap<String, Mailbox>> {
     let boxes: BTreeMap<String, Mailbox> =
         toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
     for (name, m) in &boxes {
-        ensure!(valid_name(name), "bad mailbox name {name:?}");
+        ensure!(name == "*" || valid_name(name), "bad mailbox name {name:?}");
         ensure!(!m.command.is_empty(), "mailbox {name}: empty command");
+        if let Some(p) = m.from.iter().find(|p| !sender_pattern_ok(p)) {
+            bail!("mailbox {name}: bad sender {p:?} in from: use agent@machine (either side may be *), or * for anyone");
+        }
         ensure!(
             m.max_wakes_per_hour >= 1,
             "mailbox {name}: max_wakes_per_hour must be at least 1"
@@ -233,6 +258,7 @@ struct Waker {
     errs: [String; 2],
     /// Letter ids already handed to a woken session, per mailbox.
     presented: HashMap<String, HashSet<String>>,
+    /// Wake times per table: the mailboxes `"*"` answers share its budget.
     wakes: HashMap<String, VecDeque<Instant>>,
     running: HashSet<String>,
 }
@@ -270,7 +296,7 @@ impl Waker {
     async fn watch(&mut self) -> Result<()> {
         let mut sub = Client::connect(&socket_path()).await?;
         sub.call(&Request::Subscribe).await?;
-        for (name, m) in &self.boxes {
+        for (name, m) in self.boxes.iter().filter(|(n, _)| *n != "*") {
             if let Err(e) = register(name, m.about.as_deref()).await {
                 warn!("status record for {name}: {e:#}");
             }
@@ -278,7 +304,7 @@ impl Waker {
         let (done_tx, mut done_rx) = mpsc::unbounded_channel::<String>();
         let (check_tx, mut check_rx) = mpsc::unbounded_channel::<String>();
         // Mail that arrived while the waker was down.
-        for m in self.boxes.keys() {
+        for m in self.boxes.keys().filter(|n| *n != "*") {
             check_tx.send(m.clone())?;
         }
         loop {
@@ -286,7 +312,7 @@ impl Waker {
                 ev = sub.next_event() => match ev? {
                     Some(Event::Mail(ev)) => {
                         self.reread_boxes();
-                        if self.boxes.contains_key(&ev.mailbox) {
+                        if table_for(&self.boxes, &ev.mailbox).is_some() {
                             check_tx.send(ev.mailbox)?;
                         }
                     }
@@ -325,9 +351,10 @@ impl Waker {
             return Ok(());
         }
         self.reread_boxes();
-        if !self.boxes.contains_key(mailbox) {
+        let Some(table) = table_for(&self.boxes, mailbox).map(String::from) else {
             return Ok(());
-        }
+        };
+        let cfg = self.boxes[&table].clone();
         let mut c = Client::connect(&socket_path()).await?;
         let hello = c
             .call(&Request::Hello {
@@ -339,19 +366,22 @@ impl Waker {
         let address = hello["address"].as_str().unwrap_or_default().to_string();
         let unread: Vec<Letter> =
             serde_json::from_value(c.call(&Request::inbox(false)).await?)?;
-        let wake_on = self.boxes[mailbox].wake_on.clone();
         let presented = self.presented.entry(mailbox.into()).or_default();
         let fresh: Vec<Letter> = unread
             .into_iter()
             // A claim only says an answer is coming: nothing to act on.
-            .filter(|l| !presented.contains(&l.id) && wake_on.contains(&l.trust) && l.kind != Kind::Claim)
+            .filter(|l| {
+                !presented.contains(&l.id)
+                    && cfg.wake_on.contains(&l.trust)
+                    && cfg.from.iter().any(|p| sender_matches(p, &l.from))
+                    && l.kind != Kind::Claim
+            })
             .collect();
         if fresh.is_empty() {
             return Ok(());
         }
-        let cfg = self.boxes[mailbox].clone();
         if !crate::within_budget(
-            self.wakes.entry(mailbox.into()).or_default(),
+            self.wakes.entry(table).or_default(),
             cfg.max_wakes_per_hour,
             Instant::now(),
         ) {
@@ -657,6 +687,11 @@ pub(crate) fn command_args(args: &[String], prompt: &str) -> Vec<String> {
     out
 }
 
+/// Fills the `{mailbox}` placeholder with the mailbox the mail is for.
+fn mailbox_arg(args: &[String], mailbox: &str) -> Vec<String> {
+    args.iter().map(|a| if a == "{mailbox}" { mailbox.to_string() } else { a.clone() }).collect()
+}
+
 async fn wake(
     mailbox: &str,
     address: &str,
@@ -665,15 +700,17 @@ async fn wake(
     state: &Path,
 ) -> Result<()> {
     let sessions_path = state.join("sessions.json");
-    let mut sessions: HashMap<String, String> = std::fs::read(&sessions_path)
-        .ok()
-        .and_then(|b| serde_json::from_slice(&b).ok())
-        .unwrap_or_default();
+    let mut sessions: HashMap<String, String> = if cfg.resume {
+        std::fs::read(&sessions_path)
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_default()
+    } else {
+        HashMap::new()
+    };
     let mut cmd = tokio::process::Command::new(&cfg.command[0]);
-    cmd.args(command_args(&cfg.command[1..], &prompt(address, letters)));
-    if cfg.resume
-        && let Some(sid) = sessions.get(mailbox)
-    {
+    cmd.args(command_args(&mailbox_arg(&cfg.command[1..], mailbox), &prompt(address, letters)));
+    if let Some(sid) = sessions.get(mailbox) {
         cmd.args(["--resume", sid]);
     }
     let ids: Vec<&str> = letters.iter().map(|l| l.id.as_str()).collect();
@@ -694,7 +731,8 @@ async fn wake(
             )
         })??;
     info!("{address} session exited: {}", out.status);
-    if let Some(sid) = serde_json::from_slice::<serde_json::Value>(&out.stdout)
+    if cfg.resume
+        && let Some(sid) = serde_json::from_slice::<serde_json::Value>(&out.stdout)
         .ok()
         .and_then(|v| v["session_id"].as_str().map(String::from))
     {
@@ -822,6 +860,30 @@ mod tests {
             a(&["-p", "P", "--x", "y"])
         );
         assert_eq!(command_args(&a(&["-p"]), "P"), a(&["-p", "P"]));
+        assert_eq!(mailbox_arg(&a(&["prompt", "{mailbox}", "{prompt}"]), "herder"), a(&["prompt", "herder", "{prompt}"]));
+    }
+
+    #[test]
+    fn senders_and_the_star_table() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("mailboxes.toml");
+        let t = |from: &str| format!("[helper]\ndir = \"/\"\ncommand = [\"x\"]\nfrom = {from}\n[\"*\"]\ndir = \"/\"\ncommand = [\"y\"]\n");
+        std::fs::write(&p, t(r#"["claude@gw", "*@laptop", "herder@*"]"#)).unwrap();
+        let boxes = load(&p).unwrap();
+        assert_eq!(boxes["*"].from, ["*"], "the default is anyone");
+        let ok = |from: &str| boxes["helper"].from.iter().any(|p| sender_matches(p, from));
+        assert!(ok("claude@gw") && ok("x@laptop") && ok("herder@ws"));
+        assert!(!ok("claude@ws") && !ok("x@gw") && !ok("laptop"));
+        assert!(sender_matches("*", "anyone@anywhere"));
+        assert_eq!((table_for(&boxes, "helper"), table_for(&boxes, "admin"), table_for(&boxes, "zed")), (Some("helper"), Some("*"), Some("*")));
+        assert_eq!(table_for(&BTreeMap::new(), "admin"), None);
+        for bad in [r#"["claude"]"#, r#"["a@b@c"]"#, r#"["Bad@gw"]"#, r#"["@gw"]"#] {
+            std::fs::write(&p, t(bad)).unwrap();
+            let e = format!("{:#}", load(&p).unwrap_err());
+            assert!(e.starts_with("mailbox helper: bad sender"), "{e}");
+        }
+        std::fs::write(&p, "[\"a*\"]\ndir = \"/\"\ncommand = [\"x\"]\n").unwrap();
+        assert!(load(&p).is_err(), "only * itself");
     }
 
     #[test]

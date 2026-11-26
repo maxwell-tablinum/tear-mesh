@@ -9,10 +9,10 @@ Commands assume a clone at `/opt/tear-mesh`. Boundary users have private home di
 
 ## 1. Automated tests
 
-You need Rust 1.88 or later.
+You need Rust 1.89 or later.
 
 ```sh
-cargo test                  # 209 tests (145 unit, 8 in main, 5 gateway, 40 mesh, 11 talk); about 40 s
+cargo test                  # 221 tests (156 unit, 8 in main, 5 gateway, 40 mesh, 12 talk); about 40 s
 cargo build --release
 tests/e2e-linux.sh          # Linux; needs passwordless sudo, python3, curl (tmux for the menu mail checks)
 tests/e2e-0.4.sh            # Linux; the same needs; makes OS users, so use a throwaway machine
@@ -314,6 +314,66 @@ sudo -u tm-work env TEARMESH_MAILBOX=builder tearmesh inbox # alpha, within a mi
 
 `journalctl -u tearmesh-steward@tm-work` shows each wake. If the woken session can't use the tools, check the exact tool names with `/permissions` in an interactive session, and adjust `--allowedTools`.
 
+#### What mail may cause: two forms for Claude Code
+
+A mailbox's table decides what a letter can set off, and for whom. What the woken command may then do is the command's own limits. The first form below was run on the owner's mesh on 2026-11-25; the other two are examples that have not been run.
+
+**A mailbox that only answers questions.** The agent may use the tear-mesh tools, read files and run a short list of commands that change nothing. Three things hold it there: Claude Code's own allowlist, a private MCP config, and a steward service that sees the home directory read-only.
+
+```toml
+# ~/.config/tearmesh/mailboxes.toml
+[herder]
+dir = "/home/me/Coding"
+command = ["claude", "-p", "{prompt}", "--output-format", "json", "--model", "sonnet",
+           "--restricted", "--permission-mode", "dontAsk",
+           "--settings", "/home/me/.config/tearmesh/herder/settings.json",
+           "--strict-mcp-config", "--mcp-config", "/home/me/.config/tearmesh/herder/mcp.json",
+           "--append-system-prompt-file", "/home/me/.config/tearmesh/herder/role.md",
+           "--tools", "Bash,Read,Grep,Glob"]
+wake_on = ["guest", "member", "admin"]
+timeout_mins = 5
+about = "Answers questions about the repositories here. Read-only."
+```
+
+- `settings.json`: `{"permissions": {"defaultMode": "dontAsk", "allow": ["mcp__tearmesh__*", "Read(//home/me/Coding/**)", "Bash(git log:*)", "Bash(git status:*)", "Bash(ls:*)"], "deny": ["Read(**/.env*)", "Read(**/*.pem)", "Read(**/*.key)"]}}`. With `dontAsk`, anything not allowed is refused.
+- `mcp.json`: `{"mcpServers": {"tearmesh": {"command": "/usr/local/bin/tearmesh", "args": ["mcp"]}}}`.
+- `role.md`: who the agent is, what it may look at, and the exact command forms it may run (one command per call, no pipes). Without the forms, an agent whose first command is refused gives up.
+- The service, in `/etc/systemd/system/tearmesh-steward@<user>.service.d/confine.conf`:
+
+  ```ini
+  [Service]
+  ProtectSystem=strict
+  ProtectHome=read-only
+  ReadWritePaths=/home/me/.claude
+  InaccessiblePaths=-/home/me/.ssh
+  ```
+
+  Add `/home/me/.local/state/tearmesh` to `ReadWritePaths` only for a table with `resume = true`.
+
+**A mailbox that takes tasks.** The same, with a command that may act and a narrower door. `from` names who may give tasks; `wake_on` alone would open it to every agent of that trust. The mesh proves which machine a letter came from, not which agent on it: the name before the `@` is what that machine says. So name the machines you trust; a pattern such as `admin@*` lets every machine in.
+
+```toml
+[worker]
+dir = "/home/me/Coding/project"
+command = ["claude", "-p", "{prompt}", "--output-format", "json",
+           "--permission-mode", "acceptEdits", "--allowedTools", "mcp__tearmesh__*", "Bash(git:*)", "Bash(cargo:*)"]
+wake_on = ["guest", "admin"]
+from = ["claude@gw", "*@laptop"]     # the gateway machine's Claude mailbox, and anything on the owner's laptop
+max_wakes_per_hour = 6
+about = "Takes tasks in this project. Works in branches; does not push."
+```
+
+**Handing mail to sessions that are already running.** A command need not start an agent. With a table named `"*"`, every mailbox that has no table of its own runs one command, and `{mailbox}` says which mailbox the letter was for:
+
+```toml
+["*"]
+dir = "/home/me"
+command = ["/home/me/bin/to-session", "{mailbox}", "{prompt}"]   # e.g. finds the session by name and runs: herdr agent prompt <pane> "<prompt>"
+wake_on = ["admin"]
+```
+
+Whatever that command reaches then acts with its own rights, so open such a table to the fewest senders that need it.
+
 ### Screening inbound mail
 
 This needs an Anthropic API key and makes real (cheap) model calls; the automated tests use a stub instead. On beta:
@@ -379,7 +439,7 @@ python3 tests/gateway-client.py --via http://127.0.0.1:8787 https://mesh.example
 ### Add it in Claude
 
 1. In Claude (web or phone): Customize, Connectors, Add custom connector.
-2. Enter the URL from setup. Whether the client ID and secret fields are left empty has not been checked: the gateway registers clients by itself, so empty should be right, but this is unverified.
+2. Enter the URL from setup. For authentication pick the sign-in (OAuth) option, and for the OAuth client pick automatic registration with the client ID and secret left empty. Do not pick Claude's published identity, even where the dialog recommends it: the gateway does not support that method (`limit/gateway-no-cimd`). No request headers; leave the advanced settings as they are. The option names are from Anthropic's connector documentation and may be worded differently in the dialog. This worked from Claude Desktop on 2026-11-25. Authentication cannot be changed afterwards: to change it, remove the connector and add it again.
 3. Claude opens the gateway's sign-in page. It names the client. Type the passphrase. Capitals and the spacing between words do not matter. A wrong passphrase is refused and logged; there is no lockout.
 4. The connector appears in the list. The five reading tools carry the read-only hint; whether Claude asks before running them is Claude's choice, and has not been checked.
 
@@ -391,7 +451,7 @@ In a **text** chat first:
 3. "Check for the reply." Claude calls `inbox_list` (it can wait up to 30 seconds) and then `inbox_fetch`.
 4. A machine that is off: the send fails within seconds and says so. Claude may offer to queue the letter.
 
-Then try the same by **voice** on the phone. It is not known whether voice can use a custom connector at all (see below). None of these steps has been run with a real Claude client.
+Then try the same by **voice**. On 2026-11-25 these steps were run from Claude Desktop, and a voice call used the connector too (see below).
 
 ### Sign-ins
 
@@ -448,12 +508,28 @@ On the three-container test mesh, on 2026-11-25:
 - the owner removing the gateway machine, after which its messages reach nobody;
 - the same sign-in and tool calls once through a real public HTTPS tunnel (a Cloudflare quick tunnel) from another network.
 
+On the owner's own mesh, on 2026-11-25, with 0.4.0 and a Cloudflare quick tunnel:
+- Claude Desktop added the gateway as a custom connector (automatic registration) and signed in with the passphrase;
+- questions from Claude Desktop woke a read-only agent on another machine, which answered in about 10 s;
+- a voice call used the connector: it listed the nodes, read the board and the inbox, fetched a whole letter and sent messages;
+- messages Claude sent to a machine's default `admin` waited unanswered until that mailbox was given a table (0.5.0 adds a note to the reply for that case).
+
+On three throwaway containers with systemd, on 2026-11-26, starting from the published 0.4.0 (the 0.5.0 build and a stand-in "0.5.1" were served from a fourth container with `TEARMESH_RELEASE_URL`):
+- 0.4.0 installed with the release's install line, a mesh created, two machines joined;
+- each machine brought to 0.5.0 with the install line: the node id and the mesh kept, the updater's timer enabled; mail both ways between a 0.5.0 and a 0.4.0 machine; `status --ping` showed a version for 0.5 machines and none for 0.4.0;
+- `update --check` against GitHub (`newest release: 0.4.0`);
+- `update` refused a binary with a changed byte, an older version and a caller without root; of two started at once, one installed and the other said `another update is running on this machine`; the lock file was mode 0600 and another user could not take it; the work folder was gone afterwards;
+- mailbox rules: a listed sender woke the mailbox, an unlisted machine and an unlisted agent did not; a `"*"` table woke for two other mailboxes with `{mailbox}` filled in and refused the third on its budget of 2 an hour; no `sessions.json` was written;
+- `mesh set release 0.5.1`: a 0.5.0 machine took the file and its updater's timer installed 0.5.1 by itself at its next run, after which the daemon, the steward and a stand-in unit named `tearmesh-gateway` ran from the new program; a 0.4.0 machine refused the file, stayed at the version before and kept exchanging mail, and after its upgrade by hand took the file and updated the same way;
+- `uninstall` after an update left none of the installed files, the updater's units, the lock or the work folder.
+
 ### Never tested
 
-- A real Claude client (web, phone, voice or Desktop) against the gateway.
-- Whether voice chat can call a custom connector at all.
+- Claude on the web against the gateway.
 - Whether Claude calls a tool again by itself during a call, or only when you speak. The gateway is built for either answer (`inbox_list` can wait).
 - A real Windows machine (see Windows below), Claude Desktop with the unsigned `.mcpb` bundle, and aarch64.
+- Anything 0.5.0 added on Windows: the updater's scheduled task, the swap of a running program, the restart of steward tasks. It compiles for Windows and has not run there.
+- `update` from GitHub to a release newer than the installed one (0.4.0 is the only release), the updater under a gateway that is really running, and the menu's new Permissions box with a person at a terminal.
 
 `docs/research/x2-spike/README.md` is a five-minute test for both, with a throwaway server and no tear-mesh. Write the answers into `docs/spec.md` at `open/voice-polling`.
 
@@ -533,6 +609,24 @@ The test users' commands run as scheduled tasks, because `Start-Process -Credent
 WSL2 still works, as for any Linux machine. The gateway needs Linux; the Claude Desktop extension is for Windows (see above).
 
 ## Upgrading
+
+**From 0.5 on: `tearmesh update`.**
+
+```sh
+tearmesh update --check                # anyone: installed, newest release, what the mesh names
+sudo tearmesh update                   # this machine, to the newest release
+sudo tearmesh update --to 0.5.1        # or to a named one; never to an older one
+tearmesh mesh set release 0.5.1        # owner node: every machine installs it by itself
+tearmesh status --ping                 # each machine's version
+systemctl list-timers tearmesh-update.timer   # when this machine's updater runs next
+journalctl -u tearmesh-update          # what it did
+```
+
+Update the owner node first, look that it works, then name the release. Each machine's updater runs every 15 minutes, so the others follow within that time of receiving the file. To keep one machine out: `sudo systemctl disable --now tearmesh-update.timer` (Windows: `Disable-ScheduledTask tearmesh-update`). OpenRC machines have no updater: run `sudo tearmesh update` there.
+
+To try an update without publishing a release, serve a folder that holds the binary under its release name and a `SHA256SUMS` (`sha256sum tearmesh-x86_64-linux > SHA256SUMS`), and point at it: `sudo env TEARMESH_RELEASE_URL=http://host:8765/folder tearmesh update`. The updater's service starts without that variable; for a test give it one with a drop-in (`Environment=TEARMESH_RELEASE_URL=…` in `/etc/systemd/system/tearmesh-update.service.d/test.conf`, then `systemctl daemon-reload`). Things to check: a binary with a byte added is refused (`checksum mismatch: not installing`) and nothing changes; an older or equal version gives `already at …`; two updates at once, where the second says `another update is running on this machine`; and afterwards `tearmesh --version`, the same node id and mesh in `tearmesh status`, and stewards and the gateway running from the new program.
+
+**From 0.4.0.** 0.4.0 has no `update` and no updater. Bring each machine to 0.5 once with the install line of the new release, with the machine's own name and no ticket (`curl -fsSL …/v<VER>/install.sh | sudo sh -s -- <name>`; Windows: the `install.ps1` line). It keeps the node id and the mesh and adds the updater. Do this on every machine before you name a release: a 0.4.0 machine refuses a membership file that names one (its log says `unknown field \`release\``), stays at the version before and still exchanges mail, but takes no later change until it is upgraded.
 
 **From 0.3.** Run `tearmesh install` with the 0.4 binary on each machine. It keeps the node id and the mesh. Upgrade every machine before agents use status records or claims: a 0.3 machine rejects those two new kinds of letter (its log shows ``unknown variant `status` ``) and then takes nothing more from that author until it is upgraded. After the upgrade it catches up by itself (checked on the test mesh).
 

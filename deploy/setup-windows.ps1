@@ -9,7 +9,8 @@
 # New users get random passwords, stored in C:\ProgramData\tearmesh\passwords.txt, which only SYSTEM
 # and Administrators can read (not the service). `tearmesh launch` (runas) asks for them.
 # -Stewards registers a steward per boundary user: a scheduled task that starts at boot as that user.
-# -Uninstall removes the service, the stewards, the firewall rule and C:\ProgramData\tearmesh, and
+# The updater is the scheduled task tearmesh-update: `tearmesh update --mesh` as SYSTEM every 15 minutes.
+# -Uninstall removes the service, the stewards, the updater, the firewall rule and C:\ProgramData\tearmesh, and
 # deletes the users of the boundaries given, with their profiles.
 #
 # The pipe accepts local callers only, including SSH sessions on this machine; other machines are
@@ -80,7 +81,7 @@ if ($Uninstall) {
     Stop-Service $Service -Force -ErrorAction SilentlyContinue
     sc.exe delete $Service | Out-Null
   }
-  Get-ScheduledTask -TaskName 'tearmesh-steward-*' -ErrorAction SilentlyContinue | ForEach-Object {
+  Get-ScheduledTask -TaskName 'tearmesh-steward-*', 'tearmesh-update' -ErrorAction SilentlyContinue | ForEach-Object {
     Stop-ScheduledTask -InputObject $_ -ErrorAction SilentlyContinue
     Unregister-ScheduledTask -InputObject $_ -Confirm:$false
   }
@@ -111,9 +112,10 @@ if (-not (Test-Path $Exe)) { throw "no binary at $Exe (pass -Exe)" }
 if (Get-Service $Service -ErrorAction SilentlyContinue) { Stop-Service $Service -Force }
 New-Item -ItemType Directory -Force $ProgramDir | Out-Null
 if ((Resolve-Path $Exe).Path -ne $Bin) {
-  # A running exe can be renamed but not overwritten (a hub or steward may still use it).
-  Remove-Item "$Bin.old" -Force -ErrorAction SilentlyContinue
-  if (Test-Path $Bin) { Move-Item $Bin "$Bin.old" -Force }
+  # A running exe can be renamed but not overwritten or deleted (a hub or steward may still use
+  # it), so each swap gets a name of its own, and older ones go once nothing runs from them.
+  Remove-Item "$Bin.old*" -Force -ErrorAction SilentlyContinue
+  if (Test-Path $Bin) { Move-Item $Bin "$Bin.old-$PID" -Force }
   Copy-Item $Exe $Bin -Force
 }
 # So `tearmesh` (and the Claude Code plugin's command) works in new prompts.
@@ -173,6 +175,18 @@ if (-not (Get-NetFirewallRule -Name tearmesh-udp -ErrorAction SilentlyContinue))
     -Program $Bin -Action Allow -Profile Private, Domain | Out-Null
 }
 Start-Service $Service
+# Stewards started from the old binary run the new one.
+Get-ScheduledTask -TaskName 'tearmesh-steward-*' -ErrorAction SilentlyContinue | Where-Object State -eq 'Running' | ForEach-Object {
+  Stop-ScheduledTask -InputObject $_
+  Start-ScheduledTask -InputObject $_
+}
+# Registered once: re-registering could stop the update that is running this script.
+if (-not (Get-ScheduledTask -TaskName 'tearmesh-update' -ErrorAction SilentlyContinue)) {
+  $every = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(5) -RepetitionInterval (New-TimeSpan -Minutes 15)
+  Register-ScheduledTask -TaskName 'tearmesh-update' -Action (New-ScheduledTaskAction -Execute $Bin -Argument 'update --mesh') `
+    -Trigger $every -User 'NT AUTHORITY\SYSTEM' -RunLevel Highest `
+    -Settings (New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew) | Out-Null
+}
 
 if ($Stewards) {
   $sids = @()

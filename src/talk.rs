@@ -276,7 +276,7 @@ impl Talk {
             tool(
                 "board_post",
                 "Post to the board",
-                "Posts a message to the board, where every agent in your boundary can read it. Use it for news everyone should see; to ask one agent, use `send_message`. Returns {id, state}.",
+                "Posts a message to the board, where every agent in your boundary can read it when it next looks. A post wakes no agent: use it for news everyone should see, and send a message meant for one agent with `send_message`. Returns {id, state}.",
                 input::<BoardPostArgs>(),
                 false,
             ),
@@ -488,12 +488,16 @@ impl Talk {
             _ => return Err("if_offline is fail or queue".into()),
         };
         // Built first, so bad arguments are refused before anything is asked of the network.
+        let mut note = None;
         let (to, nodes) = match (&a.to, &a.reply_to) {
-            (Some(to), _) => {
+            (Some(to), reply_to) => {
                 let (agent, node) = resolve(to)?;
                 let who = self.who().await?;
                 machine(&who, &node)?;
                 known(&who, &agent, &node)?;
+                if reply_to.is_none() {
+                    note = unannounced(&who, &agent, &node);
+                }
                 (vec![format!("{agent}@{node}")], vec![node])
             }
             (None, Some(id)) => {
@@ -548,7 +552,11 @@ impl Talk {
         } else {
             "sent"
         };
-        Ok(json!({ "id": r["id"], "state": state }))
+        let mut out = json!({ "id": r["id"], "state": state });
+        if let Some(n) = note {
+            out["note"] = n.into();
+        }
+        Ok(out)
     }
 
     async fn listing(
@@ -713,6 +721,29 @@ fn known(who: &Who, agent: &str, node: &str) -> Result<(), String> {
     }
 }
 
+/// For a new message to an address with no status record that no session here holds: who on
+/// that node has one, since a person may be the only reader.
+fn unannounced(who: &Who, agent: &str, node: &str) -> Option<String> {
+    let address = format!("{agent}@{node}");
+    if who.status.iter().any(|s| s.address == address) || who.held.contains(&address) {
+        return None;
+    }
+    let mut with: Vec<&str> = who
+        .status
+        .iter()
+        .filter_map(|s| s.address.split_once('@'))
+        .filter(|(_, n)| *n == node)
+        .map(|(a, _)| a)
+        .collect();
+    with.sort();
+    let others = if with.is_empty() {
+        format!("No agent on {node} has one.")
+    } else {
+        format!("Agents on {node} with one: {}", with.join(", "))
+    };
+    Some(format!("{address} has no status record: a person may read this later, in the menu. {others}"))
+}
+
 /// The known agents of a node (or one of them), each with its status record's fields.
 fn agents_json(who: &Who, node: &str, only: Option<&str>) -> Vec<Value> {
     agents_on(who, node)
@@ -826,6 +857,7 @@ mod tests {
                 .map(|n| PeerInfo { name: n.to_string(), this_machine: *n == "ws", ..Default::default() })
                 .collect(),
             addresses: vec!["builder@ws".into(), "herder@laptop".into()],
+            held: vec!["builder@ws".into()],
             status: vec![AgentStatus {
                 address: "scout@laptop".into(),
                 about: Some("reads papers".into()),
@@ -855,6 +887,13 @@ mod tests {
             "no agent \"y\" is known on laptop; agents there: admin, herder, scout"
         );
         assert_eq!(machine(&w, "x").unwrap_err(), "no node \"x\" in this boundary; nodes: ws, laptop");
+        assert_eq!(
+            unannounced(&w, "admin", "laptop").unwrap(),
+            "admin@laptop has no status record: a person may read this later, in the menu. Agents on laptop with one: scout"
+        );
+        assert_eq!(unannounced(&w, "scout", "laptop"), None);
+        assert_eq!(unannounced(&w, "builder", "ws"), None, "held here");
+        assert!(unannounced(&w, "admin", "ws").unwrap().ends_with("No agent on ws has one."));
         let a = agents_json(&w, "laptop", Some("scout"));
         assert_eq!(a, [json!({"address": "scout@laptop", "about": "reads papers", "updated": "1970-01-01T00:00:00Z"})]);
     }

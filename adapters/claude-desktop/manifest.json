@@ -2,7 +2,7 @@
   "manifest_version": "0.3",
   "name": "tearmesh",
   "display_name": "tear-mesh",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "Gives Claude Desktop the tools of your tear-mesh hub by running the tear-mesh already installed on this PC. It holds no copy of tear-mesh.",
   "author": {
     "name": "tear-mesh contributors"

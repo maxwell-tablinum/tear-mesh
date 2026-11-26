@@ -79,6 +79,19 @@ enum Cmd {
         #[arg(long)]
         yes: bool,
     },
+    /// Install a newer release in place (admin): the newest, the one --to names, or with --mesh the
+    /// one the membership file names (what the updater runs). --check only looks, and needs no rights.
+    Update {
+        /// This release (like 0.5.1) instead of the newest. Never an older one than installed.
+        #[arg(long, value_name = "VERSION", conflicts_with = "mesh")]
+        to: Option<String>,
+        /// The release the membership file names, when it is newer; otherwise do nothing.
+        #[arg(long)]
+        mesh: bool,
+        /// Print the installed version, the newest release and the mesh's, and what to run.
+        #[arg(long, conflicts_with_all = ["to", "mesh"])]
+        check: bool,
+    },
     /// The membership file: machines, grants, approvals, owners (admin).
     #[command(subcommand)]
     Mesh(MeshCmd),
@@ -271,8 +284,8 @@ enum MeshCmd {
         #[command(flatten)]
         edit: Edit,
     },
-    /// Let FROM act on TO (FROM speaks, TO listens): converse, tools, shell. `*` matches any
-    /// machine (not for shell).
+    /// Let FROM do these on TO: mail (`converse` in the file; both words work), tools, shell. `*`
+    /// matches any machine (not for shell).
     Grant {
         from: String,
         to: String,
@@ -310,7 +323,7 @@ enum MeshCmd {
         edit: Edit,
     },
     /// Change a mesh-wide setting: tools-sharing (approval|free), relays (n0|none|URL,URL),
-    /// lookup (n0-dns,mdns).
+    /// lookup (n0-dns,mdns), release (a version like 0.5.1 that every machine installs, or none).
     Set {
         setting: String,
         value: String,
@@ -659,6 +672,8 @@ async fn run(cmd: Option<Cmd>) -> Result<()> {
             }
         }
         Cmd::Uninstall { boundaries, keep_users, yes } => uninstall(boundaries, keep_users, yes).await?,
+        Cmd::Update { check: true, .. } => tearmesh::update::check().await?,
+        Cmd::Update { to, mesh, .. } => tearmesh::update::run(to.as_deref(), mesh).await?,
         Cmd::Join { cancel: true, .. } => {
             let v = admin(Request::JoinCancel).await?;
             println!("{}", if v["cancelled"] == true { "cancelled" } else { "no join was running" });
@@ -791,7 +806,7 @@ async fn run(cmd: Option<Cmd>) -> Result<()> {
                     }
                     println!("{} flagged, {} waiting for the screener", flagged.len(), v["waiting"]);
                     println!(
-                        "To block a sender, on the owner node: tearmesh mesh revoke <sender's machine> <this machine> converse"
+                        "To block a sender, on the owner node: tearmesh mesh revoke <sender's machine> <this machine> mail"
                     );
                 }
                 Some(QuarantineCmd::Release { id }) => {
@@ -1122,11 +1137,7 @@ async fn mesh_cmd(cmd: MeshCmd) -> Result<()> {
             categories,
             edit: e,
         } => {
-            edit(e, |m| {
-                m.grant(&from, &to, &categories);
-                Ok(())
-            })
-            .await?
+            edit(e, |m| change(m, Change::Grant(Grant { from, to, allow: categories }))).await?
         }
         MeshCmd::Revoke {
             from,

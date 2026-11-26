@@ -21,21 +21,23 @@ const PLUGIN: [(&str, &str); 4] = [
 
 /// The deploy script and the files it installs, as (path beside it, text).
 #[cfg(not(windows))]
-const SCRIPT: [(&str, &str); 4] = [
+const SCRIPT: [(&str, &str); 6] = [
     ("setup-linux.sh", include_str!("../deploy/setup-linux.sh")),
     ("tearmesh.service", include_str!("../deploy/tearmesh.service")),
     ("tearmesh-steward@.service", include_str!("../deploy/tearmesh-steward@.service")),
+    ("tearmesh-update.service", include_str!("../deploy/tearmesh-update.service")),
+    ("tearmesh-update.timer", include_str!("../deploy/tearmesh-update.timer")),
     ("openrc/tearmesh", include_str!("../deploy/openrc/tearmesh")),
 ];
 #[cfg(windows)]
 const SCRIPT: [(&str, &str); 1] = [("setup-windows.ps1", include_str!("../deploy/setup-windows.ps1"))];
 
 #[cfg(not(windows))]
-const CONFIG: &str = "/etc/tearmesh/config.toml";
+pub(crate) const CONFIG: &str = "/etc/tearmesh/config.toml";
 #[cfg(windows)]
-const CONFIG: &str = r"C:\ProgramData\tearmesh\config.toml";
+pub(crate) const CONFIG: &str = r"C:\ProgramData\tearmesh\config.toml";
 
-fn plugin_dir() -> PathBuf {
+pub(crate) fn plugin_dir() -> PathBuf {
     #[cfg(windows)]
     return PathBuf::from(std::env::var("ProgramFiles").unwrap_or_else(|_| r"C:\Program Files".into())).join("tearmesh");
     #[cfg(not(windows))]
@@ -299,7 +301,7 @@ pub fn one_liners(ticket: &str, name: Option<&str>) -> [String; 2] {
 
 /// `over` as a folder URL, trailing slash trimmed: http(s) and only characters that need no
 /// quoting in a shell or PowerShell. Anything else is None.
-fn release_url(over: &str) -> Option<&str> {
+pub(crate) fn release_url(over: &str) -> Option<&str> {
     let ok = over.bytes().all(|c| c.is_ascii_alphanumeric() || b"._:/~%+-".contains(&c));
     let u = over.trim_end_matches('/');
     let host = u.strip_prefix("https://").or_else(|| u.strip_prefix("http://"))?;
@@ -435,9 +437,9 @@ pub fn elevated(args: &[&str]) -> Result<()> {
 
 /// What uninstall removes, besides users, for its confirmation.
 #[cfg(not(windows))]
-pub const REMOVES: &str = "the tearmesh service and its user, /usr/local/bin/tearmesh, the plugin (/usr/local/share/tearmesh), /etc/tearmesh, the state with every mail log (/var/lib/tearmesh), the gateway if there is one (its service, its user tm-<boundary>-gw and /var/lib/tearmesh-gateway)";
+pub const REMOVES: &str = "the tearmesh service, its updater and its user, /usr/local/bin/tearmesh, the plugin (/usr/local/share/tearmesh), /etc/tearmesh, the state with every mail log (/var/lib/tearmesh), the gateway if there is one (its service, its user tm-<boundary>-gw and /var/lib/tearmesh-gateway)";
 #[cfg(windows)]
-pub const REMOVES: &str = r"the tearmesh service, the steward tasks, C:\Program Files\tearmesh, C:\ProgramData\tearmesh (the config and the state with every mail log)";
+pub const REMOVES: &str = r"the tearmesh service, the steward tasks, the updater task, C:\Program Files\tearmesh, C:\ProgramData\tearmesh (the config and the state with every mail log)";
 
 /// Returns whether it added users to an existing config. `me`: also map the person's own OS
 /// user to that boundary.

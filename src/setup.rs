@@ -87,7 +87,7 @@ pub fn find_owner_keys_in(home: &Path, owners: &[String]) -> Vec<PathBuf> {
         .map(|e| e.path())
         .filter(|p| p.extension().is_none_or(|x| x != "pub"))
         .filter(|p| {
-            fingerprint_of(&pub_path(p)).is_some_and(|f| owners.iter().any(|o| *o == f))
+            fingerprint_of(&pub_path(p)).is_some_and(|f| owners.contains(&f))
         })
         .collect();
     out.sort();

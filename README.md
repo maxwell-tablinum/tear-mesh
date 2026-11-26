@@ -7,7 +7,7 @@ A peer-to-peer mesh that connects the apps and agents on your own machines, not 
 
 All of it is encrypted app to app over [iroh](https://iroh.computer), with no VPN and no public endpoint, under permissions you sign with an ordinary SSH key. Every machine keeps each **boundary**'s data inside that boundary. The daemon and the operating system enforce that, never a model's judgment.
 
-**Status: 0.4.0, early.** It runs on Linux (systemd or OpenRC; one static binary for any distribution) and natively on Windows. How every part behaves, and what is still undecided, is in the specification: [docs/spec.md](docs/spec.md). 0.3 added `tearmesh menu` (bare `tearmesh` opens it), where you create, join and approve without leaving it, `tearmesh install` and the MCP hub. 0.4 renames and extends the MCP tools, adds agent status and claims, replaces the old Claude connector with the gateway, and adds a Claude Desktop extension (see below). Every machine of a mesh must run 0.4 before agents use status records or claims: a 0.3 machine rejects those two new kinds of letter (its log says ``unknown variant `status` ``) and then takes nothing more from that author until it is upgraded; after the upgrade it catches up by itself. Upgrading in place keeps the node id and the mesh. The project stays at 0.x until the maintainers declare it launched.
+**Status: 0.5.0, early.** It runs on Linux (systemd or OpenRC; one static binary for any distribution) and natively on Windows. How every part behaves, and what is still undecided, is in the specification: [docs/spec.md](docs/spec.md). 0.3 added `tearmesh menu` (bare `tearmesh` opens it), where you create, join and approve without leaving it, `tearmesh install` and the MCP hub. 0.4 renames and extends the MCP tools, adds agent status and claims, replaces the old Claude connector with the gateway, and adds a Claude Desktop extension (see below). Every machine of a mesh must run 0.4 before agents use status records or claims: a 0.3 machine rejects those two new kinds of letter (its log says ``unknown variant `status` ``) and then takes nothing more from that author until it is upgraded; after the upgrade it catches up by itself. Upgrading in place keeps the node id and the mesh. 0.5 names the three channels mail, tools and shell and lets configuration decide what each can cause, reworks the permissions screen, and adds `tearmesh update` with an updater on every machine that follows the release the owner names. 0.4 and 0.5 machines share a mesh until the membership file names a release. The project stays at 0.x until the maintainers declare it launched.
 
 **About the name:** in intelligence reporting, a *tear line* separates the classified part of a document from a cleaned-up summary that can be torn off and shared at a lower clearance. The hyphen in tear-mesh is that line.
 
@@ -44,15 +44,15 @@ Some overlap is real: machine bios resemble A2A Agent Cards and MCP registry met
 - **Dissolving a mesh.** `tearmesh mesh dissolve` signs a last version with no machines, after which nothing can follow. It hands that version to the machines it can reach; the rest fetch it on their next sync. Each machine then shows the mesh as dissolved. When you create or join another mesh, or run `tearmesh mesh leave` or `mesh reset`, it moves the old logs to `boundaries-<mesh id>/` (kept, not deleted), and it never adopts that mesh again. Upgrade every machine first: builds from before 2026-11-12 (they also call themselves 0.3.0) can't read the closed version.
 - **A boundary is an OS user.** Each boundary on a machine has its own user (`tm-work`, `tm-vault`). The daemon learns a session's boundary from the OS (`SO_PEERCRED` on Linux; the pipe client's token on Windows), so a session can't claim another one.
 - **One log per boundary.** Each boundary has an append-only SQLite file, synced only with machines that host that boundary. Moving information between boundaries is a person's job.
-- **Permissions are three categories, each in two directions, per pair of machines.** A machine *speaks* a category to another machine (acts on it) and *listens* to it (accepts the same from it):
+- **Three channels, per pair of machines and per direction.** Everything one machine does on another goes through one of them. No kind of request has a feature of its own: a use is a channel plus configuration on the machine it reaches.
 
-  | Category | speak: this machine… | listen: this machine… |
+  | Channel | Carries | What it can cause on the other machine is decided by |
   |---|---|---|
-  | `converse` | posts notes to that machine | accepts notes from that machine |
-  | `tools` | calls the MCP servers that machine offers | accepts tool calls from that machine |
-  | `shell` | drives that machine, with anything its SSH login can do | can be driven by that machine |
+  | **mail** (`converse` in the file) | letters to mailboxes: notes, questions, tasks, alerts, answers | that mailbox's configuration there: what answers it and for which senders (see *Wake on mail*), or the live session that holds it |
+  | **tools** | calls to the MCP servers that machine shares | the server, and the owner's approval of its tool list |
+  | **shell** | an SSH connection | the SSH login there |
 
-  An action from A to B needs A to speak it to B and B to listen to it from A. The membership file holds the pair as one grant, `A → B`, which both daemons check, so a switch can't be half on. An owner node usually speaks `shell` and never listens to it: it drives other machines and can't be driven. In the menu, **Mesh → G** on a machine's row shows the six switches between it and this machine, and signs everything you change at once.
+  The membership file holds each permission as one grant, `A → B`: A may do that on B. Both daemons check it, so a switch can't be half on. An owner node usually has shell on other machines and gives none on itself. In the menu, **Mesh → G** on a machine's row says in words what this machine may do there and what that machine may do here, and signs everything you change at once; removing a tick revokes. The **All machines** row sets mail and tools for every machine, also those that join later.
 
   Grants are deny by default. A new mesh starts with mail allowed among all machines; tools and shell need explicit grants, and shell grants must name both machines. Grants are checked at both ends. They never widen a boundary: a `work` session reaches only `work` tools.
 - **Offers.** A machine shares an MCP server by publishing an offer that pins the server's instructions and exact tool list. By default the owner approves each offer, optionally only some of its tools.
@@ -103,7 +103,7 @@ Not covered:
 
 ## Quick start (Linux)
 
-On **each machine**, install the release with one OS user per boundary the machine hosts (`<VER>` is the release, e.g. `0.4.0`):
+On **each machine**, install the release with one OS user per boundary the machine hosts (`<VER>` is the release, e.g. `0.5.0`):
 
 ```sh
 curl -fsSL https://github.com/maxwell-tablinum/tear-mesh/releases/download/v<VER>/install.sh | sudo sh -s -- workstation work vault
@@ -116,7 +116,9 @@ The releases are listed at <https://github.com/maxwell-tablinum/tear-mesh/releas
 
 Or by hand: download the binary and `SHA256SUMS`, then `grep ' tearmesh-x86_64-linux$' SHA256SUMS | sha256sum -c`, `chmod +x tearmesh-x86_64-linux`, `sudo ./tearmesh-x86_64-linux install workstation work vault` (add `--join <ticket>` to join too). Or run `./tearmesh-x86_64-linux` as yourself: on a machine without tear-mesh the menu opens its Install form (the hostname and `work` filled in) and runs the install through sudo.
 
-`install` puts the binary at `/usr/local/bin/tearmesh`, creates the `tearmesh` daemon user and `tm-work`/`tm-vault`, writes `/etc/tearmesh/config.toml` (making you an admin), installs the Claude Code plugin under `/usr/local/share/tearmesh`, and starts the service (systemd or OpenRC). The machine name defaults to the hostname, and boundaries are optional: `sudo tearmesh install` alone installs a machine whose boundaries the owner picks when it joins (`tearmesh status` lists those with no OS user yet under `unmapped`). Add `--me <boundary>` to also map your own OS user to a boundary, so agents you run as yourself (and Claude Desktop) are its sessions. Run it again to upgrade or to add boundaries; with no name it keeps the installed one. `sudo tearmesh uninstall` removes it all (the gateway too, if there is one), with the users it made, after telling the other machines this one is leaving (they list it under `leaving` until the owner node removes it); on an owner node it suggests `tearmesh mesh dissolve` first, and it never touches the keys in `~/.ssh`. From source: `cargo build --release` (Rust 1.88+), then `sudo target/release/tearmesh install …`.
+`install` puts the binary at `/usr/local/bin/tearmesh`, creates the `tearmesh` daemon user and `tm-work`/`tm-vault`, writes `/etc/tearmesh/config.toml` (making you an admin), installs the Claude Code plugin under `/usr/local/share/tearmesh`, and starts the service (systemd or OpenRC). The machine name defaults to the hostname, and boundaries are optional: `sudo tearmesh install` alone installs a machine whose boundaries the owner picks when it joins (`tearmesh status` lists those with no OS user yet under `unmapped`). Add `--me <boundary>` to also map your own OS user to a boundary, so agents you run as yourself (and Claude Desktop) are its sessions. Run it again to upgrade or to add boundaries; with no name it keeps the installed one. `sudo tearmesh uninstall` removes it all (the gateway too, if there is one), with the users it made, after telling the other machines this one is leaving (they list it under `leaving` until the owner node removes it); on an owner node it suggests `tearmesh mesh dissolve` first, and it never touches the keys in `~/.ssh`. From source: `cargo build --release` (Rust 1.89+), then `sudo target/release/tearmesh install …`.
+
+**Updating.** `sudo tearmesh update` installs the newest release in place, keeping the machine's identity and its mesh; `tearmesh update --check` only looks. To update every machine of a mesh, name the release once on the owner node: `tearmesh mesh set release <VER>`. Each machine has an updater (a systemd timer; a scheduled task on Windows) that installs the release the mesh names, usually within 20 minutes, and `tearmesh status --ping` shows each machine's version. The updater downloads from this project's releases, refuses a binary whose SHA-256 is not the one in the release's `SHA256SUMS`, and never installs an older version than the one that runs. To keep a machine out of it: `sudo systemctl disable --now tearmesh-update.timer`. OpenRC machines have no updater, and a 0.4.0 machine has none either: bring it to 0.5 once with the install line above (its own name, no ticket).
 
 Everything else happens in **`tearmesh menu`**, without leaving it. It has three screens: **Mesh** (a summary, a live map and the machines, with join requests on top on the owner node), **Mail** (read and write letters) and **Settings** (the mesh's settings, the owner keys, the MCP hub, and the event and daemon logs). On Mesh, **U** adds boundaries through sudo (or UAC) when this machine hosts none yet or the mesh has it host one with no OS user here, and **Settings → X** uninstalls (the menu closes afterwards, since its binary goes too). Arrow keys or the keypad move, Enter picks, Esc goes back, `?` lists the keys, and a nano-style bar shows them:
 
@@ -188,8 +190,11 @@ command = ["claude", "-p", "{prompt}", "--output-format", "json",
            "--allowedTools", "mcp__plugin_tearmesh_tearmesh__*"]
 max_wakes_per_hour = 6        # default
 wake_on = ["member", "admin"] # default; add "guest" to wake on letters from the owner's Claude (the gateway)
+# from = ["*@laptop", "claude@gw"]   # only these senders wake it; default: every sender
 about = "Answers questions about the project."   # shown to others in list_nodes; default "Woken when mail arrives."
 ```
+
+A mailbox's table is where you decide what mail can cause on this machine. The command can start an agent that only reads, one that may change things, or a program that is no agent at all (one that sends a push message, or `herdr agent prompt <session> {prompt}` to hand the letter to a session that is already running). `wake_on` and `from` say who may set it off; of a sender's address the mesh proves the machine, not the agent's name, so `from` is as strong as the machines it names. A table named `"*"` answers every mailbox that has no table of its own, and `{mailbox}` in a command is the mailbox the letter was for. What the woken command may do is its own business, not tear-mesh's: its permission settings, the user it runs as, the confinement of the steward's service. [docs/testing.md](docs/testing.md#wake-on-mail) has a read-only form and a task-taking form for Claude Code.
 
 **Screening inbound mail (the honeypot reader).** Letters from other machines can carry prompt injections. With screening on, every letter that reaches a boundary from another machine (or from a guest, through the gateway) waits until a cheap model has read it. The model's only job is a one-line summary, and it holds only decoy tools: run a shell command, delete files, send a file. None of them does anything. A letter that gets the model to reach for one is quarantined: no session, hook, wake or MCP tool on this machine shows it until an admin releases it.
 
@@ -218,7 +223,7 @@ These three take an admin: the list quotes the sender's subject and what the rea
 - With screening on and no working screener (no key, no network, the API down), letters wait. They are never shown unscreened. A letter the model API refuses to read goes to quarantine, so it can't hold up the ones behind it.
 - Screening starts with the mail that arrives after you turn it on. Letters already in the log stay readable and aren't sent to the model.
 - Letters written on this machine by its own sessions aren't held. Offers and bios aren't screened.
-- To block a sender, on the owner node: `tearmesh mesh revoke <sender's machine> <this machine> converse`.
+- To block a sender, on the owner node: `tearmesh mesh revoke <sender's machine> <this machine> mail`.
 - `tearmesh status` and the menu show, per screened boundary, how many letters wait and how many are flagged, and warn when `screen` names a boundary this machine doesn't host.
 
 Know its limits:
@@ -235,7 +240,7 @@ Know its limits:
 - It offers conversation only: the seven conversation tools, no tools and no shell. Its letters come from `claude@<machine>`, marked `guest`. They wake a mailbox only if its `wake_on` lists `guest`.
 - Everything that passes through it is visible to the gateway, the tunnel's operator and Anthropic, so keep secret boundaries away from it.
 
-The steps are in [docs/testing.md](docs/testing.md#the-gateway); `tests/gateway-client.py` stands in for Claude there, so you can try it without Claude. The 0.2 and 0.3 connector (`tearmesh mcp --http`) is gone. **Never tested:** a real Claude client (web, phone, voice or Desktop) against the gateway, and whether voice can call a custom connector at all. It was tried with the stand-in client, including once through a public HTTPS tunnel from another network.
+The steps are in [docs/testing.md](docs/testing.md#the-gateway); `tests/gateway-client.py` stands in for Claude there, so you can try it without Claude. The 0.2 and 0.3 connector (`tearmesh mcp --http`) is gone. **Tried by hand** on 2026-11-25 with 0.4.0: Claude Desktop added the gateway as a custom connector through a public tunnel, signed in with the passphrase and used the tools, and a voice call used them too (listing nodes, reading the board and the inbox, fetching a whole letter, sending a message). **Not tried:** Claude on the web, and whether Claude calls a tool again by itself during a voice call.
 
 **Claude Desktop (Windows).** The extension `tearmesh.mcpb` gives Desktop the hub's tools with no gateway. It runs the installed `tearmesh mcp connect`. Install tear-mesh with `--me <boundary>`, then add the file under Settings, Extensions. The file is not signed, so Desktop warns at install, and it has not been tried with Claude Desktop. See [adapters/claude-desktop/README.md](adapters/claude-desktop/README.md).
 
@@ -243,7 +248,7 @@ The steps are in [docs/testing.md](docs/testing.md#the-gateway); `tests/gateway-
 
 ## Windows
 
-tear-mesh runs natively on Windows. Earlier versions were tested on Windows Server 2022; nobody has used 0.3 or 0.4.0 on a real Windows machine yet. The release workflow installs the 0.4.0 build on a Windows Server runner through `install.ps1`, sees the service running and uninstalls it. A GNU cross-build of 0.4.0 was also smoke-tested under Wine: the daemon starts on a named pipe and the stdio mail server lists its ten tools. Windows 10 and 11 use the same APIs but haven't been tested.
+tear-mesh runs natively on Windows. Earlier versions were tested on Windows Server 2022; nobody has used 0.3 or 0.4.0 on a real Windows machine yet. The release workflow installs each release's build on a Windows Server runner through `install.ps1`, sees the service running and uninstalls it. A GNU cross-build of 0.4.0 was also smoke-tested under Wine: the daemon starts on a named pipe and the stdio mail server lists its ten tools. Windows 10 and 11 use the same APIs but haven't been tested.
 
 - The local socket is a named pipe, and a session's boundary is its Windows account. The daemon identifies a caller by impersonating it.
 - The daemon runs as a service under the virtual account `NT SERVICE\tearmesh`.
@@ -288,7 +293,7 @@ Mesh-wide settings live in the membership file. Change them with `tearmesh mesh 
 ## Tests
 
 [docs/testing.md](docs/testing.md) has the full walkthrough.
-- `cargo test` (209 tests: 145 unit, 8 in main, 5 gateway, 40 mesh, 11 talk): unit tests and in-process mesh tests over real iroh connections. They cover placement, membership, revocation, the version chain and split healing, ticket joins, converse, tool and shell grants, and carrying a 0.1 circle over.
+- `cargo test` (221 tests: 156 unit, 8 in main, 5 gateway, 40 mesh, 12 talk): unit tests and in-process mesh tests over real iroh connections. They cover placement, membership, revocation, the version chain and split healing, ticket joins, converse, tool and shell grants, and carrying a 0.1 circle over.
 - `tests/e2e-linux.sh`: two daemons with real OS users. It covers the ticket join, a tool call through the steward, shell, bios, the mail server, the waker and the menu's Mail tab.
 - `tests/talk.rs`: the conversation tools against real in-process daemons: every tool, the error texts, offline and queued sends, claims, status records and paging.
 - `tests/gateway.rs`: the gateway against an in-process daemon: sign-in with PKCE, the tools, and the refusals (no token, forged, expired or revoked tokens, wrong passphrases, foreign redirect addresses, floods).

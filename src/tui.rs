@@ -597,6 +597,7 @@ mod tests {
                 ..Default::default()
             }],
             addresses: vec![],
+            held: vec![],
             status: vec![],
         });
         let s = screen(&a);

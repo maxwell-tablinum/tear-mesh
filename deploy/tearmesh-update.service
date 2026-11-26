@@ -1,0 +1,11 @@
+# The updater (spec 22.3): installs the release the membership file names, when it is newer than
+# this one. Root, because it replaces the program; it takes only a version from the file.
+# To keep this machine from following the mesh: systemctl disable --now tearmesh-update.timer
+[Unit]
+Description=tear-mesh updater
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/tearmesh update --mesh

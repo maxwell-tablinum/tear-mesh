@@ -632,7 +632,7 @@ async fn handle(
             }
             Request::Reject { name } => need_admin()
                 .and_then(|_| Ok(json!({ "rejected": node.joins.reject(name.as_deref())? }))),
-            Request::JoinCancel => need_admin().and_then(|_| Ok(json!({ "cancelled": node.cancel_join() }))),
+            Request::JoinCancel => need_admin().map(|_| json!({ "cancelled": node.cancel_join() })),
             Request::SyncNow => match need_admin() {
                 Ok(()) => Ok(json!({ "synced": node.sync_all().await })),
                 Err(e) => Err(e),
